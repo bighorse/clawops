@@ -135,8 +135,14 @@ impl Provisioner {
         // [gateway] paired_tokens. Skips the pair handshake — ClawOps is
         // the only client of each user's zeroclaw, so a pre-shared token
         // is simpler and equivalent in security.
+        //
+        // The `zc_` prefix is critical: zeroclaw's `is_token_hash()` treats
+        // any bare 64-hex string as an *already-hashed* value and stores it
+        // verbatim, which means client-supplied plaintext (re-hashed on
+        // verification) will never match. The prefix makes the length 67
+        // and forces zeroclaw to hash on load instead.
         let paired_token = format!(
-            "{}{}",
+            "zc_{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
