@@ -25,24 +25,16 @@ ExecStart=/usr/local/bin/zeroclaw daemon --config-dir %h/.zeroclaw
 Restart=on-failure
 RestartSec=5
 
-# Resource caps. zeroclaw also has internal max_memory_mb in [security.resources];
-# this is the hard kernel-enforced ceiling.
+# Resource caps (work at user level)
 MemoryMax=512M
 TasksMax=64
 LimitNOFILE=4096
 
-# Hardening — read-only system, only the user's own home is writable.
-ProtectSystem=strict
-ProtectHome=tenant
-ReadWritePaths=%h/.zeroclaw
-PrivateTmp=true
+# user-level supported hardening. Stronger directives like PrivateTmp,
+# ProtectKernel*, ProtectControlGroups, RestrictAddressFamilies require
+# capabilities the user systemd manager doesn't have and produce
+# 218/CAPABILITIES. Per-user uid + 0700 home is the primary isolation.
 NoNewPrivileges=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-
-# Network access required for LLM calls.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=default.target

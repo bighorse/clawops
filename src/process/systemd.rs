@@ -4,12 +4,18 @@
 //! - ClawOps runs as root (or a user with sudo/NOPASSWD on useradd/loginctl/systemctl).
 //! - A systemd user-template unit `zeroclaw@.service` is installed system-wide
 //!   under `/etc/systemd/user/zeroclaw@.service` (see installer script).
+//!
+//! systemctl --user requires the target user's D-Bus session, reachable via
+//! `XDG_RUNTIME_DIR=/run/user/<uid>`. `loginctl enable-linger` boots the
+//! per-user `user@<uid>.service` which creates `/run/user/<uid>/bus`. We wait
+//! for that socket before issuing systemctl commands.
 
 use super::{ProcessManager, ProcessStatus, UserHomeLayout};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
 
 pub struct SystemdProcessManager {
@@ -46,9 +52,52 @@ async fn run(cmd: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+async fn run_capture(cmd: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+}
+
+async fn lookup_uid(linux_uid: &str) -> Result<u32> {
+    let out = run("id", &["-u", linux_uid]).await?;
+    out.trim()
+        .parse::<u32>()
+        .map_err(|e| Error::Process(format!("parse uid for {linux_uid}: {e}")))
+}
+
+/// Wait for `/run/user/<uid>/bus` to exist (i.e. the user's D-Bus session is up).
+async fn wait_user_bus(numeric_uid: u32, timeout: Duration) -> Result<()> {
+    let path = format!("/run/user/{numeric_uid}/bus");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::path::Path::new(&path).exists() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Process(format!(
+                "user bus {path} did not appear within {:?}",
+                timeout
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `sudo -u <uid> env XDG_RUNTIME_DIR=/run/user/<numeric_uid> systemctl --user <args>`
 async fn systemctl_user(linux_uid: &str, args: &[&str]) -> Result<String> {
-    // Run `sudo -u <uid> XDG_RUNTIME_DIR=/run/user/$(id -u <uid>) systemctl --user ...`
-    let mut full = vec!["-u", linux_uid, "--", "systemctl", "--user"];
+    let numeric_uid = lookup_uid(linux_uid).await?;
+    let xdg = format!("XDG_RUNTIME_DIR=/run/user/{numeric_uid}");
+    let mut full: Vec<&str> = vec![
+        "-u",
+        linux_uid,
+        "env",
+        xdg.as_str(),
+        "systemctl",
+        "--user",
+    ];
     full.extend_from_slice(args);
     run("sudo", &full).await
 }
@@ -69,8 +118,14 @@ impl ProcessManager for SystemdProcessManager {
                 &["-m", "-d", &home, "-s", "/bin/bash", linux_uid],
             )
             .await?;
-            run("loginctl", &["enable-linger", linux_uid]).await?;
         }
+        // enable-linger is idempotent — safe to call every time.
+        run("loginctl", &["enable-linger", linux_uid]).await?;
+
+        // Wait for user@<uid>.service to be ready (bus socket exists).
+        let numeric_uid = lookup_uid(linux_uid).await?;
+        wait_user_bus(numeric_uid, Duration::from_secs(10)).await?;
+
         std::fs::create_dir_all(&layout.workspace_dir)?;
         let _ = &self.zeroclaw_binary;
         let _ = &self.home_base;
@@ -85,10 +140,19 @@ impl ProcessManager for SystemdProcessManager {
         )
         .await?;
         run("chmod", &["700", &home]).await?;
+        // config.toml contains the paired_token — restrict to 0600 to silence
+        // zeroclaw's "world-readable" warning.
+        let cfg_path = layout.config_dir.join("config.toml");
+        if cfg_path.exists() {
+            run("chmod", &["600", cfg_path.to_string_lossy().as_ref()]).await?;
+        }
         Ok(())
     }
 
     async fn start(&self, linux_uid: &str) -> Result<()> {
+        // Reset failed state from previous attempts so restart counter is clean.
+        let _ =
+            systemctl_user(linux_uid, &["reset-failed", &format!("zeroclaw@{linux_uid}")]).await;
         systemctl_user(linux_uid, &["start", &format!("zeroclaw@{linux_uid}")]).await?;
         Ok(())
     }
@@ -99,12 +163,23 @@ impl ProcessManager for SystemdProcessManager {
     }
 
     async fn status(&self, linux_uid: &str) -> Result<ProcessStatus> {
+        let numeric_uid = lookup_uid(linux_uid).await?;
+        let xdg = format!("XDG_RUNTIME_DIR=/run/user/{numeric_uid}");
         let unit = format!("zeroclaw@{linux_uid}");
-        let out =
-            Command::new("sudo")
-                .args(["-u", linux_uid, "--", "systemctl", "--user", "is-active", &unit])
-                .output()
-                .await?;
+        let out = run_capture(
+            "sudo",
+            &[
+                "-u",
+                linux_uid,
+                "env",
+                &xdg,
+                "systemctl",
+                "--user",
+                "is-active",
+                &unit,
+            ],
+        )
+        .await?;
         let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
         Ok(match text.as_str() {
             "active" => ProcessStatus::Running,
