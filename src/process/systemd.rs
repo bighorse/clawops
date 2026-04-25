@@ -122,6 +122,25 @@ impl ProcessManager for SystemdProcessManager {
         // enable-linger is idempotent — safe to call every time.
         run("loginctl", &["enable-linger", linux_uid]).await?;
 
+        // Grant the new uid read access to the shared LLM env file. The file
+        // is root:root 0600 by convention; setfacl adds a per-user ACL entry
+        // so the user-systemd manager can read it. Idempotent. Best-effort —
+        // skip silently if the file is absent (e.g. dev without zeroclaw.env).
+        let env_file = "/etc/clawops/zeroclaw.env";
+        if std::path::Path::new(env_file).exists() {
+            if let Err(e) = run(
+                "setfacl",
+                &["-m", &format!("u:{linux_uid}:r"), env_file],
+            )
+            .await
+            {
+                tracing::warn!(
+                    uid = linux_uid,
+                    "setfacl on {env_file} failed (non-fatal): {e}"
+                );
+            }
+        }
+
         // Wait for user@<uid>.service to be ready (bus socket exists).
         let numeric_uid = lookup_uid(linux_uid).await?;
         wait_user_bus(numeric_uid, Duration::from_secs(10)).await?;

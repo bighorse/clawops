@@ -27,7 +27,7 @@ apt-get upgrade -y -q
 echo "==> base packages"
 apt-get install -y -q \
     build-essential pkg-config libssl-dev cmake git curl jq sqlite3 \
-    fail2ban ufw \
+    fail2ban ufw acl \
     ca-certificates
 
 echo "==> rustup (system-wide for the build user)"
