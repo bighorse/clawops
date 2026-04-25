@@ -1,0 +1,40 @@
+# 用户画像 — {{display_name}}
+
+## 身份
+- OpenID: `{{openid}}`
+- 手机号: {{#if phone}}`{{phone}}`{{else}}(未授权){{/if}}
+- Linux UID: `{{linux_uid}}`
+
+## 所属企业
+
+{{#if enterprise.company_name}}
+- 企业名称: **{{enterprise.company_name}}**
+{{/if}}
+{{#if enterprise.industry}}
+- 行业: {{enterprise.industry}}
+{{/if}}
+{{#if enterprise.stage}}
+- 阶段: {{enterprise.stage}}
+{{/if}}
+{{#if enterprise.team_size}}
+- 团队规模: {{enterprise.team_size}}
+{{/if}}
+{{#if enterprise.pain_points}}
+
+### 核心痛点
+{{#each enterprise.pain_points}}
+- {{this}}
+{{/each}}
+{{/if}}
+{{#if enterprise.goals}}
+
+### 近期目标
+{{#each enterprise.goals}}
+- {{this}}
+{{/each}}
+{{/if}}
+
+## 协作偏好
+- 中文回复
+- 重要操作(涉及政府申报、资金、合规)前二次确认
+- 日常业务优先用工具查实时数据,不要凭预训练记忆

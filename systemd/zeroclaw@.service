@@ -1,0 +1,48 @@
+[Unit]
+Description=ZeroClaw daemon for user %i
+Documentation=https://github.com/bighorse/zeroclaw
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# %h expands to the user's home directory (e.g. /home/claw-001).
+WorkingDirectory=%h
+
+# Per-instance environment file. Put ZEROCLAW_API_KEY etc. here so secrets
+# never sit in config.toml. ClawOps writes /etc/clawops/zeroclaw-%i.env at
+# provision time. The leading `-` keeps systemd happy when the file is absent.
+EnvironmentFile=-/etc/clawops/zeroclaw-%i.env
+EnvironmentFile=-/etc/clawops/zeroclaw.env
+
+Environment=ZEROCLAW_CONFIG_DIR=%h/.zeroclaw
+Environment=ZEROCLAW_WORKSPACE=%h/.zeroclaw/workspace
+Environment=RUST_LOG=info,zeroclaw=info
+
+ExecStart=/usr/local/bin/zeroclaw daemon --config-dir %h/.zeroclaw
+
+Restart=on-failure
+RestartSec=5
+
+# Resource caps. zeroclaw also has internal max_memory_mb in [security.resources];
+# this is the hard kernel-enforced ceiling.
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=4096
+
+# Hardening — read-only system, only the user's own home is writable.
+ProtectSystem=strict
+ProtectHome=tenant
+ReadWritePaths=%h/.zeroclaw
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Network access required for LLM calls.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

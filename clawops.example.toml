@@ -1,0 +1,49 @@
+# ClawOps configuration example — copy to clawops.toml and edit.
+
+[server]
+host = "127.0.0.1"
+port = 8088
+
+[database]
+# Relative paths are resolved against the working directory.
+url = "sqlite://data/clawops.db?mode=rwc"
+
+[zeroclaw]
+# Path to the zeroclaw binary used when spawning per-user daemons.
+binary = "/usr/local/bin/zeroclaw"
+# Base directory for per-user homes. Each user lives at <home_base>/claw-<linux_uid>.
+home_base = "/home"
+# Port pool for per-user zeroclaw gateways.
+port_range_start = 42618
+port_range_end = 50000
+
+[provisioner]
+# "systemd" (Linux) or "mock" (dev / macOS). Mock writes provisioning steps to log only.
+backend = "mock"
+# Template directory bundled with the ClawOps install.
+template_dir = "templates/workspace"
+
+# ── LLM defaults injected into each rendered per-user config.toml ───
+# These centralise the model/provider so individual users don't repeat
+# secrets. Prefer leaving api_key empty here and exporting
+# ZEROCLAW_API_KEY in the per-user systemd unit.
+[zeroclaw_template]
+default_provider = "qwen"
+default_model = "qwen3.6-plus"
+api_key = ""
+# api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+default_temperature = 0.6
+provider_timeout_secs = 120
+max_cost_per_day_cents = 500
+
+[wx]
+# WeChat mini-program credentials. Leave empty during local dev to use mock login.
+appid = ""
+secret = ""
+
+[reaper]
+# Minutes of idle time (based on users.last_active_at) before stopping a process.
+# Phase 1 default: 90 days. Set low values for testing.
+idle_stop_minutes = 129600
+# Archive status threshold (not acted on yet, recorded for future Phase).
+idle_archive_minutes = 525600

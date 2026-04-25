@@ -1,0 +1,139 @@
+# Rendered by ClawOps provisioner for user {{openid}} (uid {{linux_uid}}).
+# Generated file — managed by ClawOps. Manual edits will be overwritten on
+# re-provision. To override secrets, set ZEROCLAW_API_KEY in the per-user
+# systemd environment, not in this file.
+
+# ── Provider & model ────────────────────────────────────────
+{{#if llm.api_key}}
+api_key = "{{llm.api_key}}"
+{{/if}}
+{{#if llm.api_url}}
+api_url = "{{llm.api_url}}"
+{{/if}}
+default_provider = "{{llm.default_provider}}"
+default_model = "{{llm.default_model}}"
+default_temperature = {{llm.default_temperature}}
+provider_timeout_secs = {{llm.provider_timeout_secs}}
+
+# ── Observability ──────────────────────────────────────────
+[observability]
+backend = "log"
+runtime_trace_mode = "rolling"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 300
+
+# ── Autonomy ───────────────────────────────────────────────
+# Multi-tenant safety: shell auto_approve is OFF, forbidden_paths
+# blocks reading neighbouring users' homes. Per-user budget cap.
+[autonomy]
+level = "supervised"
+workspace_only = true
+allowed_commands = [
+    "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail", "date",
+    "python3", "pip3", "jq", "curl", "wget"
+]
+forbidden_paths = [
+    "/etc", "/root", "/home", "/usr", "/bin", "/sbin",
+    "/lib", "/boot", "/dev", "/proc", "/sys", "/var", "/tmp",
+    "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"
+]
+max_actions_per_hour = 120
+max_cost_per_day_cents = {{llm.max_cost_per_day_cents}}
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = ["PATH", "HOME", "VIRTUAL_ENV"]
+auto_approve = ["file_read", "memory_recall", "web_fetch", "web_search_tool"]
+always_ask = ["shell", "file_write"]
+
+# ── Security ───────────────────────────────────────────────
+[security.sandbox]
+backend = "auto"
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 90
+max_subprocesses = 10
+memory_monitoring = true
+
+[security.audit]
+enabled = true
+log_path = "audit.log"
+max_size_mb = 50
+sign_events = false
+
+[security.estop]
+enabled = true
+state_file = ".zeroclaw/estop-state.json"
+require_otp_to_resume = false
+
+# ── Runtime ────────────────────────────────────────────────
+[runtime]
+kind = "native"
+
+# ── Reliability ────────────────────────────────────────────
+[reliability]
+provider_retries = 2
+provider_backoff_ms = 2000
+
+# ── Scheduler ──────────────────────────────────────────────
+[scheduler]
+enabled = true
+max_tasks = 16
+max_concurrent = 2
+
+# ── Agent ──────────────────────────────────────────────────
+[agent]
+compact_context = false
+max_tool_iterations = 80
+max_history_messages = 30
+parallel_tools = false
+tool_dispatcher = "auto"
+
+# ── Skills ─────────────────────────────────────────────────
+[skills]
+open_skills_enabled = false
+
+# Heartbeat is intentionally omitted — ClawOps drives any reminders.
+# Empty section would still require interval_minutes; falling back to
+# zeroclaw defaults is fine.
+
+# ── Cron ───────────────────────────────────────────────────
+[cron]
+enabled = true
+max_run_history = 30
+
+# ── Channels — disabled, gateway-only access via ClawOps ───
+[channels_config]
+cli = false
+
+# ── Memory ─────────────────────────────────────────────────
+[memory]
+backend = "sqlite"
+auto_save = true
+hygiene_enabled = true
+archive_after_days = 90
+purge_after_days = 365
+conversation_retention_days = 90
+embedding_provider = "none"
+snapshot_enabled = true
+snapshot_on_hygiene = true
+auto_hydrate = true
+
+# ── Gateway — bind to localhost only, ClawOps fronts the world ─
+[gateway]
+host = "127.0.0.1"
+port = {{port}}
+allow_public_bind = false
+public_url = "http://127.0.0.1:{{port}}"
+require_pairing = true
+paired_tokens = ["{{paired_token}}"]
+pair_rate_limit_per_minute = 10
+webhook_rate_limit_per_minute = 60
+trust_forwarded_headers = false
+rate_limit_max_keys = 1000
+idempotency_ttl_secs = 300
+idempotency_max_keys = 1000
+
+# ── Cost tracking ──────────────────────────────────────────
+[cost]
+enabled = true
