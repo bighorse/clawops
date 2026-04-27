@@ -1,7 +1,8 @@
 # ClawOps 小程序对接接口文档
 
-> 状态:Phase 2 已上线,阶段 PoC。生产前必须解决[已知限制](#已知限制与上线前必修)。
-> 当前测试环境:`http://120.48.131.72:8088`(开发期 HTTP,**生产必须切 HTTPS**)。
+> 状态:Phase 3 已上线 HTTPS,阶段 PoC 接近可联调。剩余[已知限制](#已知限制与上线前必修)。
+> **接入地址**:`https://clawops.2048office.com`(通配证书 `*.2048office.com`,TLS 1.3 + HTTP/2)。
+> 小程序后台必须把 `https://clawops.2048office.com` 加入"开发设置 → 服务器域名 → request 合法域名"。
 
 ## 总览
 
@@ -173,7 +174,7 @@ data: {"type":"agent_end","duration_ms":12450,"tokens_used":2341,"timestamp":"..
 
 ```javascript
 // app.js or login page
-const BASE = 'https://your-domain.com';   // 生产 HTTPS
+const BASE = 'https://clawops.2048office.com';   // 通配证书,nginx 反代 -> ClawOps
 
 async function login() {
   // 1. 拿 wx.login code
@@ -310,18 +311,20 @@ const stream = subscribeEvents(token, ev => {
 
 | 项 | 状态 | 影响 |
 |----|------|------|
-| HTTPS | 测试环境是 HTTP | 小程序生产必须 HTTPS,要装 caddy + Let's Encrypt |
-| 真实微信 `code2session` | 当前 mock 模式(传 `mock_openid` 直通) | 上线前需在 `clawops.toml` 配 `wx.appid` + `wx.secret` |
-| `PUT /me/profile` 修改企业画像 | 未实现 | 用户首次注册画像后无法自助修改 |
-| `/admin/*` 鉴权 | 未实现(仅靠 ufw 防护) | Phase 3 加 admin token,**完成前不要在小程序代码里出现这些路径** |
-| Token 撤销接口 | 未实现 | 用户登出要靠 token 自然过期(30 天) |
-| 多端登录 token 互斥 | 未实现 | 用户多端登录会拿不同 token,互不影响 |
-| Rate limit | 无 | Phase 3 补 |
+| HTTPS | ✅ 已上(nginx 反代 + 通配证书) | 证书 2026-06-08 到期需续签;长期建议切 Let's Encrypt 自动续 |
+| `/admin/*` 鉴权 | ✅ 已加 `X-Admin-Token`(Phase 3.1) | 小程序无需关心,运维侧用 |
+| Reaper 90 天清理 | ✅ 已上(Phase 3.2) | 用户 90 天无活跃自动停 daemon,工作区文件保留;再次访问自动唤醒 |
+| 真实微信 `code2session` | ⏳ 当前 mock 模式(传 `mock_openid` 直通) | 上线前需在 `clawops.toml` 配 `wx.appid` + `wx.secret` |
+| `PUT /me/profile` 修改企业画像 | ⏳ 未实现 | 用户首次注册画像后无法自助修改 |
+| Token 撤销接口 | ⏳ 未实现 | 用户登出要靠 token 自然过期(30 天) |
+| 多端登录 token 互斥 | ⏳ 未实现 | 用户多端登录会拿不同 token,互不影响 |
+| Rate limit | ⏳ 未实现 | DDoS / 单用户疯狂调 LLM 风险尚未防 |
 
 ---
 
 ## 联系 / 调试
 
-- ClawOps 健康检查:`curl http://120.48.131.72:8088/health`
+- ClawOps 健康检查:`curl https://clawops.2048office.com/health`
 - 后端版本:见 `/health` 返回的 `version` 字段
+- TLS 链路:HTTP/2 + TLSv1.3,通配证书 `*.2048office.com` 由 TrustAsia 颁发
 - 后端联调请联系运维(目前是 Mario)开 admin 接口排查
