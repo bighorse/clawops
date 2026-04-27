@@ -1,5 +1,6 @@
 use crate::auth::WxClient;
 use crate::config::Config;
+use crate::limits::{self, AppLimiters};
 use crate::provisioner::Provisioner;
 use crate::{sessions, users, Error, Result};
 use axum::extract::FromRequestParts;
@@ -21,6 +22,7 @@ pub struct AppState {
     pub provisioner: Arc<Provisioner>,
     pub http: reqwest::Client,
     pub wx: Arc<WxClient>,
+    pub limiters: Arc<AppLimiters>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -63,8 +65,8 @@ impl FromRequestParts<AppState> for AuthOpenid {
     }
 }
 
-/// Admin guard — `X-Admin-Token: <token>` must match `cfg.admin.token`
-/// (constant-time compare). 503 if admin is disabled (token empty).
+/// Admin guard — rate-limit by source IP, then `X-Admin-Token` constant-time
+/// compare. 503 if admin is disabled (token empty), 429 if rate-limited.
 pub struct AdminGuard;
 
 #[axum::async_trait]
@@ -75,6 +77,15 @@ impl FromRequestParts<AppState> for AdminGuard {
         parts: &mut Parts,
         state: &AppState,
     ) -> std::result::Result<Self, Self::Rejection> {
+        // 1. rate limit on source IP first (cheap; stops scanners early)
+        let ip = limits::client_ip(&parts.headers);
+        if let Err(retry) = limits::check(&state.limiters.admin_per_ip, &ip) {
+            return Err(Error::RateLimited {
+                retry_after_secs: retry,
+            }
+            .into_response());
+        }
+
         let expected = state.cfg.admin.token.as_bytes();
         if expected.is_empty() {
             return Err((
@@ -225,8 +236,14 @@ struct WxLoginResp {
 
 async fn wx_login(
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<WxLoginReq>,
 ) -> std::result::Result<Json<WxLoginResp>, Error> {
+    // Rate-limit by source IP (defends openid enumeration / brute force)
+    let ip = limits::client_ip(&headers);
+    limits::check(&st.limiters.wx_login_per_ip, &ip)
+        .map_err(|retry| Error::RateLimited { retry_after_secs: retry })?;
+
     let session = st
         .wx
         .code2session(&req.code, req.mock_openid.as_deref())
@@ -275,6 +292,10 @@ async fn chat(
     AuthOpenid(openid): AuthOpenid,
     Json(req): Json<ChatReq>,
 ) -> std::result::Result<Json<ChatResp>, Error> {
+    // Rate-limit by openid (defends LLM-cost blast radius if a token leaks)
+    limits::check(&st.limiters.chat_per_user, &openid)
+        .map_err(|retry| Error::RateLimited { retry_after_secs: retry })?;
+
     let user = st.provisioner.ensure_running(&openid).await?;
     users::touch_active(&st.pool, &user.openid).await?;
 

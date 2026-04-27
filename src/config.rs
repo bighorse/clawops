@@ -14,6 +14,28 @@ pub struct Config {
     pub reaper: ReaperConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RateLimitConfig {
+    /// `/auth/wx-login` per source-IP per minute. Defaults: 10.
+    pub wx_login_per_ip_per_min: u32,
+    /// `/chat` per session-openid per minute. Defaults: 30.
+    pub chat_per_user_per_min: u32,
+    /// `/admin/*` per source-IP per minute. Defaults: 60.
+    pub admin_per_ip_per_min: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            wx_login_per_ip_per_min: 10,
+            chat_per_user_per_min: 30,
+            admin_per_ip_per_min: 60,
+        }
+    }
 }
 
 /// Admin API protection. The /admin/* routes are gated by a static

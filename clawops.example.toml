@@ -53,3 +53,11 @@ idle_archive_minutes = 525600
 # Leave empty to **disable** all /admin/* routes (returns 503).
 # Generate with: openssl rand -hex 32
 token = ""
+
+[rate_limit]
+# All limits are sliding-window per minute, in-memory (reset on restart).
+# Source IP is read from X-Forwarded-For first hop (trusted because nginx
+# is the only thing that can reach 127.0.0.1:8088 in production).
+wx_login_per_ip_per_min = 10
+chat_per_user_per_min = 30
+admin_per_ip_per_min = 60

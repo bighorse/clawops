@@ -51,6 +51,10 @@ pub enum Error {
     #[error("dev-only field used in production: {0}")]
     DevFieldInProd(&'static str),
 
+    /// Per-IP / per-user rate limit exceeded.
+    #[error("rate limit exceeded; retry after {retry_after_secs}s")]
+    RateLimited { retry_after_secs: u64 },
+
     #[error("{0}")]
     Other(String),
 }
@@ -66,6 +70,21 @@ impl axum::response::IntoResponse for Error {
         use axum::http::StatusCode;
         // WeChat-specific path returns structured details so the mini-program
         // can branch on errcode (40029 = re-login, 45011 = backoff, etc.)
+        if let Error::RateLimited { retry_after_secs } = &self {
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(serde_json::json!({
+                    "error": "rate_limited",
+                    "retry_after_secs": retry_after_secs,
+                })),
+            )
+                .into_response();
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                retry_after_secs.to_string().parse().unwrap(),
+            );
+            return resp;
+        }
         if let Error::WxApiError { errcode, errmsg } = &self {
             return (
                 StatusCode::BAD_REQUEST,

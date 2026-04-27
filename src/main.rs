@@ -3,6 +3,7 @@ use clawops::auth::WxClient;
 use clawops::config::Config;
 use clawops::http::AppState;
 use clawops::provisioner::Provisioner;
+use clawops::limits::AppLimiters;
 use clawops::reaper::Reaper;
 use clawops::{db, http, process, users};
 use std::path::PathBuf;
@@ -83,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let wx = Arc::new(WxClient::new(cfg.wx.clone(), http_client.clone()));
+    let limiters = Arc::new(AppLimiters::new(&cfg.rate_limit));
 
     match cli.cmd {
         Cmd::Serve => {
@@ -97,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
                 provisioner,
                 http: http_client,
                 wx,
+                limiters,
             };
             let app = http::router(state);
             let addr: std::net::SocketAddr =
