@@ -29,10 +29,16 @@
 
 | 方法 | 路径                | 鉴权              | 说明 |
 |------|---------------------|-------------------|------|
-| POST | `/auth/wx-login`    | ❌                | 登录 / 首次自动开通 |
-| GET  | `/health`           | ❌                | 健康检查 |
-| POST | `/chat`             | ✅ Bearer         | 发送消息,等待整段回复 |
+| POST | `/auth/wx-login`    | ❌                | 登录 / 首次自动开通(限流 10/min/IP) |
+| POST | `/auth/logout`      | ✅ Bearer         | 撤销当前 token(幂等) |
+| POST | `/auth/logout-all`  | ✅ Bearer         | 撤销该 openid 全部 token(设备丢失场景) |
+| GET  | `/me/profile`       | ✅ Bearer         | 取当前用户的 display_name / phone / 企业画像 |
+| PUT  | `/me/profile`       | ✅ Bearer         | 部分更新(只传要改的字段);USER.md 立即重渲染,下条 chat 生效 |
+| POST | `/chat`             | ✅ Bearer         | 发送消息,等待整段回复(限流 30/min/用户) |
 | GET  | `/events`           | ✅ Bearer 或 `?token=` | 实时事件流(进度条用) |
+| GET  | `/health`           | ❌                | 健康检查 |
+
+**429 限流响应**:`{"error":"rate_limited","retry_after_secs":N}` + 标准 `Retry-After: N` 头。客户端建议指数退避。
 
 > 不要在小程序里调用 `/admin/*` 系列 —— 那是运维接口,小程序无权访问。
 
