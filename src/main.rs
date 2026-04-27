@@ -3,6 +3,7 @@ use clawops::auth::WxClient;
 use clawops::config::Config;
 use clawops::http::AppState;
 use clawops::provisioner::Provisioner;
+use clawops::reaper::Reaper;
 use clawops::{db, http, process, users};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,6 +46,10 @@ enum Cmd {
 
     /// List all known users.
     List,
+
+    /// Run a single reaper pass against the configured DB and exit.
+    /// Useful for ad-hoc cleanup or cron-driven invocations.
+    Reap,
 }
 
 #[tokio::main]
@@ -81,6 +86,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Serve => {
+            // Reaper runs alongside the HTTP server, sharing pool +
+            // provisioner. It outlives no longer than the process; tokio
+            // drops the JoinHandle on shutdown.
+            let _reaper = Reaper::new(pool.clone(), provisioner.clone(), cfg.reaper.clone()).spawn();
+
             let state = AppState {
                 pool,
                 cfg: cfg.clone(),
@@ -94,6 +104,15 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("clawops listening on http://{addr}");
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, app).await?;
+        }
+        Cmd::Reap => {
+            // Manual one-shot: run a single reaper tick from the CLI for
+            // testing or ad-hoc cleanup. Useful with --config pointing at
+            // production DB while clawops.service stays up — both share
+            // the same SQLite file with WAL.
+            let reaper = Reaper::new(pool.clone(), provisioner.clone(), cfg.reaper.clone());
+            let n = reaper.tick().await?;
+            println!("reaper one-shot stopped {n} idle user(s)");
         }
         Cmd::Provision {
             openid,

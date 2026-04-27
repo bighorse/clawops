@@ -6,6 +6,7 @@ pub mod http;
 pub mod ports;
 pub mod process;
 pub mod provisioner;
+pub mod reaper;
 pub mod sessions;
 pub mod users;
 
