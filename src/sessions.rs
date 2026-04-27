@@ -65,12 +65,22 @@ pub async fn resolve(pool: &SqlitePool, token: &str) -> Result<String> {
     }
 }
 
-pub async fn revoke(pool: &SqlitePool, token: &str) -> Result<()> {
-    sqlx::query("DELETE FROM sessions WHERE token = ?")
+pub async fn revoke(pool: &SqlitePool, token: &str) -> Result<u64> {
+    let r = sqlx::query("DELETE FROM sessions WHERE token = ?")
         .bind(token)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(r.rows_affected())
+}
+
+/// Revoke every session for a given openid (used for "log out everywhere"
+/// after device loss / suspected compromise).
+pub async fn revoke_all_for_openid(pool: &SqlitePool, openid: &str) -> Result<u64> {
+    let r = sqlx::query("DELETE FROM sessions WHERE openid = ?")
+        .bind(openid)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
 }
 
 pub async fn purge_expired(pool: &SqlitePool) -> Result<u64> {

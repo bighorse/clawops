@@ -315,10 +315,10 @@ const stream = subscribeEvents(token, ev => {
 | `/admin/*` 鉴权 | ✅ 已加 `X-Admin-Token`(Phase 3.1) | 小程序无需关心,运维侧用 |
 | Reaper 90 天清理 | ✅ 已上(Phase 3.2) | 用户 90 天无活跃自动停 daemon,工作区文件保留;再次访问自动唤醒 |
 | 真实微信 `code2session` | ⏳ 当前 mock 模式(传 `mock_openid` 直通) | 上线前需在 `clawops.toml` 配 `wx.appid` + `wx.secret` |
-| `PUT /me/profile` 修改企业画像 | ⏳ 未实现 | 用户首次注册画像后无法自助修改 |
-| Token 撤销接口 | ⏳ 未实现 | 用户登出要靠 token 自然过期(30 天) |
-| 多端登录 token 互斥 | ⏳ 未实现 | 用户多端登录会拿不同 token,互不影响 |
-| Rate limit | ⏳ 未实现 | DDoS / 单用户疯狂调 LLM 风险尚未防 |
+| `PUT /me/profile` 修改企业画像 | ✅ 已上(Phase 3.5 #3) | 改后下条 /chat 即生效,无需重启 |
+| Token 撤销接口 | ✅ 已上(`/auth/logout` + `/auth/logout-all`) | 用户登出立即失效,不必等 30 天过期 |
+| 多端登录 token 互斥 | ⏳ 未实现 | 用户多端登录会拿不同 token,互不影响(可用 logout-all 一次清掉) |
+| Rate limit | ✅ 已上(governor) | wx-login 10/分/IP,chat 30/分/用户,admin 60/分/IP;429 + Retry-After |
 
 ---
 

@@ -29,6 +29,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/auth/wx-login", post(wx_login))
+        .route("/auth/logout", post(logout))
+        .route("/auth/logout-all", post(logout_all))
         .route("/chat", post(chat))
         .route("/events", get(events))
         .route("/me/profile", axum::routing::put(update_my_profile))
@@ -350,6 +352,37 @@ async fn chat(
             .map(|s| s.to_string()),
         openid: user.openid,
     }))
+}
+
+/// POST /auth/logout — revoke the bearer used on this request.
+/// Idempotent: missing/already-revoked token still returns 200.
+async fn logout(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> std::result::Result<Json<serde_json::Value>, Error> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("");
+    // We DON'T require AuthOpenid here — the token may already be expired
+    // and the client just wants to clean up. Revoking a non-existent token
+    // is a 0-rows no-op (safe & idempotent).
+    let revoked = sessions::revoke(&st.pool, token).await.unwrap_or(0);
+    Ok(Json(serde_json::json!({ "revoked": revoked })))
+}
+
+/// POST /auth/logout-all — revoke every session for the authenticated
+/// openid. Use after device loss or suspected token compromise.
+async fn logout_all(
+    State(st): State<AppState>,
+    AuthOpenid(openid): AuthOpenid,
+) -> std::result::Result<Json<serde_json::Value>, Error> {
+    let revoked = sessions::revoke_all_for_openid(&st.pool, &openid).await?;
+    Ok(Json(serde_json::json!({
+        "revoked": revoked,
+        "openid": openid,
+    })))
 }
 
 #[derive(Serialize)]
