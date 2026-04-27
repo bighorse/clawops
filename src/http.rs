@@ -63,6 +63,52 @@ impl FromRequestParts<AppState> for AuthOpenid {
     }
 }
 
+/// Admin guard — `X-Admin-Token: <token>` must match `cfg.admin.token`
+/// (constant-time compare). 503 if admin is disabled (token empty).
+pub struct AdminGuard;
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for AdminGuard {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let expected = state.cfg.admin.token.as_bytes();
+        if expected.is_empty() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin api is disabled (admin.token empty in clawops.toml)",
+            )
+                .into_response());
+        }
+        let supplied = parts
+            .headers
+            .get("X-Admin-Token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .as_bytes();
+        if !ct_eq(supplied, expected) {
+            return Err((StatusCode::UNAUTHORIZED, "invalid admin token").into_response());
+        }
+        Ok(AdminGuard)
+    }
+}
+
+/// Constant-time comparison; returns false on length mismatch without
+/// short-circuiting on first differing byte (only on length).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// GET /events — SSE byte-stream proxy to the user's zeroclaw /api/events.
 /// Auth via `Authorization: Bearer <session_token>` (or `?token=` for
 /// EventSource clients that can't set headers). Each request opens its own
@@ -283,7 +329,10 @@ async fn chat(
     }))
 }
 
-async fn list_users(State(st): State<AppState>) -> Result<Json<Vec<users::User>>> {
+async fn list_users(
+    _: AdminGuard,
+    State(st): State<AppState>,
+) -> Result<Json<Vec<users::User>>> {
     let rows: Vec<users::User> = sqlx::query_as(
         "SELECT * FROM users ORDER BY created_at DESC",
     )
@@ -293,6 +342,7 @@ async fn list_users(State(st): State<AppState>) -> Result<Json<Vec<users::User>>
 }
 
 async fn get_user(
+    _: AdminGuard,
     State(st): State<AppState>,
     Path(openid): Path<String>,
 ) -> std::result::Result<Json<users::User>, Error> {
@@ -312,6 +362,7 @@ struct ProvisionReq {
 }
 
 async fn admin_provision(
+    _: AdminGuard,
     State(st): State<AppState>,
     Json(req): Json<ProvisionReq>,
 ) -> std::result::Result<impl IntoResponse, Error> {
@@ -332,6 +383,7 @@ async fn admin_provision(
 }
 
 async fn admin_stop(
+    _: AdminGuard,
     State(st): State<AppState>,
     Path(openid): Path<String>,
 ) -> std::result::Result<impl IntoResponse, Error> {

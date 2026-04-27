@@ -47,3 +47,9 @@ secret = ""
 idle_stop_minutes = 129600
 # Archive status threshold (not acted on yet, recorded for future Phase).
 idle_archive_minutes = 525600
+
+[admin]
+# Required token for any /admin/* request — sent as `X-Admin-Token: <token>`.
+# Leave empty to **disable** all /admin/* routes (returns 503).
+# Generate with: openssl rand -hex 32
+token = ""

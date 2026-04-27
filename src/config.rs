@@ -12,6 +12,19 @@ pub struct Config {
     pub wx: WxConfig,
     #[serde(default)]
     pub reaper: ReaperConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
+}
+
+/// Admin API protection. The /admin/* routes are gated by a static
+/// `X-Admin-Token` header; if `token` is empty the routes return 503
+/// (service available but admin disabled). This is **not** a substitute
+/// for network-level isolation — operators should still bind 127.0.0.1
+/// and front via reverse proxy in production.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub token: String,
 }
 
 /// LLM/provider settings injected into each rendered per-user `config.toml`.
