@@ -41,6 +41,16 @@ pub enum Error {
         waited_ms: u64,
     },
 
+    /// Surfaces WeChat code2session errors verbatim to the client so the
+    /// mini-program can react (re-call wx.login on 40029, retry on 45011, etc.)
+    #[error("wechat code2session failed: errcode={errcode} errmsg={errmsg}")]
+    WxApiError { errcode: i64, errmsg: String },
+
+    /// Client tried to use a dev-only field in production (e.g. `mock_openid`
+    /// when wx.appid is configured).
+    #[error("dev-only field used in production: {0}")]
+    DevFieldInProd(&'static str),
+
     #[error("{0}")]
     Other(String),
 }
@@ -54,10 +64,24 @@ impl From<anyhow::Error> for Error {
 impl axum::response::IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
         use axum::http::StatusCode;
+        // WeChat-specific path returns structured details so the mini-program
+        // can branch on errcode (40029 = re-login, 45011 = backoff, etc.)
+        if let Error::WxApiError { errcode, errmsg } = &self {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "wechat_login_failed",
+                    "errcode": errcode,
+                    "errmsg": errmsg,
+                })),
+            )
+                .into_response();
+        }
         let (status, msg) = match &self {
             Error::UserNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Error::UserAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
             Error::NoFreePort => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            Error::DevFieldInProd(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             _ => {
                 tracing::error!(error = %self, "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
