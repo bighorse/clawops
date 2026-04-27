@@ -116,6 +116,57 @@ pub async fn touch_active(pool: &SqlitePool, openid: &str) -> Result<()> {
     Ok(())
 }
 
+/// Patch user profile fields. Any field set to `None` is left unchanged
+/// (so callers can update only what they care about).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ProfilePatch {
+    pub display_name: Option<String>,
+    pub phone: Option<String>,
+    pub enterprise_profile: Option<serde_json::Value>,
+}
+
+pub async fn update_profile(
+    pool: &SqlitePool,
+    openid: &str,
+    patch: &ProfilePatch,
+) -> Result<()> {
+    // Build the dynamic SET clause to only touch fields the caller sent.
+    let mut set_parts: Vec<&'static str> = Vec::new();
+    if patch.display_name.is_some() {
+        set_parts.push("display_name = ?");
+    }
+    if patch.phone.is_some() {
+        set_parts.push("phone = ?");
+    }
+    if patch.enterprise_profile.is_some() {
+        set_parts.push("enterprise_profile = ?");
+    }
+    if set_parts.is_empty() {
+        return Ok(()); // no-op
+    }
+    set_parts.push("last_active_at = ?");
+    let sql = format!(
+        "UPDATE users SET {} WHERE openid = ?",
+        set_parts.join(", ")
+    );
+    let mut q = sqlx::query(&sql);
+    if let Some(v) = &patch.display_name {
+        q = q.bind(v);
+    }
+    if let Some(v) = &patch.phone {
+        q = q.bind(v);
+    }
+    if let Some(v) = &patch.enterprise_profile {
+        q = q.bind(v.to_string());
+    }
+    q = q.bind(Utc::now()).bind(openid);
+    let res = q.execute(pool).await?;
+    if res.rows_affected() == 0 {
+        return Err(Error::UserNotFound(openid.to_string()));
+    }
+    Ok(())
+}
+
 pub async fn set_error(pool: &SqlitePool, openid: &str, err: &str) -> Result<()> {
     sqlx::query("UPDATE users SET status = 'failed', last_error = ? WHERE openid = ?")
         .bind(err)

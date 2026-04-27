@@ -215,6 +215,61 @@ impl Provisioner {
         Ok(())
     }
 
+    /// Refresh the rendered `USER.md` for an existing user from the latest
+    /// profile in the DB. The other workspace files (IDENTITY/SOUL/config)
+    /// are *not* touched — config.toml in particular contains the
+    /// paired_token that the daemon already loaded.
+    ///
+    /// zeroclaw rebuilds the system prompt on every new message
+    /// (channels/mod.rs `inject_workspace_file`), so the next /chat
+    /// request will pick up the new profile without restarting the daemon.
+    pub async fn refresh_user_md(&self, openid: &str) -> Result<()> {
+        let user = users::get_required(&self.pool, openid).await?;
+        let layout = UserHomeLayout::new(&self.cfg.zeroclaw.home_base, &user.linux_uid);
+
+        let profile: serde_json::Value = user
+            .enterprise_profile
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+
+        let ctx = json!({
+            "openid": user.openid,
+            "phone": user.phone,
+            "display_name": user.display_name,
+            "linux_uid": user.linux_uid,
+            "port": user.port,
+            "workspace_path": layout.workspace_dir,
+            "config_dir": layout.config_dir,
+            "home_dir": layout.home_dir,
+            "enterprise": profile,
+        });
+
+        let mut hb = Handlebars::new();
+        hb.set_strict_mode(false);
+
+        let tpl_dir = &self.cfg.provisioner.template_dir;
+        std::fs::create_dir_all(&layout.workspace_dir)?;
+        render_one(
+            &hb,
+            tpl_dir,
+            "USER.md.hbs",
+            &layout.workspace_dir.join("USER.md"),
+            &ctx,
+        )?;
+
+        // Re-chown so the new file is owned by the user (only matters in
+        // systemd backend; mock no-ops). Best-effort.
+        let user_md = layout.workspace_dir.join("USER.md");
+        if user_md.exists() {
+            self.backend
+                .chown_workspace(&user.linux_uid, &layout)
+                .await
+                .ok();
+        }
+        Ok(())
+    }
+
     pub async fn ensure_running(&self, openid: &str) -> Result<users::User> {
         let user = users::get_required(&self.pool, openid).await?;
         if user.status == "running" && user.port.is_some() {

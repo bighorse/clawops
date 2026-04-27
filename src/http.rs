@@ -31,6 +31,8 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/wx-login", post(wx_login))
         .route("/chat", post(chat))
         .route("/events", get(events))
+        .route("/me/profile", axum::routing::put(update_my_profile))
+        .route("/me/profile", get(get_my_profile))
         .route("/admin/users", get(list_users))
         .route("/admin/users/:openid", get(get_user))
         .route("/admin/provision", post(admin_provision))
@@ -348,6 +350,43 @@ async fn chat(
             .map(|s| s.to_string()),
         openid: user.openid,
     }))
+}
+
+#[derive(Serialize)]
+struct MyProfileResp {
+    openid: String,
+    display_name: Option<String>,
+    phone: Option<String>,
+    enterprise_profile: Option<serde_json::Value>,
+}
+
+async fn get_my_profile(
+    State(st): State<AppState>,
+    AuthOpenid(openid): AuthOpenid,
+) -> std::result::Result<Json<MyProfileResp>, Error> {
+    let u = users::get_required(&st.pool, &openid).await?;
+    let prof = u
+        .enterprise_profile
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    Ok(Json(MyProfileResp {
+        openid: u.openid,
+        display_name: u.display_name,
+        phone: u.phone,
+        enterprise_profile: prof,
+    }))
+}
+
+async fn update_my_profile(
+    State(st): State<AppState>,
+    AuthOpenid(openid): AuthOpenid,
+    Json(patch): Json<users::ProfilePatch>,
+) -> std::result::Result<Json<MyProfileResp>, Error> {
+    users::update_profile(&st.pool, &openid, &patch).await?;
+    // Re-render USER.md so the next /chat picks up the new profile —
+    // zeroclaw reads the file on every new message, no daemon restart.
+    st.provisioner.refresh_user_md(&openid).await?;
+    get_my_profile(State(st), AuthOpenid(openid)).await
 }
 
 async fn list_users(
