@@ -107,13 +107,17 @@ max_run_history = 30
 cli = false
 
 # ── Memory ─────────────────────────────────────────────────
+# auto_save = false on purpose: when true, every user message is
+# persisted and resurfaces via build_context on later turns, which
+# leaks cross-session history into the current prompt. The agent
+# can still call memory_store explicitly to record durable facts.
 [memory]
 backend = "sqlite"
-auto_save = true
+auto_save = false
 hygiene_enabled = true
 archive_after_days = 90
 purge_after_days = 365
-conversation_retention_days = 90
+conversation_retention_days = 30
 embedding_provider = "none"
 snapshot_enabled = true
 snapshot_on_hygiene = true
