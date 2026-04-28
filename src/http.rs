@@ -317,7 +317,9 @@ async fn chat(
     let port = user.port.ok_or_else(|| {
         Error::Other(format!("user {} has no port assigned", user.openid))
     })?;
-    let url = format!("http://127.0.0.1:{port}/webhook");
+    // /api/chat (full agent loop with tool execution); /webhook would
+    // bypass the agent loop and return raw <tool_call> XML.
+    let url = format!("http://127.0.0.1:{port}/api/chat");
 
     let mut builder = st
         .http
