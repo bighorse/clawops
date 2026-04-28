@@ -68,7 +68,9 @@
 
 > `enterprise_profile` 强烈建议小程序在用户首次完善资料时收集并提交。这决定 ClawOps 给该用户渲染的 `USER.md` 内容,直接影响 LLM 回复质量(参考下方"画像生效示例")。
 
-> 开发期可以传 `mock_openid` 字段直接指定 openid,跳过微信(需要 ClawOps 配置 `wx.appid` 为空)。生产必须传真实 `code`。
+> ⚠️ **生产服务器 `clawops.2048office.com` 已切真微信**(2026-04-28 起)。`mock_openid` 字段会被 **400 DevFieldInProd** 拒绝。前端开发请用微信开发者工具的 `wx.login()` 拿真 code 调试 —— 这跟生产链路完全一致。
+>
+> 如果未来上线 staging 环境(`wx.appid` 配空的实例),才能用 `mock_openid` 调试。当前没有。
 
 **Response 200**
 
@@ -320,7 +322,7 @@ const stream = subscribeEvents(token, ev => {
 | HTTPS | ✅ 已上(nginx 反代 + 通配证书) | 证书 2026-06-08 到期需续签;长期建议切 Let's Encrypt 自动续 |
 | `/admin/*` 鉴权 | ✅ 已加 `X-Admin-Token`(Phase 3.1) | 小程序无需关心,运维侧用 |
 | Reaper 90 天清理 | ✅ 已上(Phase 3.2) | 用户 90 天无活跃自动停 daemon,工作区文件保留;再次访问自动唤醒 |
-| 真实微信 `code2session` | ⏳ 当前 mock 模式(传 `mock_openid` 直通) | 上线前需在 `clawops.toml` 配 `wx.appid` + `wx.secret` |
+| 真实微信 `code2session` | ✅ 已切(2026-04-28) | 生产 `wx.appid` + `secret` 已配置;`mock_openid` 字段被 400 拒 |
 | `PUT /me/profile` 修改企业画像 | ✅ 已上(Phase 3.5 #3) | 改后下条 /chat 即生效,无需重启 |
 | Token 撤销接口 | ✅ 已上(`/auth/logout` + `/auth/logout-all`) | 用户登出立即失效,不必等 30 天过期 |
 | 多端登录 token 互斥 | ⏳ 未实现 | 用户多端登录会拿不同 token,互不影响(可用 logout-all 一次清掉) |
