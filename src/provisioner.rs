@@ -168,6 +168,7 @@ impl Provisioner {
                 "default_temperature": tpl.default_temperature,
                 "provider_timeout_secs": tpl.provider_timeout_secs,
                 "max_cost_per_day_cents": tpl.max_cost_per_day_cents,
+                "tavily_api_key": tpl.tavily_api_key,
             },
         });
 

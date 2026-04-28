@@ -134,6 +134,35 @@ rate_limit_max_keys = 1000
 idempotency_ttl_secs = 300
 idempotency_max_keys = 1000
 
+# ── Tools (web search + http + fetch) ──────────────────────
+{{#if llm.tavily_api_key}}
+[web_search]
+enabled = true
+provider = "tavily"
+tavily_api_key = "{{llm.tavily_api_key}}"
+max_results = 10
+timeout_secs = 15
+{{else}}
+[web_search]
+enabled = true
+provider = "duckduckgo"
+max_results = 10
+timeout_secs = 15
+{{/if}}
+
+[web_fetch]
+enabled = true
+allowed_domains = ["*"]
+blocked_domains = []
+max_response_size = 524288
+timeout_secs = 30
+
+[http_request]
+enabled = true
+allowed_domains = []
+max_response_size = 1048576
+timeout_secs = 30
+
 # ── Cost tracking ──────────────────────────────────────────
 [cost]
 enabled = true

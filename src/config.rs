@@ -69,6 +69,10 @@ pub struct ZeroclawTemplateConfig {
     /// rendered `[autonomy] max_cost_per_day_cents` field.
     #[serde(default = "default_max_cost_per_day_cents")]
     pub max_cost_per_day_cents: u64,
+    /// Tavily API key for the web_search tool. Empty = web_search stays
+    /// disabled. Get a free key at https://app.tavily.com (1000/mo free).
+    #[serde(default)]
+    pub tavily_api_key: String,
 }
 
 fn default_temperature() -> f64 {

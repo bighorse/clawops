@@ -35,6 +35,9 @@ api_key = ""
 default_temperature = 0.6
 provider_timeout_secs = 120
 max_cost_per_day_cents = 500
+# Tavily API key for the web_search tool. Free tier (1000/mo) at
+# https://app.tavily.com — empty falls back to DuckDuckGo (no key).
+tavily_api_key = ""
 
 [wx]
 # WeChat mini-program credentials. Leave empty during local dev to use mock login.
