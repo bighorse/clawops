@@ -73,5 +73,5 @@ admin_per_ip_per_min = 60
 # Empty api_base disables the commodity skill.
 api_base = "https://bdhrapi.2048office.com/commodity"
 # `{id}` is the literal placeholder the LLM substitutes per product.
-# Example outputs: /pages/commodity/detail?id=42
-detail_path_template = "/pages/commodity/detail?id={id}"
+# Example outputs: /pages/products/detail?id=42
+detail_path_template = "/pages/products/detail?id={id}"

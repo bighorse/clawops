@@ -131,7 +131,7 @@ pub struct CommodityConfig {
 }
 
 fn default_detail_path_template() -> String {
-    "/pages/commodity/detail?id={id}".into()
+    "/pages/products/detail?id={id}".into()
 }
 
 impl Default for CommodityConfig {
