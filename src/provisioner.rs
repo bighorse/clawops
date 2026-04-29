@@ -170,6 +170,11 @@ impl Provisioner {
                 "max_cost_per_day_cents": tpl.max_cost_per_day_cents,
                 "tavily_api_key": tpl.tavily_api_key,
             },
+            "commodity": {
+                "api_base": self.cfg.commodity.api_base,
+                "detail_path_template": self.cfg.commodity.detail_path_template,
+                "enabled": !self.cfg.commodity.api_base.is_empty(),
+            },
         });
 
         let mut hb = Handlebars::new();
@@ -183,6 +188,32 @@ impl Provisioner {
         render_one(&hb, tpl_dir, "IDENTITY.md.hbs", &layout.workspace_dir.join("IDENTITY.md"), &ctx)?;
         render_one(&hb, tpl_dir, "SOUL.md.hbs", &layout.workspace_dir.join("SOUL.md"), &ctx)?;
         render_one(&hb, tpl_dir, "config.toml.hbs", &layout.config_dir.join("config.toml"), &ctx)?;
+
+        // Render skills: each templates/workspace/skills/<name>/SKILL.md.hbs
+        // becomes <workspace>/skills/<name>/SKILL.md. zeroclaw auto-loads
+        // anything under workspace/skills/<name>/SKILL.md into the system
+        // prompt (see src/skills/mod.rs:148 — manifest path resolution).
+        let tpl_skills_dir = tpl_dir.join("skills");
+        if tpl_skills_dir.is_dir() {
+            for entry in std::fs::read_dir(&tpl_skills_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let skill_name = entry.file_name();
+                let src_skill_md = entry.path().join("SKILL.md.hbs");
+                if !src_skill_md.exists() {
+                    continue;
+                }
+                let dest_dir = layout.workspace_dir.join("skills").join(&skill_name);
+                std::fs::create_dir_all(&dest_dir)?;
+                let dest_path = dest_dir.join("SKILL.md");
+                let tpl_text = std::fs::read_to_string(&src_skill_md)?;
+                let rendered = hb.render_template(&tpl_text, &ctx)?;
+                std::fs::write(&dest_path, rendered)?;
+            }
+        }
+
         Ok(())
     }
 

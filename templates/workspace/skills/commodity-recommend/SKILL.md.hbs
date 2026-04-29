@@ -1,0 +1,101 @@
+{{#if commodity.enabled}}
+# 平台服务产品推荐(commodity-recommend)
+
+当用户表达"我需要 / 想找 / 帮我推荐 / 有没有 XX 服务"等采购意图时,**直接调用本平台的服务产品 API**(`http_request` 工具),返回结构化推荐清单。**不要**用 web_search 搜外网 —— 平台自己有完整产品库。
+
+## API 入口
+
+- **API 根路径**:`{{commodity.api_base}}`
+- **鉴权**:GET 接口**无需 token**,直接调用
+- **响应包络**:`{ "request_id": "...", "message": null, "data": { ... } }` —— 数据在 `.data` 字段里
+
+## 四种使用场景
+
+### 1. 关键字搜索(最常用)
+
+用户:"我想找招聘服务" / "有没有工商注册的产品"
+
+```
+GET {{commodity.api_base}}/services/products?keyword=<关键字>&page_size=10
+```
+
+可选参数:
+- `keyword`(string)模糊匹配,多个用英文逗号分隔
+- `category_ids[]`(array of int)按分类过滤
+- `service_scope[]`(array of string)服务地域,如 `["北京"]`
+- `is_innovation_coupon_service`(int,1=只看创新券产品)
+- `page_index`(default 1)、`page_size`(default 20)
+
+响应 `.data.data[]` 每项含:`id`, `service_name`, `description`, `min_price`, `max_price`, `shop_name`, `images[]`, `view_count`。
+
+### 2. 推荐清单(平台运营推荐)
+
+用户:"业务刚起步有什么推荐?" / "新手入门必备" / "热门服务"
+
+```
+GET {{commodity.api_base}}/services/products/recommend_list?page_size=10
+```
+
+返回平台运营选定的推荐产品。响应字段同上。
+
+### 3. 浏览分类(产品太多时先收敛话题)
+
+用户:"你们都有什么类型的服务?" / 不确定关键字时
+
+```
+GET {{commodity.api_base}}/categories?tree=true&page_size=50
+```
+
+响应 `.data.data[]` 含:`id`, `name`, `child_categories[]`(树形)。把分类名抛给用户选,再用对应 `category_id` 调场景 1。
+
+### 4. 查具体产品详情
+
+用户提到具体产品名/ID,或者第一轮搜出来后用户问"第 X 个的具体内容"
+
+```
+GET {{commodity.api_base}}/services/products/<obj_id>
+```
+
+响应是单个产品的完整 schema,含规格、详细介绍、图片等。
+
+## 输出格式(给小程序前端)
+
+**用 markdown 列表**,每项必含:**产品名(带链接)、价格区间、店铺、一句话简介**。链接格式:
+
+```
+[产品名]({{commodity.detail_path_template}})
+```
+
+把 `{id}` 替换成产品的实际 `id`(从 API 响应取)。**不要**写成 `{{commodity.api_base}}/...` —— 那是 API 不是详情页,用户点了打不开。
+
+**完整输出示例**(用户问"我想找招聘服务"):
+
+```
+帮你从平台找了 5 款相关产品:
+
+1. **[翰翼(高端精英人才服务)](/pages/commodity/detail?id=1234)**
+   ¥30000 起 · 锐仕方达 · 高端管理与核心技术人才精准匹配
+
+2. **[XX 招聘代理服务](/pages/commodity/detail?id=1278)**
+   ¥5000–8000 · ...
+```
+
+输出准则:
+- 默认返 5 条,够用即可。用户说"多看几个"才上 10
+- 每项 1-2 行,**不要**把 description 全文复制(可能几百字)
+- 价格区间用"¥min–max"或"¥min 起",**不要**写 `null`(API 偶尔返回 null,过滤掉这个字段)
+- **没有结果**时:告诉用户当前关键词没匹配到,建议换词或先看分类(场景 3)
+- **API 返回错误**(非 200):告诉用户"产品库暂时取不到,稍后再试",**不要**编造产品
+
+## 何时**不**用本 SKILL
+
+- 用户问"政策"/"补贴"/"申报窗口"——这是 web_search 找政策原文,不是平台产品
+- 用户已经在结账/下单流程——本 SKILL 只做推荐,**不**走订单 API(POST 接口)
+- 用户问"我的订单状态"——本 SKILL 也不查订单(订单接口需要 Bearer 鉴权,我们没有)
+
+## 安全 & 限制
+
+- 只调 GET 接口。**禁止**调 POST/PUT/PATCH/DELETE(写操作需要 Bearer token,我们没有,而且会动平台数据)
+- 只调 `{{commodity.api_base}}` 域下的 URL,**不要**猜其他 endpoint
+- 一次对话里 `http_request` 调用 ≤ 3 次,避免无限刷接口
+{{/if}}

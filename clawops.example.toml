@@ -64,3 +64,14 @@ token = ""
 wx_login_per_ip_per_min = 10
 chat_per_user_per_min = 30
 admin_per_ip_per_min = 60
+
+[commodity]
+# Platform commodity / service-product catalogue API. The ClawOps
+# provisioner injects api_base + detail_path_template into every user's
+# rendered SKILL.md so the in-daemon LLM knows where to query and how
+# to format product detail links.
+# Empty api_base disables the commodity skill.
+api_base = "https://bdhrapi.2048office.com/commodity"
+# `{id}` is the literal placeholder the LLM substitutes per product.
+# Example outputs: /pages/commodity/detail?id=42
+detail_path_template = "/pages/commodity/detail?id={id}"

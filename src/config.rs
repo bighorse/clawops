@@ -16,6 +16,8 @@ pub struct Config {
     pub admin: AdminConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub commodity: CommodityConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -108,6 +110,37 @@ pub struct ZeroclawConfig {
 pub struct ProvisionerConfig {
     pub backend: String,
     pub template_dir: PathBuf,
+}
+
+/// Platform service-product (commodity) catalogue API. ClawOps doesn't
+/// proxy these calls itself — it injects the API base + URL templates
+/// into each user's SKILL doc so the in-daemon LLM uses the http_request
+/// tool to query the catalogue and recommend products to the user.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommodityConfig {
+    /// Public root, e.g. "https://bdhrapi.2048office.com/commodity".
+    /// Empty disables the commodity skill.
+    #[serde(default)]
+    pub api_base: String,
+    /// Mini-program internal path the LLM puts in markdown links so the
+    /// front-end can intercept clicks and `wx.navigateTo`. `{id}` is
+    /// replaced with the product id at render time by the LLM.
+    /// Example: "/pages/commodity/detail?id={id}"
+    #[serde(default = "default_detail_path_template")]
+    pub detail_path_template: String,
+}
+
+fn default_detail_path_template() -> String {
+    "/pages/commodity/detail?id={id}".into()
+}
+
+impl Default for CommodityConfig {
+    fn default() -> Self {
+        Self {
+            api_base: String::new(),
+            detail_path_template: default_detail_path_template(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

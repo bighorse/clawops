@@ -163,7 +163,7 @@ timeout_secs = 30
 
 [http_request]
 enabled = true
-allowed_domains = []
+allowed_domains = [{{#if commodity.enabled}}"bdhrapi.2048office.com"{{/if}}]
 max_response_size = 1048576
 timeout_secs = 30
 
