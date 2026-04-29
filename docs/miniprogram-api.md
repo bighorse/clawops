@@ -138,6 +138,69 @@ Content-Type: application/json
 
 ---
 
+### GET /me/chat-history
+
+拉取已保存的历史对话,支持游标分页。**只有成功完成的 chat 才会被持久化**(中途 timeout / 报错的不写入);重启 daemon 也不丢。
+
+**Query params**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `before_id` | int (optional) | 游标,只返回 `id < before_id` 的消息。首次不传(从最新开始) |
+| `limit` | int (default 20, max 100) | 每页消息数 |
+
+**Response 200**
+
+```json
+{
+  "messages": [
+    {"id": 12, "openid": "o_xxx", "role": "assistant", "content": "...", "created_at": "..."},
+    {"id": 11, "openid": "o_xxx", "role": "user",      "content": "...", "created_at": "..."},
+    ...
+  ],
+  "has_more": true,
+  "next_cursor": 9
+}
+```
+
+`messages` 是按 `id DESC` 排列(最新在最前)。前端通常 `reverse()` 后展示(最旧在顶)。`has_more` 表示之前还有更多,把 `next_cursor` 当下次的 `before_id` 传即可。
+
+**典型用法**(进入 chat 页面 + 上拉加载更多):
+
+```javascript
+// 进入 chat 页面 onLoad
+async loadInitialHistory() {
+  const res = await wx.request({
+    url: `${BASE}/me/chat-history?limit=20`,
+    header: { 'Authorization': `Bearer ${token}` }
+  })
+  // 反转一次,变成 [最旧,...,最新]
+  this.setData({
+    messages: res.data.messages.reverse(),
+    cursor: res.data.next_cursor,
+    hasMore: res.data.has_more
+  })
+}
+
+// 用户上拉(scrollView bindtap-to-top 或 onPullDownRefresh)
+async loadMoreHistory() {
+  if (!this.data.hasMore || this.data.loading) return
+  this.setData({ loading: true })
+  const res = await wx.request({
+    url: `${BASE}/me/chat-history?limit=20&before_id=${this.data.cursor}`,
+    header: { 'Authorization': `Bearer ${token}` }
+  })
+  this.setData({
+    messages: [...res.data.messages.reverse(), ...this.data.messages],
+    cursor: res.data.next_cursor,
+    hasMore: res.data.has_more,
+    loading: false
+  })
+}
+```
+
+---
+
 ### GET /events
 
 订阅 zeroclaw 实时事件流(SSE),用于展示"思考中 / 正在搜索 / 调用工具"等进度。
@@ -169,6 +232,69 @@ data: {"type":"agent_end","duration_ms":12450,"tokens_used":2341,"timestamp":"..
 - 订阅 `/events` 把进度事件渲染成进度条 / 思考过程
 
 `/events` 在 `/chat` 完成后**不会自动关闭**(它是用户专属事件流,持久订阅);小程序自己负责在合适时机断开(切页面、消息显示完成后)。
+
+#### 事件 → 状态文案映射(让用户不焦虑)
+
+每个 chat 期间事件**多次到达**,前端用一个**单一**状态行(替换显示,**不**堆叠成列表),展示 LLM 当前在干啥。建议映射:
+
+| 事件 type | 字段提示 | 前端文案 |
+|-----------|---------|---------|
+| `agent_start` | — | 🤔 思考中... |
+| `llm_request` | `model` | 💭 正在请求 {model}... |
+| `tool_call_start` | `tool=http_request` | 🌐 正在查产品库... |
+| `tool_call_start` | `tool=web_search` | 🔍 正在搜索网络... |
+| `tool_call_start` | `tool=web_fetch` | 📄 正在打开网页... |
+| `tool_call_start` | `tool=memory_recall` | 🧠 正在回忆... |
+| `tool_call_start` | `tool=memory_store` | 📝 正在记录... |
+| `tool_call_start` | `tool=file_read` / `file_write` | 📁 正在处理文件... |
+| `tool_call_start` | 其他 tool | 🔧 正在调用 {tool}... |
+| `tool_call` | `success=false` | ⚠️ 工具调用失败,继续尝试... |
+| `agent_end` | — | 隐藏状态行,显示最终回复 |
+| `error` | `message` | ❌ {message} |
+
+**示例代码**(配合上面 `subscribeEvents`):
+
+```javascript
+this.setData({ statusLine: '' })
+
+const stream = subscribeEvents(token, ev => {
+  const text = formatEventStatus(ev)
+  if (text === null) {
+    // agent_end - 隐藏状态行
+    this.setData({ statusLine: '' })
+    return
+  }
+  // 任何新事件 → 替换状态行(不堆叠)
+  this.setData({ statusLine: text })
+})
+
+function formatEventStatus(ev) {
+  switch (ev.type) {
+    case 'agent_start': return '🤔 思考中...'
+    case 'llm_request': return `💭 正在请求 ${ev.model || 'AI'}...`
+    case 'agent_end':   return null  // 收尾
+    case 'error':       return `❌ ${ev.message || '出错了'}`
+    case 'tool_call_start': {
+      const tool = ev.tool
+      const map = {
+        'http_request': '🌐 正在查产品库...',
+        'web_search':   '🔍 正在搜索网络...',
+        'web_fetch':    '📄 正在打开网页...',
+        'memory_recall':'🧠 正在回忆...',
+        'memory_store': '📝 正在记录...',
+        'file_read':    '📁 正在读取文件...',
+        'file_write':   '📁 正在写入文件...',
+      }
+      return map[tool] || `🔧 正在调用 ${tool}...`
+    }
+    case 'tool_call':
+      return ev.success === false ? '⚠️ 工具调用失败,继续尝试...' : null
+    default: return null
+  }
+}
+```
+
+**注意**:`/events` 流持续推送,`/chat` POST 收到 response 后,**前端要主动隐藏状态行**(因为 SSE 不会主动停)。最简单:`/chat` success 回调里 `setData({ statusLine: '' })`。
 
 ---
 
