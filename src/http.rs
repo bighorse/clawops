@@ -41,6 +41,8 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/provision", post(admin_provision))
         .route("/admin/stop/:openid", post(admin_stop))
         .route("/admin/issue-token", post(admin_issue_token))
+        .route("/admin/refresh-workspace/:openid", post(admin_refresh_workspace))
+        .route("/admin/refresh-all-workspaces", post(admin_refresh_all_workspaces))
         .with_state(state)
 }
 
@@ -552,6 +554,47 @@ async fn admin_issue_token(
         "token": s.token,
         "openid": s.openid,
         "expires_at": s.expires_at,
+    })))
+}
+
+/// POST /admin/refresh-workspace/:openid — re-render workspace markdown
+/// (USER.md, IDENTITY.md, SOUL.md, skills/*) from the latest templates
+/// for ONE user. Does not touch config.toml so paired_token / cost
+/// limits survive. zeroclaw picks up changes on next /chat (re-reads
+/// markdown per turn).
+async fn admin_refresh_workspace(
+    _: AdminGuard,
+    State(st): State<AppState>,
+    Path(openid): Path<String>,
+) -> std::result::Result<impl IntoResponse, Error> {
+    st.provisioner.refresh_workspace(&openid).await?;
+    Ok(Json(serde_json::json!({"refreshed": openid})))
+}
+
+/// POST /admin/refresh-all-workspaces — same as above but loop over every
+/// user. Reports success/error counts. Use after deploying template changes.
+async fn admin_refresh_all_workspaces(
+    _: AdminGuard,
+    State(st): State<AppState>,
+) -> std::result::Result<impl IntoResponse, Error> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT openid FROM users")
+        .fetch_all(&st.pool)
+        .await?;
+    let mut ok = 0usize;
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+    for (openid,) in &rows {
+        match st.provisioner.refresh_workspace(openid).await {
+            Ok(()) => ok += 1,
+            Err(e) => errors.push(serde_json::json!({
+                "openid": openid,
+                "error": e.to_string(),
+            })),
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "total": rows.len(),
+        "refreshed": ok,
+        "errors": errors,
     })))
 }
 

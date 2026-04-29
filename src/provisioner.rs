@@ -252,9 +252,103 @@ impl Provisioner {
     /// are *not* touched — config.toml in particular contains the
     /// paired_token that the daemon already loaded.
     ///
-    /// zeroclaw rebuilds the system prompt on every new message
-    /// (channels/mod.rs `inject_workspace_file`), so the next /chat
-    /// request will pick up the new profile without restarting the daemon.
+    /// Re-render every markdown asset under the user's workspace
+    /// (USER.md, IDENTITY.md, SOUL.md, all skills/<name>/SKILL.md)
+    /// from the latest templates. **Does NOT touch config.toml** so
+    /// the daemon's paired_token, port, and cost limits are preserved
+    /// — caller doesn't need to restart the daemon, zeroclaw re-reads
+    /// these markdown files on every new message
+    /// (channels/mod.rs `inject_workspace_file`).
+    ///
+    /// Use after deploying template changes (e.g. new IDENTITY rules,
+    /// new skills) to roll the change out to existing users without
+    /// disturbing their session tokens.
+    pub async fn refresh_workspace(&self, openid: &str) -> Result<()> {
+        let user = users::get_required(&self.pool, openid).await?;
+        let layout = UserHomeLayout::new(&self.cfg.zeroclaw.home_base, &user.linux_uid);
+
+        let profile: serde_json::Value = user
+            .enterprise_profile
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+
+        let tpl = &self.cfg.zeroclaw_template;
+        let ctx = json!({
+            "openid": user.openid,
+            "phone": user.phone,
+            "display_name": user.display_name,
+            "linux_uid": user.linux_uid,
+            "port": user.port,
+            "workspace_path": layout.workspace_dir,
+            "config_dir": layout.config_dir,
+            "home_dir": layout.home_dir,
+            "enterprise": profile,
+            "llm": {
+                "default_provider": tpl.default_provider,
+                "default_model": tpl.default_model,
+                "tavily_api_key": tpl.tavily_api_key,
+            },
+            "commodity": {
+                "api_base": self.cfg.commodity.api_base,
+                "detail_path_template": self.cfg.commodity.detail_path_template,
+                "enabled": !self.cfg.commodity.api_base.is_empty(),
+            },
+        });
+
+        let mut hb = Handlebars::new();
+        hb.set_strict_mode(false);
+
+        let tpl_dir = &self.cfg.provisioner.template_dir;
+        std::fs::create_dir_all(&layout.workspace_dir)?;
+
+        // Re-render the three top-level markdowns (NOT config.toml)
+        for fname in &["USER.md", "IDENTITY.md", "SOUL.md"] {
+            let tpl_name = format!("{fname}.hbs");
+            render_one(
+                &hb,
+                tpl_dir,
+                &tpl_name,
+                &layout.workspace_dir.join(fname),
+                &ctx,
+            )?;
+        }
+
+        // Re-render every skill (clear stale skills first so removed
+        // skills don't linger; add new skills automatically appear).
+        let dest_skills = layout.workspace_dir.join("skills");
+        let _ = std::fs::remove_dir_all(&dest_skills);
+        let tpl_skills_dir = tpl_dir.join("skills");
+        if tpl_skills_dir.is_dir() {
+            for entry in std::fs::read_dir(&tpl_skills_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let skill_name = entry.file_name();
+                let src_skill_md = entry.path().join("SKILL.md.hbs");
+                if !src_skill_md.exists() {
+                    continue;
+                }
+                let dest_dir = dest_skills.join(&skill_name);
+                std::fs::create_dir_all(&dest_dir)?;
+                let dest_path = dest_dir.join("SKILL.md");
+                let tpl_text = std::fs::read_to_string(&src_skill_md)?;
+                let rendered = hb.render_template(&tpl_text, &ctx)?;
+                std::fs::write(&dest_path, rendered)?;
+            }
+        }
+
+        // chown best-effort (only matters in systemd backend)
+        self.backend
+            .chown_workspace(&user.linux_uid, &layout)
+            .await
+            .ok();
+        Ok(())
+    }
+
+    /// Legacy: re-render only USER.md. Kept for /me/profile which
+    /// only updates the user's own profile fields.
     pub async fn refresh_user_md(&self, openid: &str) -> Result<()> {
         let user = users::get_required(&self.pool, openid).await?;
         let layout = UserHomeLayout::new(&self.cfg.zeroclaw.home_base, &user.linux_uid);
