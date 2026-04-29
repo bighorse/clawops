@@ -18,6 +18,29 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub commodity: CommodityConfig,
+    #[serde(default)]
+    pub lead: LeadConfig,
+}
+
+/// Lead-submission notification settings. When a user leaves contact
+/// info during cross-sell or commodity inquiry, the daemon can POST a
+/// notification to a chat-bot webhook so ops sees it in real time.
+/// If `webhook_url` is empty, no notification is sent.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct LeadConfig {
+    /// Webhook URL. Currently supports Lark/Feishu custom bot
+    /// (`https://open.feishu.cn/open-apis/bot/v2/hook/<id>`).
+    /// Empty disables notification — LLM only stores to memory.
+    #[serde(default)]
+    pub webhook_url: String,
+    /// Webhook format. `"feishu"` (default) wraps in Lark text body;
+    /// `"raw"` sends a flat JSON string.
+    #[serde(default = "default_lead_format")]
+    pub webhook_format: String,
+}
+
+fn default_lead_format() -> String {
+    "feishu".into()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

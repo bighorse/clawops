@@ -57,6 +57,17 @@ idle_archive_minutes = 525600
 # Generate with: openssl rand -hex 32
 token = ""
 
+[lead]
+# Webhook to notify ops when a user leaves contact info during chat
+# (cross-sell, commodity inquiry, custom build interest, etc).
+# Lark/Feishu custom bot URL example:
+#   https://open.feishu.cn/open-apis/bot/v2/hook/abcd-efgh-1234
+# Empty = no notification (LLM falls back to memory_store only — opaque
+# to ops, transcripts are dead leads).
+webhook_url = ""
+# "feishu" (Lark text body) or "raw" (plain JSON). Other vendors TBD.
+webhook_format = "feishu"
+
 [rate_limit]
 # All limits are sliding-window per minute, in-memory (reset on restart).
 # Source IP is read from X-Forwarded-For first hop (trusted because nginx

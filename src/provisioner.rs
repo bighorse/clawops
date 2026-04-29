@@ -175,6 +175,11 @@ impl Provisioner {
                 "detail_path_template": self.cfg.commodity.detail_path_template,
                 "enabled": !self.cfg.commodity.api_base.is_empty(),
             },
+            "lead": {
+                "webhook_url": self.cfg.lead.webhook_url,
+                "webhook_format": self.cfg.lead.webhook_format,
+                "enabled": !self.cfg.lead.webhook_url.is_empty(),
+            },
         });
 
         let mut hb = Handlebars::new();
@@ -293,6 +298,11 @@ impl Provisioner {
                 "api_base": self.cfg.commodity.api_base,
                 "detail_path_template": self.cfg.commodity.detail_path_template,
                 "enabled": !self.cfg.commodity.api_base.is_empty(),
+            },
+            "lead": {
+                "webhook_url": self.cfg.lead.webhook_url,
+                "webhook_format": self.cfg.lead.webhook_format,
+                "enabled": !self.cfg.lead.webhook_url.is_empty(),
             },
         });
 
