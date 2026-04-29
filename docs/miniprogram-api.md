@@ -34,6 +34,7 @@
 | POST | `/auth/logout-all`  | ✅ Bearer         | 撤销该 openid 全部 token(设备丢失场景) |
 | GET  | `/me/profile`       | ✅ Bearer         | 取当前用户的 display_name / phone / 企业画像 |
 | PUT  | `/me/profile`       | ✅ Bearer         | 部分更新(只传要改的字段);USER.md 立即重渲染,下条 chat 生效 |
+| GET  | `/me/chat-history`  | ✅ Bearer         | 历史消息分页(`?before_id=N&limit=20`),首次不传 before_id |
 | POST | `/chat`             | ✅ Bearer         | 发送消息,等待整段回复(限流 30/min/用户) |
 | GET  | `/events`           | ✅ Bearer 或 `?token=` | 实时事件流(进度条用) |
 | GET  | `/health`           | ❌                | 健康检查 |
