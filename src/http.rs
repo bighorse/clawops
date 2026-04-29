@@ -337,7 +337,7 @@ async fn chat(
     let resp = builder.send().await?;
     if !resp.status().is_success() {
         return Err(Error::Other(format!(
-            "zeroclaw /webhook returned {}",
+            "zeroclaw /api/chat returned {}",
             resp.status()
         )));
     }
