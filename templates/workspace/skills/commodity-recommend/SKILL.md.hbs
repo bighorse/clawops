@@ -1,89 +1,156 @@
 {{#if commodity.enabled}}
-# 平台服务产品推荐(commodity-recommend)
+# SKILL.md — commodity-recommend
 
-⚠️ **这是强制规则,不是参考资料**。
+## 元数据
 
-用户表达任何采购意图时(关键词:"我想找 / 我需要 / 帮我推荐 / 有没有 / 给我看 XX 服务/产品/代办/方案"),你**必须**:
+- **名称**: commodity-recommend
+- **描述**: 对接 2048office 平台 commodity API,自主售前选品、可行性校验,给用户结构化推荐清单
+- **触发词**: 我想找 / 我需要 / 帮我推荐 / 有没有 / 给我看 / 找一下 — 后接任何一个 → **必触发**:
+  - 服务 / 产品 / 方案 / 代办 / 代理 / 注册
+  - 记账 / 报税 / 财税 / 税务
+  - 商标 / 品牌 / 专利 / 软著 / 著作权 / 知识产权
+  - 高新 / 高企 / 研发加计 / 创新券
+  - 社保 / 公积金 / 人事 / 招聘
+  - 法律 / 合同 / 顾问 / 法务
+  - 工商 / 营业执照 / 变更 / 注销 / 年报
+- **API 文档**: https://bdhrapi.2048office.com/commodity/redoc
 
-1. **第一步**:调 `http_request` GET 平台 commodity API(见下面具体 URL)
-2. **第二步**:用 API 返回的真实数据生成推荐清单
-3. **禁止**在没调 API 的情况下输出公司名 / 服务名 / 价格 / 周期 —— 这些是平台运营数据,**你的训练记忆里没有**,**写出来 100% 是编造**,会误导用户决策。这一条没有例外。
+---
 
-**自检**:回答前先问自己:"我列的产品名,是不是从这一轮 http_request 响应里读出来的?" 如果答案是 No,**不要回答** —— 必须先调 API。
+## ⚠️ 核心原则
 
-## API 入口
+- **查询类**(浏览服务、获取报价、推荐方案):自动执行,无需确认
+- **下单类**(POST orders):**禁止**(没鉴权,且我们只做推荐不做下单)
+- **不调 API 不答采购**:用户提到上述触发词时,**必须先调 http_request**;**禁止**凭训练记忆给具体公司名 / 价格 / 周期 —— 这些是平台运营数据,你的训练里没有,写出来 100% 是编造
 
-- API 根路径(常量,渲染时已注入):见下面 case 里的 URL
-- 鉴权:GET 接口**无需 token**,直接调
-- 响应包络:`{"request_id": ..., "message": null, "data": {...}}`,真实数据在 `.data` 字段里
+---
 
-## 四种使用场景
+## API 基础信息
 
-### 场景 1:关键字搜索(最常用)
+- Base URL: `{{commodity.api_base}}`
+- 鉴权: GET 接口**不需要 token**,直接调
+- 响应包络: `{"request_id":..., "message":null, "data":{...}}` —— 真数据在 `.data` 里
 
-触发例:"我想找招聘服务" / "有没有商标注册的产品" / "帮我找工商注册"
+主要端点:
 
-调用:GET 请求至 `{{commodity.api_base}}/services/products`
+| 方法 | 路径 | 用途 |
+|------|------|------|
+| GET | `/services/products` | 关键字搜索/列表 |
+| GET | `/services/products/{id}` | 单产品详情 |
+| GET | `/services/products/recommend_list` | 平台运营推荐 |
+| GET | `/categories?tree=true` | 分类树(用户没具体诉求时) |
 
-查询参数:
-- `keyword`(string)模糊匹配,多个用英文逗号分隔
-- `category_ids[]`(int 数组)按分类过滤
-- `service_scope[]`(string 数组)服务地域,如 `["北京"]`
-- `is_innovation_coupon_service`(int,1 = 只看创新券产品)
-- `page_index`(默认 1)、`page_size`(默认 20,推荐传 10)
+---
 
-响应 `.data.data[]` 每项含:`id`, `service_name`, `description`, `min_price`, `max_price`, `shop_name`, `images[]`, `view_count`。
+## 执行流程:5 步自主售前
 
-### 场景 2:推荐清单(平台运营推荐)
+### Step 1:理解需求,确定关键词
 
-触发例:"业务刚起步有什么推荐" / "新手入门必备" / "热门服务"
+用关键词速查表把用户诉求转成 API 参数:
 
-调用:GET 至 `{{commodity.api_base}}/services/products/recommend_list?page_size=10`
+| 用户诉求 | keyword 参数 |
+|---------|-------------|
+| 商标 / 注册 / 品牌 | `商标注册` |
+| 代理记账 / 财税 | `记账` |
+| 税务申报 / 报税 | `税务申报` |
+| 专利 / 发明 / 实用新型 | `专利申请` |
+| 软件著作权 / 软著 | `软件著作权` |
+| 高新 / 高企 | `高新技术企业` |
+| 社保 / 公积金 | `社保` |
+| 法律顾问 / 合同审核 | `法律顾问` |
+| 工商 / 变更 / 注销 / 营业执照 | `工商` |
+| 知识产权综合 | `知识产权` |
+| 创新券产品 | 加参数 `is_innovation_coupon_service=1` |
 
-响应字段同场景 1。
+### Step 2:搜索服务(自动执行)
 
-### 场景 3:浏览分类(产品太多时先收敛话题)
+```
+http_request GET {{commodity.api_base}}/services/products
+  ?keyword=<速查表的值>
+  &page_size=10
+  &page_index=1
+```
 
-触发例:"你们都有什么类型的服务" / 用户没具体关键字时
+如果 `data_count < 3`,补一把推荐:
 
-调用:GET 至 `{{commodity.api_base}}/categories?tree=true&page_size=50`
+```
+http_request GET {{commodity.api_base}}/services/products/recommend_list
+  ?page_size=5
+```
 
-响应 `.data.data[]` 含:`id`, `name`, `child_categories[]`(树形)。把分类名抛给用户选,再用对应 `category_id` 调场景 1。
+如果用户**完全没说具体需求**(只问"你们都有什么"),改走分类:
 
-### 场景 4:看具体产品详情
+```
+http_request GET {{commodity.api_base}}/categories?tree=true&page_size=50
+```
 
-触发例:用户提到具体产品名/ID,或在前面搜索结果里追问"第 X 个具体怎么收费"
+### Step 3:可行性校验(过滤候选)
 
-调用:GET 至 `{{commodity.api_base}}/services/products/<obj_id>`(把 `<obj_id>` 换成产品 id)
+对返回的 `.data.data[]`,只保留满足以下**全部**条件的:
 
-响应是单个产品的完整 schema(规格、详细介绍、图片等)。
+1. `service_name` 跟用户诉求**真实相关**(光含关键字不够,要语义相关 —— 比如 "商标注册" 通过,"商标侵权诉讼" 不通过,因为用户要"注册"不要"诉讼")
+2. `min_price` 和 `max_price` **不全是 0 或 null**(为 0/null 一律记为"价格面议",不要造价)
+3. `description` 不为空
 
-## 输出给用户的格式
+留 TOP 5。如果过滤后 < 2 条,告诉用户"暂无强匹配,这是接近的产品",再列出来。
 
-最终回复给用户用 **markdown 列表**,每项必含:**产品名(带链接)、价格区间、店铺、一句话简介**。
+### Step 4:展示推荐清单
 
-**链接规则**:用 markdown 链接语法 `[产品名](path)`,其中 `path` 用本路径模板,把 `{id}` 替换成 API 响应中实际的 `id` 值:
+格式严格按下面模板,每条产品**一段**:
 
-  路径模板(原样,不要改):`{{commodity.detail_path_template}}`
+```
+**N. <service_name>** — <shop_name>
+- 价格:¥<min_price>–<max_price>/件 (price 全为 0 时写"面议")
+- 简介:<description 截到 60 字内,带省略号>
+- [查看详情](该产品 id 替换到路径模板里的链接)
+```
 
-举例,产品 id 是 1234,产品名"翰翼",输出形如:**翰翼**接 markdown 链接,链接目标是 `{{commodity.detail_path_template}}` 把 `{id}` 替换成 `1234`。**不要**写成 `{{commodity.api_base}}/...` —— 那是 API 不是详情页,用户点了打不开。
+链接路径模板: `{{commodity.detail_path_template}}` —— 把 `{id}` 换成 API 返回的实际 `id` 数字。比如 id=370 → 链接目标 `/pages/products/detail?id=370`。
 
-输出准则:
-- 默认返 5 条,够用即可。用户说"多看几个"才上 10
-- 每项 1-2 行,**不要**把 description 全文复制(可能几百字)
-- 价格区间用"¥min–max"或"¥min 起",**不要**写 `null`(API 偶尔返回 null,过滤掉这个字段)
-- **没有结果**时:告诉用户当前关键词没匹配到,建议换词或先看分类(场景 3)
-- **API 返回错误**(非 200):告诉用户"产品库暂时取不到,稍后再试",**不要**编造产品
+末尾固定加:
 
-## 何时**不**用本 SKILL
+```
+如需了解某个产品的详情或对比服务差异,告诉我即可。
+```
 
-- 用户问"政策"/"补贴"/"申报窗口"——这是 web_search 找政策原文,不是平台产品
-- 用户已在结账/下单流程——本 SKILL 只做推荐,**不**走订单 API(POST 接口)
-- 用户问"我的订单状态"——本 SKILL 也不查订单(订单接口需要 Bearer 鉴权,我们没有)
+### Step 5:用户追问详情(按需执行)
 
-## 安全 & 限制
+用户指 "第 N 个产品" / "翔石那个怎么样" / "id=370 详情":
 
-- 只调 GET 接口。**禁止**调 POST/PUT/PATCH/DELETE(写操作需要 Bearer token,我们没有,而且会动平台数据)
-- 只调 `{{commodity.api_base}}` 域下的 URL,**不要**猜其他 endpoint
-- 一次对话里 `http_request` 调用 ≤ 3 次,避免无限刷接口
+```
+http_request GET {{commodity.api_base}}/services/products/<obj_id>
+```
+
+返回单产品完整 schema,把 `specs`(规格列表)、`shop`(店铺/联系)、`deliverables`(交付物)整理给用户。**禁止**回到 Step 4 重新搜 —— 用户已经选定了。
+
+---
+
+## 自检(回答前必过)
+
+回答之前必须过这 3 道:
+
+1. **我列的产品 id**,是不是来自这一轮 `http_request` 响应的 `data[].id`?如果不是,**不要回答** —— 必须先调 API。
+2. **我列的价格**,是不是 API 响应的 `min_price`/`max_price`?如果是 0/null,我有没有写"面议"?
+3. **我的链接** `[查看详情](path)` 里,`path` 是不是把 `{id}` 换成了**真 id 数字**?
+
+任一项答 No,**回去调 API,不要凭记忆出答**。
+
+---
+
+## 降级策略
+
+| 情况 | 处理 |
+|------|------|
+| API 401/403 | 不应该发生(GET 免鉴权)。真发生了 → 告诉用户"产品库暂时不可用",**不**编造产品 |
+| 搜无结果(`data_count=0`) | 换 keyword 重试 1 次(用上下文里更宽的词);仍无 → 转 `categories?tree=true` 拉分类问用户具体方向 |
+| 网络超时(`http_request` 失败) | 告诉用户"产品库暂时取不到,稍后再试",**不**编造 |
+| 用户问下单/购买流程 | 回复"我可以帮你找产品和对比方案,具体下单请到产品详情页操作" —— **不调** POST |
+
+---
+
+## 与其他技能的边界
+
+- 用户问**政策 / 补贴 / 申报窗口** → web_search,**不**用本技能(政策不是平台产品)
+- 用户问**订单状态 / 我的购买记录** → 不是本技能(订单查询要 Bearer 鉴权,我们没有)
+- 用户问**详细业务建议**(怎么注册、流程是啥) → 先用本技能找产品,再让用户去产品详情页看,**不**自己解释流程
 {{/if}}
