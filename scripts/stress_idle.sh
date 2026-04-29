@@ -76,17 +76,24 @@ snapshot() {
 echo "→ baseline (0 stress users)"
 snapshot 0 || exit 0
 
+CLAWOPS_BIN="${CLAWOPS_BIN:-/usr/local/bin/clawops}"
+CLAWOPS_CONFIG="${CLAWOPS_CONFIG:-/etc/clawops/clawops.toml}"
+
+# Use the CLI subcommand instead of POST /admin/provision so we don't
+# trip our own admin_per_ip rate limit (60/min by default — would
+# block at user 79 otherwise).
 for i in $(seq 1 "$MAX_USERS"); do
     openid="${PREFIX}${i}"
-    code=$(curl -s -o /tmp/_provision.json -w '%{http_code}' \
-        -X POST "$BASE/admin/provision" \
-        -H "X-Admin-Token: $ADMIN_TOKEN" \
-        -H 'Content-Type: application/json' \
-        -d "{\"openid\":\"$openid\"}")
-    if [[ "$code" != "200" ]]; then
-        echo "!! provision $openid HTTP $code — $(head -c 200 /tmp/_provision.json)" >&2
-        # often 409 (already exists) on rerun; fine, keep going
-        if [[ "$code" != "409" ]]; then
+    if ! "$CLAWOPS_BIN" --config "$CLAWOPS_CONFIG" provision \
+        --openid "$openid" >/tmp/_provision.log 2>&1
+    then
+        last=$(tail -3 /tmp/_provision.log)
+        # already-exists is fine on rerun, anything else is fatal
+        if echo "$last" | grep -qi 'already exists'; then
+            : # noop, continue
+        else
+            echo "!! provision $openid failed:" >&2
+            echo "$last" >&2
             break
         fi
     fi
