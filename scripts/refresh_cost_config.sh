@@ -20,12 +20,12 @@ warn_at_percent = 80
 allow_override = false
 
 [cost.prices."qwen3.6-flash"]
-input = 0.043
-output = 0.086
+input = 0.169
+output = 1.014
 
 [cost.prices."qwen3.6-plus"]
-input = 0.114
-output = 0.343
+input = 0.676
+output = 4.056
 EOT
 
 updated=0

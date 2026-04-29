@@ -184,9 +184,10 @@ warn_at_percent = 80
 allow_override = false
 
 [cost.prices."qwen3.6-flash"]
-input = 0.043                 # USD per 1M tokens (≈ ¥0.30)
-output = 0.086                # USD per 1M tokens (≈ ¥0.60)
+input = 0.169                 # USD per 1M tokens (= ¥1.2 official)
+output = 1.014                # USD per 1M tokens (= ¥7.2 official)
 
 [cost.prices."qwen3.6-plus"]
-input = 0.114                 # USD per 1M tokens (≈ ¥0.80)
-output = 0.343                # USD per 1M tokens (≈ ¥2.40)
+# qwen-plus 比 qwen-flash 贵 4-5 倍,这里按经验比例,以 dashscope 实际为准
+input = 0.676                 # USD per 1M tokens (≈ ¥4.8)
+output = 4.056                # USD per 1M tokens (≈ ¥28.8)
