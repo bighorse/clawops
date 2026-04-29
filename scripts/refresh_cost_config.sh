@@ -24,24 +24,20 @@ input = 0.169
 output = 1.014
 
 [cost.prices."qwen3.6-plus"]
-input = 0.676
-output = 4.056
+input = 0.282
+output = 1.690
 EOT
 
 updated=0
-skipped=0
 for u in $(ls /home | grep '^claw-'); do
     cfg="/home/$u/.zeroclaw/config.toml"
     if [[ ! -f "$cfg" ]]; then
         continue
     fi
 
-    if grep -q '^daily_limit_usd' "$cfg"; then
-        echo "skip $u (already up-to-date)"
-        skipped=$((skipped + 1))
-        continue
-    fi
-
+    # No idempotent skip: always replace [cost] from the latest
+    # template. Pricing/limits change too often for a marker check
+    # to work; backup the old config so rollback is one cp away.
     cp -p "$cfg" "${cfg}.bak.$(date +%Y%m%d%H%M%S)"
 
     # Strip the existing [cost] section (and any [cost.*] sub-tables)
@@ -69,5 +65,5 @@ for u in $(ls /home | grep '^claw-'); do
 done
 
 echo
-echo "done — updated=$updated skipped=$skipped"
-echo "rollback per-user: cp /home/<uid>/.zeroclaw/config.toml.bak.* /home/<uid>/.zeroclaw/config.toml"
+echo "done — updated=$updated users"
+echo "rollback per-user: cp /home/<uid>/.zeroclaw/config.toml.bak.<latest> /home/<uid>/.zeroclaw/config.toml"
