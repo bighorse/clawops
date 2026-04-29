@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod chat_history;
 pub mod config;
 pub mod db;
 pub mod error;

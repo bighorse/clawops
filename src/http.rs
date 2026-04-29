@@ -2,7 +2,7 @@ use crate::auth::WxClient;
 use crate::config::Config;
 use crate::limits::{self, AppLimiters};
 use crate::provisioner::Provisioner;
-use crate::{sessions, users, Error, Result};
+use crate::{chat_history, sessions, users, Error, Result};
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::body::Body;
@@ -35,6 +35,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(events))
         .route("/me/profile", axum::routing::put(update_my_profile))
         .route("/me/profile", get(get_my_profile))
+        .route("/me/chat-history", get(get_my_chat_history))
         .route("/admin/users", get(list_users))
         .route("/admin/users/:openid", get(get_user))
         .route("/admin/provision", post(admin_provision))
@@ -303,56 +304,107 @@ async fn chat(
     let user = st.provisioner.ensure_running(&openid).await?;
     users::touch_active(&st.pool, &user.openid).await?;
 
-    // Phase 1: if the backend does not actually launch a daemon, we return
-    // a canned response for smoke-testing the pipeline. Real mode forwards
-    // to the user's zeroclaw /webhook.
-    if !st.provisioner.backend.launches_daemon() {
-        return Ok(Json(ChatResp {
-            response: format!("[mock] echo: {}", req.content),
-            model: Some("mock".into()),
-            openid: user.openid,
-        }));
-    }
+    // Mock mode (no daemon launched) returns a canned echo so smoke
+    // tests of the full pipeline still work. Real mode hits the daemon.
+    let (response_text, model) = if !st.provisioner.backend.launches_daemon() {
+        (format!("[mock] echo: {}", req.content), Some("mock".into()))
+    } else {
+        let port = user
+            .port
+            .ok_or_else(|| Error::Other(format!("user {} has no port assigned", user.openid)))?;
+        // /api/chat (full agent loop with tool execution); /webhook would
+        // bypass the agent loop and return raw <tool_call> XML.
+        let url = format!("http://127.0.0.1:{port}/api/chat");
 
-    let port = user.port.ok_or_else(|| {
-        Error::Other(format!("user {} has no port assigned", user.openid))
-    })?;
-    // /api/chat (full agent loop with tool execution); /webhook would
-    // bypass the agent loop and return raw <tool_call> XML.
-    let url = format!("http://127.0.0.1:{port}/api/chat");
+        let mut builder = st
+            .http
+            .post(&url)
+            .json(&serde_json::json!({"message": req.content}));
+        if let Some(token) = &user.paired_token_enc {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+        if let Some(idem) = &req.idempotency_key {
+            builder = builder.header("X-Idempotency-Key", idem);
+        }
 
-    let mut builder = st
-        .http
-        .post(&url)
-        .json(&serde_json::json!({"message": req.content}));
-
-    if let Some(token) = &user.paired_token_enc {
-        // In phase 1 the token is stored in plaintext; encryption is TODO.
-        builder = builder.header("Authorization", format!("Bearer {token}"));
-    }
-    if let Some(idem) = &req.idempotency_key {
-        builder = builder.header("X-Idempotency-Key", idem);
-    }
-
-    let resp = builder.send().await?;
-    if !resp.status().is_success() {
-        return Err(Error::Other(format!(
-            "zeroclaw /api/chat returned {}",
-            resp.status()
-        )));
-    }
-    let body: serde_json::Value = resp.json().await?;
-    Ok(Json(ChatResp {
-        response: body
+        let resp = builder.send().await?;
+        if !resp.status().is_success() {
+            return Err(Error::Other(format!(
+                "zeroclaw /api/chat returned {}",
+                resp.status()
+            )));
+        }
+        let body: serde_json::Value = resp.json().await?;
+        let response_text = body
             .get("response")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
-            .to_string(),
-        model: body
+            .to_string();
+        let model = body
             .get("model")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+            .map(|s| s.to_string());
+        (response_text, model)
+    };
+
+    // Persist this turn (user + assistant) so the mini-program can
+    // re-render history on page load + scroll-back-load older messages.
+    // Non-fatal if the write fails — caller still gets the response.
+    if let Err(e) =
+        chat_history::record_turn(&st.pool, &user.openid, &req.content, &response_text).await
+    {
+        tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
+    }
+
+    Ok(Json(ChatResp {
+        response: response_text,
+        model,
         openid: user.openid,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ChatHistoryQuery {
+    /// Cursor: returns messages with `id < before_id`. Omit on first page.
+    #[serde(default)]
+    before_id: Option<i64>,
+    /// Page size, capped at 100. Default 20.
+    #[serde(default = "default_history_limit")]
+    limit: i64,
+}
+
+fn default_history_limit() -> i64 {
+    20
+}
+
+#[derive(Serialize)]
+struct ChatHistoryResp {
+    /// Messages in DESC order by id (newest first within this page).
+    /// Front-end typically reverses for display.
+    messages: Vec<chat_history::ChatMessage>,
+    /// True if more messages exist before this page.
+    has_more: bool,
+    /// Pass this back as `before_id` to load the next older page.
+    /// Null when `has_more` is false.
+    next_cursor: Option<i64>,
+}
+
+async fn get_my_chat_history(
+    State(st): State<AppState>,
+    AuthOpenid(openid): AuthOpenid,
+    Query(q): Query<ChatHistoryQuery>,
+) -> std::result::Result<Json<ChatHistoryResp>, Error> {
+    let messages = chat_history::fetch_page(&st.pool, &openid, q.before_id, q.limit).await?;
+    let has_more = messages.len() as i64 == q.limit.clamp(1, 100);
+    let next_cursor = if has_more {
+        messages.last().map(|m| m.id)
+    } else {
+        None
+    };
+    Ok(Json(ChatHistoryResp {
+        messages,
+        has_more,
+        next_cursor,
     }))
 }
 
