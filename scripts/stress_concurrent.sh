@@ -58,25 +58,38 @@ done
 echo "→ before-fire mem (MB):"
 free -m | awk 'NR==2 {printf "  used=%s free=%s avail=%s\n",$3,$4,$7}'
 
-# 3. Fire K parallel chats (xargs -P K)
+# 3. Fire K parallel chats. Use a worker function and `xargs -P` over
+# token lines; export env vars so the child shells see them.
+fire_one() {
+    local openid="$1"
+    local tok="$2"
+    local resp="/tmp/_resp_${openid}.json"
+    local t0 t1 code bytes dur_ms
+    t0=$(date +%s%N)
+    code=$(curl -s -o "$resp" -w '%{http_code}' \
+        -X POST "$BASE/chat" \
+        --max-time 180 \
+        -H "Authorization: Bearer $tok" \
+        -H 'Content-Type: application/json' \
+        -d "{\"content\":\"$PROMPT\"}")
+    t1=$(date +%s%N)
+    dur_ms=$(( (t1 - t0) / 1000000 ))
+    if [[ -f "$resp" ]]; then
+        bytes=$(wc -c < "$resp")
+        rm -f "$resp"
+    else
+        bytes=0
+    fi
+    printf '%s\t%s\t%dms\t%db\n' "$openid" "$code" "$dur_ms" "$bytes"
+}
+export -f fire_one
+export BASE PROMPT
+
 echo "→ firing $K parallel /chat..."
 START_NS=$(date +%s%N)
 < "$TOKENS_FILE" \
-    xargs -n2 -P "$K" -I{} bash -c '
-        read -r openid tok <<<"$@"
-        t0=$(date +%s%N)
-        code=$(curl -s -o /tmp/_resp_${openid}.json -w "%{http_code}" \
-            -X POST "$BASE/chat" \
-            --max-time 180 \
-            -H "Authorization: Bearer $tok" \
-            -H "Content-Type: application/json" \
-            -d "{\"content\":\"$PROMPT\"}")
-        t1=$(date +%s%N)
-        dur_ms=$(( (t1 - t0) / 1000000 ))
-        bytes=$(wc -c < /tmp/_resp_${openid}.json)
-        rm -f /tmp/_resp_${openid}.json
-        printf "%s\t%s\t%dms\t%db\n" "$openid" "$code" "$dur_ms" "$bytes"
-    ' _ {} | tee "$OUT"
+    xargs -L1 -P "$K" bash -c 'fire_one "$1" "$2"' _ \
+    | tee "$OUT"
 END_NS=$(date +%s%N)
 WALL_MS=$(( (END_NS - START_NS) / 1000000 ))
 
@@ -90,22 +103,29 @@ echo
 echo "==== summary K=$K ===="
 echo "wall clock total: ${WALL_MS} ms"
 
-awk -F'\t' '
-    /^stress_/ {
-        code=$2; ms=$3; sub(/ms/,"",ms);
-        all[NR]=ms+0
-        codes[code]++
-    }
+# Stats: extract ms column, sort numerically with `sort`, compute
+# percentiles in awk (mawk doesn't have asort).
+awk -F'\t' '/^stress_/ {ms=$3; sub(/ms/,"",ms); print ms+0}' "$OUT" \
+    | sort -n > /tmp/_ms.txt
+
+awk -F'\t' '/^stress_/ {codes[$2]++} END {
+    printf "http codes: "
+    for (c in codes) printf "%s=%d  ", c, codes[c]
+    print ""
+}' "$OUT"
+
+awk '
+    {a[NR]=$1}
     END {
-        n = length(all)
-        if (n == 0) { print "no rows"; exit }
-        # sort
-        asort(all)
-        printf "n=%d  min=%d  p50=%d  p95=%d  max=%d (ms)\n", n, all[1], all[int(n*0.5)+1], all[int(n*0.95)+1], all[n]
-        printf "http codes: "
-        for (c in codes) printf "%s=%d  ", c, codes[c]
-        print ""
+        n=NR
+        if (n==0) {print "no rows"; exit}
+        p50_i = int(n*0.5)+1
+        p95_i = int(n*0.95)+1
+        if (p50_i > n) p50_i = n
+        if (p95_i > n) p95_i = n
+        printf "n=%d  min=%d  p50=%d  p95=%d  max=%d (ms)\n", n, a[1], a[p50_i], a[p95_i], a[n]
     }
-' "$OUT"
+' /tmp/_ms.txt
+rm -f /tmp/_ms.txt
 
 rm -f "$TOKENS_FILE"
