@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/users/:openid", get(get_user))
         .route("/admin/provision", post(admin_provision))
         .route("/admin/stop/:openid", post(admin_stop))
+        .route("/admin/issue-token", post(admin_issue_token))
         .with_state(state)
 }
 
@@ -526,6 +527,31 @@ async fn admin_provision(
         "port": out.port,
         "workspace": out.workspace_path,
         "paired": out.paired,
+    })))
+}
+
+#[derive(Deserialize)]
+struct IssueTokenReq {
+    openid: String,
+}
+
+/// POST /admin/issue-token — sign a fresh 30-day session token for an
+/// existing openid. Use case: ops / debugging from a Mac without going
+/// through real wx.login(). Returns 404 if the openid hasn't been
+/// provisioned yet (use /admin/provision first to create the user).
+async fn admin_issue_token(
+    _: AdminGuard,
+    State(st): State<AppState>,
+    Json(req): Json<IssueTokenReq>,
+) -> std::result::Result<impl IntoResponse, Error> {
+    // Confirm the user exists; refuse to issue tokens for unknown openids
+    // (otherwise an admin typo creates a stranded session).
+    users::get_required(&st.pool, &req.openid).await?;
+    let s = sessions::issue(&st.pool, &req.openid, Some("admin-issued")).await?;
+    Ok(Json(serde_json::json!({
+        "token": s.token,
+        "openid": s.openid,
+        "expires_at": s.expires_at,
     })))
 }
 
