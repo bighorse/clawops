@@ -132,7 +132,9 @@ Content-Type: application/json
 | 401  | token 缺失/过期/无效 → 重新登录 |
 | 500  | 上游 LLM 调用失败、daemon 异常 |
 
-**典型耗时**:5–25 秒(LLM 思考 + 联网搜索)。小程序 `wx.request` 默认超时 60 秒够用,如果用户问题复杂可放宽到 90 秒。
+**典型耗时**:5–30 秒(LLM 思考 + 工具调用)。极少数复杂查询会到 60–90 秒。
+
+> ⚠️ **必须把 `wx.request` 的 `timeout` 设到 120000(120 秒)**。微信默认 60 秒,长 chat 会被前端超时但后端仍在跑,造成"第一次没回复、再发一次才回"的体感问题。同时**必须**在 `fail` 回调里 `console.error(err.errMsg)`,默默吞掉网络错误会让用户以为机器人没响应。
 
 ---
 
@@ -327,6 +329,86 @@ const stream = subscribeEvents(token, ev => {
 | Token 撤销接口 | ✅ 已上(`/auth/logout` + `/auth/logout-all`) | 用户登出立即失效,不必等 30 天过期 |
 | 多端登录 token 互斥 | ⏳ 未实现 | 用户多端登录会拿不同 token,互不影响(可用 logout-all 一次清掉) |
 | Rate limit | ✅ 已上(governor) | wx-login 10/分/IP,chat 30/分/用户,admin 60/分/IP;429 + Retry-After |
+
+---
+
+---
+
+## 前端实现注意事项(踩坑清单)
+
+下面这些是真机联调过程中实际遇到的前端坑,请按 ☑ 逐项落实。
+
+### 1. ☑ wx.request timeout = 120000(必填)
+
+```javascript
+wx.request({ url, method, data, header, timeout: 120000, success, fail })
+```
+
+默认 60 秒会让 30-90 秒的长 chat 体验为"没回复 / 重发才回"。
+
+### 2. ☑ fail 回调必须打 console.error
+
+```javascript
+fail: (err) => {
+  console.error('chat fail:', err)   // err.errMsg 通常是 timeout / abort / fail 之类
+  this.showError(`网络异常: ${err.errMsg}`)
+}
+```
+
+不让用户面对"为什么没反应"的黑盒。
+
+### 3. ☑ 用 markdown 渲染组件,不要 `<text>` 直贴
+
+后端的 chat response 是 markdown(含粗体、链接、列表)。原生 `<text>` 会显示成字面字符 `[查看详情](/pages/products/detail?id=370)`,不可点击。
+
+推荐组件:**[Towxml](https://github.com/sbfkcel/towxml)**(支持小程序原生 markdown 渲染 + 自定义点击)。
+
+```javascript
+const towxml = require('/towxml/index')
+
+setData({ msgRendered: towxml(res.data.response, 'markdown', {
+  events: { tap: this.onMsgTap }
+}) })
+
+onMsgTap(e) {
+  const href = e.currentTarget.dataset.attrs?.href
+  if (href?.startsWith('/pages/')) wx.navigateTo({ url: href })
+}
+```
+
+### 4. ☑ 进入 chat 页面硬编码欢迎语
+
+不要在用户没说话时就调后端拿欢迎语。直接前端展示固定文案:
+
+```javascript
+// chat.js onLoad
+data: {
+  messages: [{
+    role: 'assistant',
+    content: '你好,我是 AI 智能助手。可以帮你**找平台服务产品**(注册/记账/知产/高企...)、**查政策补贴**、**起草材料**。直接说你的需求即可。'
+  }]
+}
+```
+
+⚠️ 这条欢迎语**只在前端展示**,**不要**发给 `/chat` 接口。否则 LLM 会看到"自己说过的话"产生困惑。
+
+### 5. ☑ wx.login is_new_user=true 时展示更长 loading
+
+新用户首次登录,后端要做 useradd / 启动 daemon / 加载模型预热,5-10 秒。前端在 `is_new_user=true` 时给 5-10 秒 loading,期间**禁用 send 按钮**(防止用户在 daemon 还没就绪时点发送)。
+
+```javascript
+if (is_new_user) {
+  wx.showLoading({ title: '正在为您准备智能助手...', mask: true })
+  setTimeout(() => wx.hideLoading(), 8000)
+}
+```
+
+### 6. ☑ 链接打开方式
+
+后端 chat 响应里的链接形如 `[XX](/pages/products/detail?id=370)`,**绝对路径**指向小程序内部页面。
+
+- 链接以 `/pages/` 开头 → `wx.navigateTo({ url: 链接 })`
+- 链接以 `https://` 开头 → 通常是外部站(目前没有,未来扩展)→ webview 或 `wx.copy`
 
 ---
 
