@@ -168,5 +168,25 @@ max_response_size = 1048576
 timeout_secs = 30
 
 # ── Cost tracking ──────────────────────────────────────────
+# zeroclaw has its own per-daemon cost ledger (separate from
+# autonomy.max_cost_per_day_cents — both run, the lower wins).
+# Limits are PER USER (per zeroclaw daemon process). Currency is USD.
+#
+# IMPORTANT: prices below are estimates based on Aliyun DashScope
+# qwen-flash list price as of 2026-04. CONFIRM in the DashScope
+# console: 计费 → 模型定价 → 通义千问-Flash → OpenAI 兼容接口
+# before assuming these numbers.
 [cost]
 enabled = true
+daily_limit_usd = 0.7         # ≈ ¥5/day/user — 同步 [autonomy].max_cost_per_day_cents=500
+monthly_limit_usd = 15.0      # ≈ ¥100/month/user
+warn_at_percent = 80
+allow_override = false
+
+[cost.prices."qwen3.6-flash"]
+input = 0.043                 # USD per 1M tokens (≈ ¥0.30)
+output = 0.086                # USD per 1M tokens (≈ ¥0.60)
+
+[cost.prices."qwen3.6-plus"]
+input = 0.114                 # USD per 1M tokens (≈ ¥0.80)
+output = 0.343                # USD per 1M tokens (≈ ¥2.40)
