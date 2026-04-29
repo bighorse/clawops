@@ -27,8 +27,17 @@ for uid in "${uids[@]}"; do
         echo "  stop $uid (uid=$n_uid)"
         sudo -u "$uid" env XDG_RUNTIME_DIR="/run/user/$n_uid" \
             systemctl --user stop "zeroclaw@${uid}" 2>/dev/null || true
+        # Force-kill stragglers BEFORE userdel — otherwise userdel -r
+        # silently fails when a process holds the home dir open, and
+        # the home dir survives as a stale orphan after the DB row
+        # gets deleted below. (See past stress runs producing 39 such
+        # orphans; sweep_orphans.sh exists to clean those.)
+        pkill -9 -u "$uid" 2>/dev/null || true
+        sleep 0.2
         loginctl disable-linger "$uid" 2>/dev/null || true
         userdel -r "$uid" 2>/dev/null || true
+        # belt-and-braces: if userdel -r still left the home dir, nuke it
+        rm -rf "/home/$uid"
     fi
 done
 
