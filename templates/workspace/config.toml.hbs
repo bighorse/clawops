@@ -163,7 +163,9 @@ timeout_secs = 30
 
 [http_request]
 enabled = true
-allowed_domains = [{{#if commodity.enabled}}"bdhrapi.2048office.com"{{/if}}]
+# Whitelist (provisioner injects host names extracted from commodity.api_base
+# and lead.webhook_url; empty = all hosts blocked, which prevents tools).
+allowed_domains = {{{http_allowed_domains_toml}}}
 max_response_size = 1048576
 timeout_secs = 30
 

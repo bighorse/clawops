@@ -7,6 +7,39 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Crude URL → host extraction (no `url` crate). Handles
+/// "https://host/path?qs" / "http://host:port/" — strips scheme,
+/// stops at first slash, drops port. Returns None if input doesn't
+/// look like a URL.
+fn extract_host(url: &str) -> Option<String> {
+    let stripped = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host_with_port = stripped.split('/').next()?;
+    let host = host_with_port.split(':').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Build the TOML-array literal for `[http_request].allowed_domains`
+/// based on which integrations are enabled. Always returns a valid
+/// TOML array string, even when no hosts are needed (an empty array
+/// disables the http_request tool).
+fn http_allowed_domains_toml(cfg: &Config) -> String {
+    let mut hosts: Vec<String> = Vec::new();
+    if let Some(h) = extract_host(&cfg.commodity.api_base) {
+        hosts.push(h);
+    }
+    if let Some(h) = extract_host(&cfg.lead.webhook_url) {
+        hosts.push(h);
+    }
+    let quoted: Vec<String> = hosts.iter().map(|h| format!("\"{h}\"")).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
 pub struct Provisioner {
     pub pool: SqlitePool,
     pub cfg: Arc<Config>,
@@ -180,6 +213,7 @@ impl Provisioner {
                 "webhook_format": self.cfg.lead.webhook_format,
                 "enabled": !self.cfg.lead.webhook_url.is_empty(),
             },
+            "http_allowed_domains_toml": http_allowed_domains_toml(&self.cfg),
         });
 
         let mut hb = Handlebars::new();
@@ -279,12 +313,28 @@ impl Provisioner {
             .unwrap_or_else(|| json!({}));
 
         let tpl = &self.cfg.zeroclaw_template;
+        // Reuse the existing paired_token from DB instead of generating
+        // a new one — that keeps the daemon's already-loaded token valid
+        // when we restart it below.
+        let paired_token = user
+            .paired_token_enc
+            .clone()
+            .unwrap_or_else(|| {
+                format!(
+                    "zc_{}{}",
+                    uuid::Uuid::new_v4().simple(),
+                    uuid::Uuid::new_v4().simple()
+                )
+            });
+
+        let port_for_config = user.port.unwrap_or(0);
         let ctx = json!({
+            "paired_token": paired_token,
             "openid": user.openid,
             "phone": user.phone,
             "display_name": user.display_name,
             "linux_uid": user.linux_uid,
-            "port": user.port,
+            "port": port_for_config,
             "workspace_path": layout.workspace_dir,
             "config_dir": layout.config_dir,
             "home_dir": layout.home_dir,
@@ -292,6 +342,11 @@ impl Provisioner {
             "llm": {
                 "default_provider": tpl.default_provider,
                 "default_model": tpl.default_model,
+                "api_key": tpl.api_key,
+                "api_url": tpl.api_url,
+                "default_temperature": tpl.default_temperature,
+                "provider_timeout_secs": tpl.provider_timeout_secs,
+                "max_cost_per_day_cents": tpl.max_cost_per_day_cents,
                 "tavily_api_key": tpl.tavily_api_key,
             },
             "commodity": {
@@ -304,6 +359,7 @@ impl Provisioner {
                 "webhook_format": self.cfg.lead.webhook_format,
                 "enabled": !self.cfg.lead.webhook_url.is_empty(),
             },
+            "http_allowed_domains_toml": http_allowed_domains_toml(&self.cfg),
         });
 
         let mut hb = Handlebars::new();
@@ -311,8 +367,11 @@ impl Provisioner {
 
         let tpl_dir = &self.cfg.provisioner.template_dir;
         std::fs::create_dir_all(&layout.workspace_dir)?;
+        std::fs::create_dir_all(&layout.config_dir)?;
 
-        // Re-render the three top-level markdowns (NOT config.toml)
+        // Re-render the three top-level markdowns + config.toml. Need
+        // config.toml because we changed [http_request].allowed_domains
+        // / [cost] tables / etc — daemon won't pick them up otherwise.
         for fname in &["USER.md", "IDENTITY.md", "SOUL.md"] {
             let tpl_name = format!("{fname}.hbs");
             render_one(
@@ -323,6 +382,13 @@ impl Provisioner {
                 &ctx,
             )?;
         }
+        render_one(
+            &hb,
+            tpl_dir,
+            "config.toml.hbs",
+            &layout.config_dir.join("config.toml"),
+            &ctx,
+        )?;
 
         // Re-render every skill (clear stale skills first so removed
         // skills don't linger; add new skills automatically appear).
@@ -354,6 +420,17 @@ impl Provisioner {
             .chown_workspace(&user.linux_uid, &layout)
             .await
             .ok();
+
+        // Restart the daemon so it re-reads config.toml. paired_token is
+        // unchanged so existing client sessions stay valid; chat in
+        // flight will fail once and the client should retry.
+        if self.backend.launches_daemon() {
+            if let Some(p) = user.port {
+                self.backend.stop(&user.linux_uid).await.ok();
+                self.backend.start(&user.linux_uid).await?;
+                self.wait_health(p as u16).await?;
+            }
+        }
         Ok(())
     }
 
