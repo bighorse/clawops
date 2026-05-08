@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
+    pub space: SpaceConfig,
+    #[serde(default)]
     pub general_information: GeneralInformationConfig,
     #[serde(default)]
     pub lead: LeadConfig,
@@ -220,6 +222,44 @@ impl Default for PolicyConfig {
         Self {
             api_base: String::new(),
             detail_path_template: default_policy_detail_path_template(),
+        }
+    }
+}
+
+/// Space (parks / maker-spaces / workshops / offices / stations /
+/// industrial land) catalogue API. Same provisioner-injection pattern
+/// as commodity/activity/policy, but **no enable toggle** — the
+/// space-recommend skill is always rendered. Defaults pre-populate
+/// production values so the [space] table can be omitted entirely
+/// from clawops.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SpaceConfig {
+    #[serde(default = "default_space_api_base")]
+    pub api_base: String,
+    #[serde(default = "default_space_park_detail_path_template")]
+    pub park_detail_path_template: String,
+    #[serde(default = "default_space_maker_space_detail_path_template")]
+    pub maker_space_detail_path_template: String,
+}
+
+fn default_space_api_base() -> String {
+    "https://bdhrapi.2048office.com/space-v2".into()
+}
+
+fn default_space_park_detail_path_template() -> String {
+    "/pages/space/park?id={id}".into()
+}
+
+fn default_space_maker_space_detail_path_template() -> String {
+    "/pages/space/makerDetail?id={id}".into()
+}
+
+impl Default for SpaceConfig {
+    fn default() -> Self {
+        Self {
+            api_base: default_space_api_base(),
+            park_detail_path_template: default_space_park_detail_path_template(),
+            maker_space_detail_path_template: default_space_maker_space_detail_path_template(),
         }
     }
 }

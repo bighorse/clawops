@@ -114,6 +114,20 @@ detail_path_template = "/pages/activity/details/Index?obj_id={id}"
 api_base = "https://bdhrapi.2048office.com/policies"
 detail_path_template = "/pages/policy/detail?id={id}"
 
+[space]
+# Space-resource catalogue API (园区 / 众创空间 / 厂房 / 独立办公室 /
+# 工位 / 产业用地). Unlike commodity/activity/policy, **no enable
+# toggle** — the space-recommend skill is always rendered. Whole
+# [space] table can be omitted; defaults below match production.
+api_base = "https://bdhrapi.2048office.com/space-v2"
+# Mini-program path the LLM puts in markdown links for park-class
+# resources (parks themselves, plus child workshops linked back to
+# their parent park). `{id}` substituted with the API id at render.
+park_detail_path_template = "/pages/space/park?id={id}"
+# Mini-program path for maker-space-class resources (maker_space
+# itself, plus child offices/stations linked back to their parent).
+maker_space_detail_path_template = "/pages/space/makerDetail?id={id}"
+
 [general_information]
 # Static-knowledge skill carrying the Huairou Science City service
 # handbook (6 大科学装置 / 14 交叉平台 / 17 科教设施 / 政策清单 /

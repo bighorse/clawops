@@ -44,6 +44,10 @@ fn http_allowed_domains_toml(cfg: &Config) -> String {
     if let Some(h) = extract_host(&cfg.policy.api_base) {
         push_unique(&mut hosts, h);
     }
+    // Space service has no enable toggle — its host is always whitelisted.
+    if let Some(h) = extract_host(&cfg.space.api_base) {
+        push_unique(&mut hosts, h);
+    }
     if let Some(h) = extract_host(&cfg.lead.webhook_url) {
         push_unique(&mut hosts, h);
     }
@@ -230,6 +234,11 @@ impl Provisioner {
                 "detail_path_template": self.cfg.policy.detail_path_template,
                 "enabled": !self.cfg.policy.api_base.is_empty(),
             },
+            "space": {
+                "api_base": self.cfg.space.api_base,
+                "park_detail_path_template": self.cfg.space.park_detail_path_template,
+                "maker_space_detail_path_template": self.cfg.space.maker_space_detail_path_template,
+            },
             "general_information": {
                 "enabled": self.cfg.general_information.enabled,
             },
@@ -389,6 +398,11 @@ impl Provisioner {
                 "api_base": self.cfg.policy.api_base,
                 "detail_path_template": self.cfg.policy.detail_path_template,
                 "enabled": !self.cfg.policy.api_base.is_empty(),
+            },
+            "space": {
+                "api_base": self.cfg.space.api_base,
+                "park_detail_path_template": self.cfg.space.park_detail_path_template,
+                "maker_space_detail_path_template": self.cfg.space.maker_space_detail_path_template,
             },
             "general_information": {
                 "enabled": self.cfg.general_information.enabled,

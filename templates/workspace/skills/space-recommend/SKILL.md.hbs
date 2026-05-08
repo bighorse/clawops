@@ -1,0 +1,304 @@
+# SKILL.md — space-recommend
+
+## 元数据
+
+- **名称**: space-recommend
+- **描述**: 对接 2048office 平台 `/space-v2/*` API,查询并推荐怀柔科学城内的**园区 / 众创空间 / 厂房 / 独立办公室 / 工位 / 产业用地**,按用户需求(面积、价格、产业方向、是否可注册等)做候选筛选并给出小程序详情页链接
+- **触发词**: 用户消息中含**找空间 / 选址 / 落地**意图 → **必触发**:
+  - "找园区 / 找空间 / 园区推荐 / 有什么园区 / 落地园区"
+  - "众创空间 / 联合办公 / 共享办公 / 创业空间 / 孵化器空间"
+  - "厂房 / 标准厂房 / 独栋 / 研发用房"
+  - "独立办公室 / 整层办公 / 写字楼"
+  - "工位 / 工位出租 / 共享工位"
+  - "产业用地 / 工业用地 / 拿地"
+  - "面积 + 多少平 + 租 / 价格 + 多少 + 元/平"(明确空间需求)
+
+---
+
+## ⚠️ 核心原则
+
+- **查询类**(浏览空间 / 看详情):自动执行,无需确认
+- **写操作**(新增 / 修改 / 删除 / 状态变更 / 审核 / 入驻审核 / 需求提交):**全部禁止调用** — 用户要预订/报价/提交需求 → 引导到详情页或留联系方式,让用户在小程序里自己点
+- **不调 API 不答空间**:用户问"有什么园区 / 哪个众创空间合适",**必须先调 http_request**;**禁止**凭训练记忆给"园区名/地址/价格/面积" — 这些是平台运营数据,你的训练里没有,写出来 100% 是编造
+- **HTML 字段**:`description`、`profile`、`investment_policy`、`industrial_resource` 等长字段可能含 HTML,展示给用户时**剥标签**或转 markdown,**不要**原样喷 HTML
+
+---
+
+## API 基础信息
+
+- Base URL: `{{{space.api_base}}}`
+- 鉴权: 全部接口对公开端点免 token,直接调
+- 响应包络: `{"request_id":..., "message":"", "data":{"page_index":1, "page_size":N, "data_count":M, "data":[...]}}` — 列表型真数据在 `.data.data[]`,详情型在 `.data` 里
+
+主要端点(本 skill 只用这些 — 含一个 POST 主搜索):
+
+| 用户问什么 | 端点 |
+|-----------|------|
+| **园区按筛选条件搜索(主路径)** | **`POST {{{space.api_base}}}/parks/query_list`** body: JSON,字段见下方 |
+| 推荐园区(无关键词时备选) | `GET {{{space.api_base}}}/parks/front/recommend/list?page_size=10` |
+| 园区详情 | `GET {{{space.api_base}}}/parks/item?id={park_id}` |
+| 园区对比(用户指定 N 个) | `GET {{{space.api_base}}}/parks/compare_list?park_ids=[1,2,3]` |
+| 众创空间列表 | `GET {{{space.api_base}}}/space_show/maker_space/list?name=<关键词>&page_size=10` |
+| 众创空间详情 | `GET {{{space.api_base}}}/space_show/maker_space/item?maker_space_id={id}` |
+| 厂房(管理列表 / 含面积/层高/承重过滤) | `GET {{{space.api_base}}}/space_show/workshop/list?page_size=10` |
+| 厂房详情 | `GET {{{space.api_base}}}/space_show/workshop/item?workshop_id={id}` |
+| 独立办公室(隶属众创空间) | `GET {{{space.api_base}}}/space_show/office/list?maker_space_id={ms_id}` |
+| 独立办公室详情 | `GET {{{space.api_base}}}/space_show/office/item?office_id={id}` |
+| 工位(隶属众创空间) | `GET {{{space.api_base}}}/space_show/station/list?maker_space_id={ms_id}` |
+| 工位详情 | `GET {{{space.api_base}}}/space_show/station/item?station_id={id}` |
+| 产业用地列表 | `GET {{{space.api_base}}}/space_show/industrial_land/list?page_size=10` |
+| 产业用地详情 | `GET {{{space.api_base}}}/space_show/industrial_land/item?land_id={id}` |
+
+### POST `/parks/query_list` body 字段(全部可选,按用户诉求选填)
+
+```json
+{
+  "keyword": "<关键词,可空>",
+  "region": [<区域id 数组,如有>],
+  "average_price": ["[0,30)", "[30,50]", "[50,70]", "(70,)"],
+  "space_appearance": [1,2,3,4],
+  "qualification_certification": [<动态枚举>],
+  "industrial_characteristics": [<动态枚举>],
+  "professional_technology_platform": [0,1],
+  "near_subway": [0,1],
+  "page_index": 1,
+  "page_size": 10
+}
+```
+
+字段语义:
+- `space_appearance`: 1 独立办公室;2 独栋总部;3 标准厂房;4 联合办公空间
+- `average_price`: 字符串数组,区间含中括号小括号,**严格按上面 4 档**(`<30 / 30-50 / 50-70 / >70` 元/㎡/月)
+- `near_subway`: 0 不临近地铁;1 临近地铁
+- `professional_technology_platform`: 0 否;1 是
+- `region` / `qualification_certification` / `industrial_characteristics`: 动态枚举,**用户没明确给值时不要填**(填了猜的 id 会零结果)
+
+调用示例(http_request POST,body 是 JSON 字符串):
+
+```
+http_request POST {{{space.api_base}}}/parks/query_list
+  Content-Type: application/json
+  body: {"keyword":"生物医药","page_size":10,"page_index":1}
+```
+
+**禁用端点**(LLM 不要调):
+- 任何 `/parks/back/*`、`/parks/maintenance/*`、`/parks/building/back/*`、`/parks/floor/back/*`、`/parks/room/back/*`、`/parks/back/factory/*` — 后台/运维管理
+- 除 `POST /parks/query_list` 外的所有 `POST/PUT/DELETE` — 包括 `POST /parks/new_query_list`、`POST /demand/add`、所有 `/incubatorpark/*` 写接口
+- `/incubatorpark/*` 整个孵化器入驻审核流程 — 与本 skill 的"找空间"无关
+- `/demand/*` 需求提交 — 留给用户在小程序里走表单提交,**不**用 LLM 代提
+
+---
+
+## 详情页链接路径模板(直接用配置注入的值,**不要替换成别的路径**)
+
+| 资源类型 | 路径模板 | id 来源 |
+|---------|---------|--------|
+| 园区(park) | `{{{space.park_detail_path_template}}}` | `parks/*` 接口返回的 `id` |
+| 众创空间(maker_space) | `{{{space.maker_space_detail_path_template}}}` | `space_show/maker_space/*` 返回的 `id` |
+| 厂房 / 独立办公室 / 工位 / 产业用地 | **回链到所属园区或众创空间** — 详情页面只覆盖这两类 | 取该资源的 `maker_space_id` 或 `park_id`,套用上面对应模板 |
+
+把 `{id}` 换成 API 返回的真实 `id` 数字。
+
+---
+
+## 关键字段(响应里出现,记住其语义)
+
+### 园区(park)
+
+| 字段 | 含义 |
+|------|------|
+| `id` | 园区 id |
+| `park_name` | 园区名(显示) |
+| `provider_name` | 运营/服务商 |
+| `park_address` | 地址 |
+| `description` | 介绍(可能含 HTML,**剥标签**) |
+| `area` / `gross_floor_area` / `total_area_used` | 占地 / 建筑总 / 使用总(㎡) |
+| `price_low` / `price_height` / `average_price` | 价格区间 / 均价(元/㎡/月) |
+| `investment_direction` | 主要招商方向(枚举数组) |
+| `industrial_characteristics` | 园区产业特色 |
+| `space_appearance` | 空间形态:1 独立办公室;2 独栋总部;3 标准厂房;4 联合办公空间 |
+| `qualification_certification` | 园区资质认证 |
+| `assessment` | 雏鹰评审:0 否;1 是 |
+| `park_images` | 园区图片列表 |
+| `park_logo` | logo |
+| `vr_url` | VR 链接(如有) |
+
+### 众创空间(maker_space)
+
+| 字段 | 含义 |
+|------|------|
+| `id` | 众创空间 id(详情链接用) |
+| `name` | 名称 |
+| `area` | 总面积(㎡) |
+| `address` | 地址 |
+| `investment_direction` | 招商方向(逗号分隔字符串) |
+| `investment_fund` | 投资基金:1 行政;2 财政;3 无 |
+| `service_matching` | 服务配套(逗号分隔字符串) |
+| `space_images` | 图片列表 |
+| `profile` | 详细介绍(**可能含 HTML,剥标签**) |
+| `investment_policy` | 招商政策(同上,剥标签) |
+| `enterprise_id` / `enterprise_name` | 服务商 |
+| `contact` / `contact_tel` | 联系人 / 电话 |
+
+### 厂房(workshop)
+
+`workshop_name`、`area`、`floor_height`、`load_bearing`、`split_lease`(可分割出租)、`lease_price`(单价)、`structure_type`、`address`、`workshop_images`、`profile`
+
+### 独立办公室(office) / 工位(station) / 产业用地(industrial_land)
+
+字段含义见 API 文档,展示前同样剥 HTML、价格 0 写"面议"。
+
+---
+
+## 执行流程:5 步自主选址顾问
+
+### Step 1:理解需求,锁定资源类型
+
+| 用户诉求关键词 | 优先查的资源类型 | 入口端点 |
+|---------------|----------------|---------|
+| 园区 / 落地 / 选址(有关键词或筛选条件) | 园区 | **`POST /parks/query_list`** |
+| 园区 / 落地 / 选址(完全无具体诉求) | 园区(运营推荐) | `GET /parks/front/recommend/list` |
+| 众创空间 / 联合办公 / 共享办公 / 孵化器空间 | 众创空间 | `GET /space_show/maker_space/list?page_size=10` |
+| 工位 / 共享工位 | 众创空间下的工位 → 先列众创空间,再问用户感兴趣的 | `GET /space_show/maker_space/list` 然后 `GET /space_show/station/list?maker_space_id=X` |
+| 独立办公室 / 整层 / 写字楼 | 同上 → 先列众创空间,再下钻到 office | `GET /space_show/maker_space/list` 然后 `GET /space_show/office/list?maker_space_id=X` |
+| 厂房 / 标准厂房 / 研发用房 | 厂房 | `GET /space_show/workshop/list` |
+| 产业用地 / 工业用地 | 产业用地 | `GET /space_show/industrial_land/list` |
+
+### Step 2:搜索(自动执行)
+
+#### 2a 园区搜索(主路径,POST)
+
+按 Step 1 把用户提到的条件填到 body。例:
+
+- 用户说"我做生物医药,想找 30-50 元/㎡/月的园区,要靠地铁"
+  ```json
+  {"keyword":"生物医药","average_price":["[30,50]"],"near_subway":[1],"page_size":10,"page_index":1}
+  ```
+- 用户说"找标准厂房园区"
+  ```json
+  {"space_appearance":[3],"page_size":10,"page_index":1}
+  ```
+- 用户没给具体方向 → **不发 POST**,改走 `GET /parks/front/recommend/list?page_size=10`
+
+#### 2b 众创空间 / 厂房 / 工位 / 办公室 / 产业用地
+
+GET 端点 + query 参数(参考"主要端点"表)。用户给了 `name` 关键词就传,没给就拉一页默认。
+
+#### 2c 行业方向端侧过滤
+
+如果用户给了产业方向(如"我做生物医药"),且**没**走 POST `/parks/query_list` 的 keyword 过滤,在结果集**端侧过滤**:命中 `investment_direction`/`industrial_characteristics` 含相应方向值的优先;不命中的排后。**不要**编造方向,只引用 API 返回的字段。
+
+### Step 3:可行性校验(过滤候选)
+
+对返回的 `.data.data[]`,只保留满足以下**全部**条件的:
+
+1. `status == 1`(已上线;`-1` 已删除 / `2` 已下线 — 都不展示)
+2. `name` / `park_name` / `workshop_name` 跟用户诉求**真实相关**(光含关键字不够,要语义相关)
+3. 价格相关字段(`price_low`/`average_price`/`unit_price`/`lease_price`)若全为 0 / null,在简介里写"价格面议",**不要**编造数字
+4. 面积相关字段(`area`/`gross_floor_area`/`floorage`)同上 — 0 / null 写"面积详询"
+
+留 TOP 5。
+
+### Step 4:展示推荐清单
+
+**园区**示例(每条一段):
+
+```
+**N. <park_name>** — <provider_name>
+- 地址:<park_address>
+- 面积:<gross_floor_area> ㎡(占地 <area> ㎡)
+- 价格:¥<average_price>/㎡/月(`price_low`–`price_height` 区间;面议时写"价格面议")
+- 招商方向:<investment_direction 翻译后的中文逗号串>
+- 简介:<description 剥 HTML 截到 60 字内,带省略号>
+- [查看园区详情](园区详情路径模板里的 `{id}` 替换成本条 id)
+```
+
+**众创空间**示例:
+
+```
+**N. <name>** — <enterprise_name>
+- 地址:<address>
+- 总面积:<area> ㎡
+- 招商方向:<investment_direction 转中文>
+- 服务配套:<service_matching 转中文,挑 3-5 个>
+- 简介:<profile 剥 HTML 截 60 字>
+- [查看众创空间详情](众创空间详情路径模板里的 `{id}` 替换成本条 id)
+```
+
+**厂房 / 办公室 / 工位 / 产业用地**:这些资源**没有独立详情页**,在简介后给出**所属园区或众创空间**的链接(从 `park_id` 或 `maker_space_id` 反推),例如:
+
+```
+**N. <workshop_name>**(位于园区 [<park_name>](园区路径模板替换 park_id))
+- 面积:<area> ㎡  层高:<floor_height> 米  承重:<load_bearing> kg/㎡
+- 价格:¥<lease_price>/㎡/天(0/null 写"面议")
+- 简介:<profile 剥 HTML 截 60 字>
+```
+
+末尾固定加:
+
+```
+要看哪个空间的详情、对比 N 个,或留下需求让顾问联系你?告诉我即可。
+```
+
+### Step 5:用户追问详情(按需执行)
+
+用户指 "第 N 个 / <某园区名> 详情":
+
+```
+http_request GET {{{space.api_base}}}/parks/item?id=<park_id>
+http_request GET {{{space.api_base}}}/space_show/maker_space/item?maker_space_id=<ms_id>
+```
+
+返回单资源完整 schema。整理给用户:
+- 基本信息(地址、面积、价格、招商方向、运营方)
+- 详细介绍(从 `description`/`profile` 剥 HTML 后给完整内容,长则分段)
+- 招商政策(`investment_policy`,剥 HTML)
+- 服务配套(`service_matching` 全列)
+- 图片提示(数量,**不要**直接展开 URL 数组)
+- VR / 楼书 / 联系方式(`vr_url`、`contact` / `contact_tel` 如有)
+- 末尾再给一次详情页链接
+
+**对比场景**:用户指定多个园区 → `GET {{{space.api_base}}}/parks/compare_list?park_ids=[1,2,3]` 拿对比数据,以**表格**形式展示关键字段(地址、价格、面积、招商方向、资质)。
+
+**禁止**回到 Step 4 重新搜 — 用户已经选定了。
+
+---
+
+## 自检(回答前必过)
+
+1. **我列的空间 id**,是不是来自这一轮 `http_request` 响应的 `data.data[].id`?如果不是,**不要回答** — 必须先调 API。
+2. **我列的面积/价格/地址**,是不是 API 响应里的字段?**禁止**编造或拼凑。
+3. **我的链接** `[查看详情](path)` 里:
+   - 园区类资源 → 用 `{{{space.park_detail_path_template}}}`,把 `{id}` 换成真 id 数字
+   - 众创空间类资源 → 用 `{{{space.maker_space_detail_path_template}}}`,把 `{id}` 换成真 id 数字
+   - 厂房/工位/办公室 → 链回它的所属园区或众创空间,**不要**自己造一个不存在的子页面
+4. **`description`/`profile`/`investment_policy`** 字段有没有 HTML 标签残留?如果有,**回去剥**再展示。
+5. **价格 0/null**有没有写成"面议"?编了具体数字就**回去删**。
+6. **写操作**(新增/编辑/审核/删除/需求提交) 有没有调 POST(除了 `/parks/query_list`)?如果调了,**回去删** — 我们只引导用户去小程序自己点。
+7. **POST `/parks/query_list`** body 里 `average_price` 有没有用错档位字符串?只允许 `"[0,30)"`、`"[30,50]"`、`"[50,70]"`、`"(70,)"` 四种之一。
+
+任一项答 No,**回去重新执行**。
+
+---
+
+## 降级策略
+
+| 情况 | 处理 |
+|------|------|
+| API 401/403 | 告诉用户"空间库暂时不可用",**不**编造空间 |
+| 搜无结果(`data_count=0`) | 换 keyword/筛选条件重试 1 次(用更宽的词或减条件);仍无 → 告诉用户"暂无符合条件的空间,可以告诉我具体面积区间 / 行业方向 / 心理价位再试" |
+| POST 422 / 400 | body 里枚举值或区间字符串可能错了 — 把可疑参数去掉重试一次;仍错 → 改走 GET `/parks/front/recommend/list` |
+| 网络超时(`http_request` 失败) | 告诉用户"空间平台暂时取不到,稍后再试",**不**编造 |
+| 用户问"帮我预订/锁定/谈价" | "我这里只做推荐和信息对比,锁定/谈价请到详情页留联系方式或直接联系运营方:[联系电话]" — **不调** POST |
+| 用户给具体的需求文本(面积/预算/截止日期) | 引导到 `lead` 流程或建议用户在小程序"提交需求"入口填写,**不**用 LLM 代提需求 |
+| 全部空间已下线 / 已停用 | 告诉用户"近期符合条件的房源较少,你可以关注后续上新或扩展筛选范围" |
+
+---
+
+## 与其他技能的边界
+
+- 用户问**入驻孵化器的资质审核流程**(雏鹰认定、对赌协议) → **不在本 skill**,告知"入驻审核请到小程序内提交资质材料,客服会联系核实"
+- 用户问**空间相关代办服务**(物业代缴、装修代办、入驻协办) → 走 `commodity-recommend`,**不**用本技能
+- 用户问**怀柔科学城园区整体介绍**(全区有几个园区、宏观分布) → 走 `general-information`(若启用),具体园区清单/价格回到本 skill
+- 用户问**政策(产业补贴、租金减免)** → 走 `policy-recommend`,本 skill 仅引用园区自身的招商政策字段,**不**解读区级/市级政策
+- 用户问**活动(园区组织的对接会、培训)** → 走 `activity-recommend`

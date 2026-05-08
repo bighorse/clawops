@@ -1,0 +1,211 @@
+{{#if policy.enabled}}
+# SKILL.md — policy-recommend
+
+## 元数据
+
+- **名称**: policy-recommend
+- **描述**: 对接 2048office 平台 `/policies/*` API,查询并推荐与用户企业相关的政策正文、政策解读、结果公示、申报指南、政策图解、FAQ
+- **触发词**: 用户消息中含**询问政策**意图 → **必触发**:
+  - "什么政策 / 哪些政策 / 政策清单 / 适合我的政策 / 我能申请的政策"
+  - "补贴 / 奖励 / 资助 / 扶持 / 减免 / 奖金"
+  - "高新认定 / 专精特新 / 小巨人 / 独角兽 / 上市奖励"
+  - "怎么申报 / 申报条件 / 申报截止 / 申报材料"
+  - 含具体文号("怀政发[2024]16号")或政策名("青创无忧十条")
+- **API 文档**: <https://bdhrapi.2048office.com/policies/redoc>
+
+---
+
+## ⚠️ 核心原则(回答前必读)
+
+1. **政策金额是申报上限,不是承诺**: API 返回的金额是政策**条文规定的最高额**,实际企业能拿多少取决于评审。**任何**金额回答末尾都必须加一句"以政策原文和最终评审结论为准"。
+2. **以原文为准**: 用户问"具体补贴多少",优先给 API 数据 + 把政策原文链接(`attachments` 字段或 `website` 字段)给用户,**不要**只给一个数字让用户去赌。
+3. **HTML 字段**: `description` 字段含 HTML 标签(`<p>`、`<br>`、`<strong>`等),展示给用户时**剥标签**或转 markdown,**不要**原样喷 HTML。
+4. **失效政策不主推**: 只展示 `status=="ONLINE"` 且 `valid_status=="EFFECTIVE"` 的政策。已失效的政策**仅**在用户问"历史政策 / 这个政策还有效吗"时引用。
+5. **不调 API 不答政策细节**: 用户问具体政策金额、条款、申报方式 → **必须先调 http_request**;**禁止**凭训练记忆给数字 — 这些是平台运营数据。general-information skill 里的政策表只是"量级参考",**遇到细节问题转 policy-recommend 真调 API**。
+6. **写操作全禁**: `POST /policies/recommends/enterprise_info`(企业画像注册)等写接口**一律不调**,留给用户在小程序自己提交。
+
+---
+
+## API 基础信息
+
+- Base URL: `{{{policy.api_base}}}` (即 `/policies`)
+- 鉴权: GET 接口**不需要 token**,直接调
+- 响应包络: `{"request_id":..., "message":null, "data":{"page_index":1, "page_size":N, "data_count":M, "data":[...]}}` — 真数据在 `.data.data[]` 里
+
+主要端点(按用户问法分类):
+
+| 用户问什么 | 端点 |
+|-----------|------|
+| 政策列表 / 找政策 | `GET {{{policy.api_base}}}/policies?keyword=...` |
+| 单条政策详情 | `GET {{{policy.api_base}}}/policies/{obj_id}` |
+| 政策怎么解读 / 怎么申报 | `GET {{{policy.api_base}}}/policy_declarations?keyword=...` |
+| 谁拿过这个政策 / 获奖名单 | `GET {{{policy.api_base}}}/policy_announcements?keyword=...` |
+| 政策图解(可视化) | `GET {{{policy.api_base}}}/policy_illustrations` |
+| 政策汇编(主题合集) | `GET {{{policy.api_base}}}/policy_collections` 或 `policy_compilations` |
+| 政策常见问题 | `GET {{{policy.api_base}}}/policy_faqs?keyword=...` |
+| 政策申报指南 | `GET {{{policy.api_base}}}/policy_applications?keyword=...` |
+| 政策分类树 | `GET {{{policy.api_base}}}/categories?tree=true&page_size=50` |
+| 标签 | `GET {{{policy.api_base}}}/tags` |
+
+**禁用端点**(LLM 不要调):
+- `POST/PUT/PATCH/DELETE` 一律不调
+- `GET {{{policy.api_base}}}/recommends/enterprise_info` — 需要 user_id,我们没有
+- `POST {{{policy.api_base}}}/recommends/enterprise_info` — 写企业画像,留给用户自己提交
+- `GET {{{policy.api_base}}}/policies/recommend_list` — 智选接口需要先注册企业画像才有数据,本 skill 不接
+
+---
+
+## 关键字段(政策正文)
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `id` | int | 政策 id,详情链接用 |
+| `title` | str | 政策名(显示) |
+| `policy_no` | str | 文号(如"怀政发[2024]16号"),可能为空 |
+| `issuer` | str | 发文单位(如"北京市怀柔区人民政府办公室") |
+| `pub_date` | datetime | 发布日期 |
+| `end_date` | datetime / null | 截止日期(null = 长期有效) |
+| `description` | str (HTML) | 政策摘要,**展示前剥标签** |
+| `tags` | str[] | 政策标签 |
+| `category_tags` | obj[] | 分类标签(name + business_code) |
+| `support_way` | str | 支持方式(资金/空间/人才/...) |
+| `support_industry` | str | 支持行业 |
+| `policy_level` | str | 政策级别(国家级/北京市级/怀柔区级) |
+| `attachments` | obj[] | 附件(政策原文 PDF) |
+| `website` | str / null | 政策原文官网链接 |
+| `view_count` | int | 浏览量 |
+| `is_top` | bool | 是否置顶 |
+| `status` | enum | `ONLINE`/`OFFLINE`(只展示 ONLINE) |
+| `valid_status` | enum | `EFFECTIVE`/失效(只主推 EFFECTIVE) |
+
+---
+
+## 执行流程:5 步
+
+### Step 1:理解需求,确定查询入口
+
+| 用户诉求 | 端点 + keyword |
+|---------|---------------|
+| "我能申请什么政策"(宽泛) | `policies?keyword=<用户行业或诉求>` + 必要时 `categories?tree=true` |
+| "高新企业 / 专精特新" | `policies?keyword=高新` 或 `专精特新` |
+| "研发补贴 / 创新补贴" | `policies?keyword=研发` 或 `创新` |
+| "人才公寓 / 人才补贴" | `policies?keyword=人才` |
+| "上市奖励 / 股权激励" | `policies?keyword=上市` 或 `股权` |
+| "怎么申报 + 政策名" | `policy_declarations?keyword=<政策名>` 拿解读,再补 `policy_applications?keyword=<政策名>` 拿申报指南 |
+| "谁拿过 + 政策名" | `policy_announcements?keyword=<政策名>` |
+| 用户给具体文号(如"怀政发[2024]16号") | `policies?keyword=<文号>` 直接搜 |
+| "有什么 FAQ / 常见问题" | `policy_faqs?keyword=<主题>` |
+
+### Step 2:搜索政策(自动执行)
+
+```
+http_request GET {{{policy.api_base}}}/policies
+  ?keyword=<速查表的值>
+  &page_size=10
+  &page_index=1
+```
+
+如果搜出结果 < 3 条,**换更宽的关键词**再搜一次。仍无 → 走 `categories?tree=true` 拿分类树,问用户"你想看哪个分类"。
+
+### Step 3:可行性校验(过滤候选)
+
+对返回的 `.data.data[]`,只保留满足以下条件的:
+
+1. `status == "ONLINE"` 且 `valid_status == "EFFECTIVE"`
+2. `title` 跟用户诉求**真实相关**(语义相关,不是光含关键字)
+3. 如果有 `support_industry` 字段且用户企业行业明确(USER.md 里有),把行业不匹配的排后面但**不删**(避免漏掉跨行业政策)
+4. `is_top == true` 优先排前
+
+留 TOP 5。
+
+### Step 4:展示推荐清单
+
+格式严格按下面模板,每条政策**一段**:
+
+```
+**N. <title>** [文号: <policy_no 或 "无文号">]
+- 发文单位:<issuer>
+- 发布日期:<pub_date YYYY-MM-DD>(<end_date 写 "截止 YYYY-MM-DD" 或 "长期有效">)
+- 支持方向:<support_way>(<support_industry 行业,如有>)
+- 摘要:<description 剥 HTML 截到 80 字内,带省略号>
+- [查看政策详情](该政策 id 替换到路径模板里的链接)
+```
+
+链接路径模板: `{{{policy.detail_path_template}}}` — 把 `{id}` 换成 API 返回的 `id` 数字。
+
+末尾**强制加**:
+
+```
+以上信息以政策原文和最终评审结论为准。要看哪条政策的具体条款 / 申报指南 / 历史获批名单?告诉我即可。
+```
+
+### Step 5:用户追问详情(按需执行)
+
+#### 5.1 用户指定一条政策要细节
+```
+http_request GET {{{policy.api_base}}}/policies/<obj_id>
+```
+
+整理返回:
+- 文号 + 发文单位 + 发布/截止日期(同 Step 4)
+- 完整 `description`(剥 HTML)
+- `attachments` 里的原文 PDF 列出来(每条 `[政策原文](附件链接)`)
+- `website` 如果有,也列出
+- `category_tags` + `tags` 给出来,帮用户理解定位
+
+末尾追加: "以上为平台收录信息,**正式申报请以政策原文为准**。"
+
+#### 5.2 用户问"怎么申报这个政策"
+**先**搜政策解读和申报指南:
+```
+http_request GET {{{policy.api_base}}}/policy_declarations?keyword=<政策名或文号>
+http_request GET {{{policy.api_base}}}/policy_applications?keyword=<政策名或文号>
+```
+
+把解读和申报指南整合给用户,**末尾**:
+> 如果你需要专业代办申报服务,我可以帮你检索平台的政策代办产品 — 是否需要?
+
+(用户答"是" → 切换到 `commodity-recommend` 用关键词"政策申报")
+
+#### 5.3 用户问"哪些公司拿过这个政策"
+```
+http_request GET {{{policy.api_base}}}/policy_announcements?keyword=<政策名>
+```
+
+整理获批公示给用户。**注意保护隐私**:如果返回里包含具体企业名,正常引用即可(公示本身就是公开数据);如果只是榜单,把名单给出来。
+
+---
+
+## 自检(回答前必过)
+
+1. **我列的政策 id**,是不是来自这一轮 `http_request` 响应的 `data.data[].id`?
+2. **我列的政策金额**,是不是 API 响应里的字段(或剥标签后的 `description`)?**禁止**编造金额。
+3. **我有没有加 "以政策原文为准" 的提示**?如果用户问到具体补贴 / 减免 / 奖励数字,**必须**加。
+4. **`description` 字段**有没有 HTML 残留?如果有,**回去剥**。
+5. **失效政策**是不是被我误推为有效?查 `valid_status == "EFFECTIVE"`。
+6. **政策代办意图**是不是该转 `commodity-recommend`?
+
+任一项答 No,**回去重新组织答案**。
+
+---
+
+## 降级策略
+
+| 情况 | 处理 |
+|------|------|
+| API 401/403 | 不应该发生(GET 免鉴权)。真发生了 → 告诉用户"政策库暂时不可用",**不**编造政策 |
+| 搜无结果(`data_count=0`) | 换 keyword 重试 1 次(用更宽的词);仍无 → 转 `categories?tree=true` 让用户选分类 |
+| 网络超时(`http_request` 失败) | 告诉用户"政策库暂时取不到,稍后再试",**不**编造 |
+| 用户问"我能拿多少补贴"(具体金额预测) | 不预测,只引用 API 返回的"申报上限"+ "以政策原文和最终评审结论为准" |
+| 用户问"帮我申报" | 转 `commodity-recommend` 找代办产品,**不**自己代办 |
+| 政策已失效 | 告诉用户"该政策已失效,可关注后续替代政策" — 失效的政策**不**做申报指引 |
+
+---
+
+## 与其他技能的边界
+
+- 用户问**政策代办服务**(找代办公司帮申报) → 走 `commodity-recommend`,**不**用本技能
+- 用户问**怀柔科学城手册里的政策清单**(粗看 9 项) → 可以走 `general-information` 第八节速览,**但**任何具体金额 / 申报截止 / 条款细节都**必须**回来调本 skill API
+- 用户问**国家级政策 / 全国性政策**(超出怀柔范围) → 本 skill 库里如果有就答,没有就**老老实实**说"我们平台目前主要收录怀柔区及北京市级政策,国家级政策建议查 [国家政策原文站点 — 让 LLM 用 web_search 找]"
+- 用户问**政策原文 PDF 在哪下载** → `attachments` 字段里有则给,没有则引导到政策原文官网(`website` 字段)或 web_search 找发文单位官网
+{{/if}}
