@@ -86,6 +86,8 @@
 
 ### Step 2:搜索活动(自动执行)
 
+#### 2a 用户给了关键词
+
 ```
 http_request GET {{{activity.api_base}}}
   ?keyword=<速查表的值>
@@ -93,11 +95,30 @@ http_request GET {{{activity.api_base}}}
   &page_index=1
 ```
 
-如果用户**只问"最近有什么活动"没具体方向**,不传 keyword 直接拉一页:
+API 关键词检索会全表扫,所以无需翻页 — 一次拿到的就是全部命中。
 
-```
-http_request GET {{{activity.api_base}}}?page_size=10&page_index=1
-```
+#### 2b 用户只问"最近有什么活动"没具体方向 ⚠️ 必须翻最后一页
+
+**重要 — API 默认按 id 升序返回(老活动在前),最近的活动都在最后一页。直接拉 page_index=1 会拿到一堆已结束的旧活动,然后被 Step 3 的 end_time 过滤砍光,导致错误回答"没有活动"。**
+
+正确流程:
+
+1. 第一调:读总数
+   ```
+   http_request GET {{{activity.api_base}}}?page_size=10&page_index=1
+   ```
+   从响应里取 `data.data_count`(假设 = N)。
+
+2. 计算最后一页 `last = ceil(N / 10)`
+
+3. 第二调:拉最后一页(里面是最新创建的活动)
+   ```
+   http_request GET {{{activity.api_base}}}?page_size=10&page_index=<last>
+   ```
+
+4. 对最后一页的 `.data.data[]` 做 Step 3 过滤;如果 future + ONLINE + APPROVED 的不到 5 条,继续拉 `page_index=<last-1>`,合并去重再过滤。最多翻到 last-2 就停(再往前都是更老的,没必要)。
+
+5. 第一调读出来的 page=1 数据可以直接丢弃(那是最老的一批),只用它的 `data_count` 字段。
 
 ### Step 3:可行性校验(过滤候选)
 
@@ -159,6 +180,7 @@ http_request GET {{{activity.api_base}}}/<obj_id>
 3. **我的链接** `[查看详情](path)` 里,`path` 是不是把 `{id}` 换成了**真 id 数字**?
 4. **`detail` 字段**有没有 HTML 标签残留?如果有,**回去剥**再展示。
 5. **报名相关**有没有调 POST?如果调了,**回去删** — 我们只引导用户去小程序自己点。
+6. **无关键词查询**(用户问"最近有什么活动")时,我有没有按 Step 2b 翻到**最后一页**?如果只调了 page_index=1 就回答"没活动",**回去重做** — 那一页是最老的活动,被 end_time 过滤掉是正常的,不代表没有近期活动。
 
 任一项答 No,**回去重新执行**。
 
