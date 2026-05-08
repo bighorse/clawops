@@ -1,28 +1,46 @@
-//! WeChat mini-program login (`wx.login` → `code2session`).
+//! WeChat mini-program login — code → openid exchange.
 //!
-//! When `wx.appid` is empty in clawops.toml the client runs in **mock**
-//! mode — the request body's `openid` field is trusted directly. This is
-//! intended for local development; in production the mock branch must be
-//! disabled by populating wx.appid + wx.secret.
+//! ClawOps does **not** call `jscode2session` directly. Instead it POSTs
+//! the wx.login code to the platform's exchange endpoint, which performs
+//! the WeChat call using its own `access_token`. This avoids the
+//! single-use `code` being consumed twice and removes the need for
+//! ClawOps to hold the WeChat AppSecret.
+//!
+//! Endpoint contract (handled by `bdhrapi.2048office.com`):
+//!   POST {backend_base_url}/message/wechat/applets/{app_id}/open_id
+//!   Content-Type: application/json
+//!   Body:  {"code": "<wx code>", "client": "clawops"}
+//!   200:   {"request_id": "...", "message": "...", "data": {"open_id": "..."}}
+//!   403:   unconfigured app_id ({"message": "未配置该公众平台", ...})
+//!   500:   code expired / already used
+//!
+//! Mock mode: when `backend_base_url` is empty (local dev / macOS), the
+//! request body's `mock_openid` is trusted directly. Setting
+//! `backend_base_url` automatically rejects `mock_openid` to prevent
+//! identity spoofing on production.
 
 use crate::config::WxConfig;
 use crate::{Error, Result};
 use serde::Deserialize;
+use std::time::Duration;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Code2SessionResp {
-    /// Optional because WeChat omits it in error responses
-    /// (e.g. invalid appid returns only errcode + errmsg).
-    #[serde(default)]
     pub openid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeResp {
     #[serde(default)]
-    pub unionid: Option<String>,
+    message: Option<String>,
     #[serde(default)]
-    pub session_key: Option<String>,
+    data: Option<ExchangeData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeData {
     #[serde(default)]
-    pub errcode: Option<i64>,
-    #[serde(default)]
-    pub errmsg: Option<String>,
+    open_id: String,
 }
 
 pub struct WxClient {
@@ -36,16 +54,18 @@ impl WxClient {
     }
 
     pub fn is_mock(&self) -> bool {
-        self.cfg.appid.is_empty() || self.cfg.secret.is_empty()
+        self.cfg.backend_base_url.is_empty()
     }
 
-    /// Exchange the wx.login `code` for an openid. In mock mode, the
-    /// `mock_openid` parameter is returned directly. In production mode
-    /// (wx.appid + wx.secret both set) the `mock_openid` field MUST be
-    /// absent — passing it returns DevFieldInProd to make config drift
-    /// loud rather than silently allow openid spoofing.
+    /// Exchange wx.login `code` for an openid via the platform backend.
+    ///
+    /// `app_id` identifies which mini-program the code came from — the
+    /// backend rejects (403) any app_id not configured on its side, so
+    /// ClawOps doesn't need its own whitelist. `mock_openid` is honored
+    /// only in mock mode and rejected otherwise.
     pub async fn code2session(
         &self,
+        app_id: &str,
         code: &str,
         mock_openid: Option<&str>,
     ) -> Result<Code2SessionResp> {
@@ -56,25 +76,23 @@ impl WxClient {
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
                     Error::Other(
-                        "wx.appid empty and no mock_openid supplied".into(),
+                        "wx.backend_base_url empty and no mock_openid supplied".into(),
                     )
                 })?
                 .to_string();
-            return Ok(Code2SessionResp {
-                openid,
-                unionid: None,
-                session_key: None,
-                errcode: Some(0),
-                errmsg: Some("mock".into()),
-            });
+            return Ok(Code2SessionResp { openid });
         }
 
-        // Production guard: refuse mock_openid so a misconfigured deployment
-        // doesn't accidentally let clients spoof identity.
         if mock_supplied {
             return Err(Error::DevFieldInProd("mock_openid"));
         }
 
+        if app_id.is_empty() {
+            return Err(Error::WxApiError {
+                errcode: -10003,
+                errmsg: "missing app_id".into(),
+            });
+        }
         if code.is_empty() {
             return Err(Error::WxApiError {
                 errcode: -10001,
@@ -83,22 +101,36 @@ impl WxClient {
         }
 
         let url = format!(
-            "https://api.weixin.qq.com/sns/jscode2session?appid={}&secret={}&js_code={}&grant_type=authorization_code",
-            self.cfg.appid, self.cfg.secret, code
+            "{}/message/wechat/applets/{}/open_id",
+            self.cfg.backend_base_url.trim_end_matches('/'),
+            app_id
         );
-        let resp: Code2SessionResp = self.http.get(&url).send().await?.json().await?;
-        if resp.errcode.unwrap_or(0) != 0 {
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(Duration::from_secs(self.cfg.exchange_timeout_secs))
+            .json(&serde_json::json!({"code": code, "client": "clawops"}))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: ExchangeResp = resp.json().await.map_err(|e| Error::WxApiError {
+            errcode: -10004,
+            errmsg: format!("backend returned non-JSON body: {e}"),
+        })?;
+        if !status.is_success() {
             return Err(Error::WxApiError {
-                errcode: resp.errcode.unwrap_or(-1),
-                errmsg: resp.errmsg.unwrap_or_else(|| "unknown".into()),
+                errcode: status.as_u16() as i64,
+                errmsg: body.message.unwrap_or_else(|| "backend error".into()),
             });
         }
-        if resp.openid.is_empty() {
-            return Err(Error::WxApiError {
+        let openid = body
+            .data
+            .map(|d| d.open_id)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::WxApiError {
                 errcode: -10002,
-                errmsg: "wechat returned empty openid".into(),
-            });
-        }
-        Ok(resp)
+                errmsg: "backend returned empty open_id".into(),
+            })?;
+        Ok(Code2SessionResp { openid })
     }
 }

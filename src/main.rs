@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
                 openid,
                 phone,
                 display_name,
+                avatar_url: None,
                 enterprise_profile: profile,
             };
             let out = provisioner.provision(&new).await?;

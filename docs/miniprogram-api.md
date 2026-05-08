@@ -14,14 +14,17 @@
 
 ## 鉴权模型
 
-1. 小程序 `wx.login()` 拿到 `code`(以及可选 `wx.getPhoneNumber()` 拿到加密手机号)。
-2. POST `/auth/wx-login`,ClawOps 调微信 `code2session` 拿到 `openid`。
-3. 首次登录的用户由 ClawOps **自动创建** zeroclaw 实例(数秒延迟)。
-4. ClawOps 返回 `token`(opaque bearer,30 天有效),**所有后续请求**带:
+1. 小程序 `wx.login()` 拿到 `code`,同时记下当前 `app_id`(`wx.getAccountInfoSync().miniProgram.appId`)。
+2. (可选)用户填昵称 / 选头像:`<button open-type="chooseAvatar">` + `<input type="nickname">`。微信自 2022 年起不再提供"用 code 换昵称头像"的接口,这两项**必须**由客户端 UI 收集。
+3. POST `/auth/wx-login`,ClawOps **不直接调微信**,而是把 `{app_id, code}` 转发到上游平台后端(`bdhrapi.2048office.com`)换 `openid`。
+   - 这样设计避免 wx `code` 被两端各调一次(`code` 是单次使用的)。
+   - app_id 校验也由上游后端负责:未配置的 app_id 一律 403。
+4. 首次登录的用户由 ClawOps **自动创建** zeroclaw 实例(数秒延迟)。
+5. ClawOps 返回 `token`(opaque bearer,30 天有效),**所有后续请求**带:
    ```
    Authorization: Bearer <token>
    ```
-5. token 过期 / 失效 → 401,小程序需重新走 `/auth/wx-login`。
+6. token 过期 / 失效 → 401,小程序需重新走 `/auth/wx-login`。
 
 > ⚠️ token 是 ClawOps 自己签发的 session token,**不是**微信 session_key。不要传给微信任何接口。
 
@@ -32,8 +35,8 @@
 | POST | `/auth/wx-login`    | ❌                | 登录 / 首次自动开通(限流 10/min/IP) |
 | POST | `/auth/logout`      | ✅ Bearer         | 撤销当前 token(幂等) |
 | POST | `/auth/logout-all`  | ✅ Bearer         | 撤销该 openid 全部 token(设备丢失场景) |
-| GET  | `/me/profile`       | ✅ Bearer         | 取当前用户的 display_name / phone / 企业画像 |
-| PUT  | `/me/profile`       | ✅ Bearer         | 部分更新(只传要改的字段);USER.md 立即重渲染,下条 chat 生效 |
+| GET  | `/me/profile`       | ✅ Bearer         | 取当前用户的 display_name / avatar_url / phone / 企业画像 |
+| PUT  | `/me/profile`       | ✅ Bearer         | 部分更新(只传要改的字段,可改 display_name / avatar_url / phone / enterprise_profile);USER.md 立即重渲染,下条 chat 生效 |
 | GET  | `/me/chat-history`  | ✅ Bearer         | 历史消息分页(`?before_id=N&limit=20`),首次不传 before_id |
 | POST | `/chat`             | ✅ Bearer         | 发送消息,等待整段回复(限流 30/min/用户) |
 | GET  | `/events`           | ✅ Bearer 或 `?token=` | 实时事件流(进度条用) |
@@ -53,9 +56,10 @@
 
 ```json
 {
-  "code": "081Kq2Fa1xxxx",          // wx.login() 拿到的 code
-  "phone": "+8613800138000",        // 可选,getPhoneNumber 解出的手机号
-  "display_name": "王小明",          // 可选,用户昵称(用于 USER.md)
+  "app_id": "wxXXXXXXXXXXXXXXXX",   // 必填,小程序 app_id;转发给上游后端做合法性校验
+  "code": "081Kq2Fa1xxxx",          // 必填,wx.login() 拿到的 code
+  "display_name": "王小明",          // 可选,nickname input 收集到的昵称
+  "avatar_url": "https://oss.../a.jpg", // 可选,chooseAvatar 拿到 wxfile:// 后**必须**由小程序先上传到 OSS / CDN 换永久 URL,再把永久 URL 传过来
   "enterprise_profile": {            // 可选,企业画像(用于定制 USER.md)
     "company_name": "示例科技",
     "industry": "软件开发",
@@ -67,11 +71,14 @@
 }
 ```
 
+注意:
+- ❌ **不再支持** `phone` 字段。手机号目前不通过登录链路收集;后续如果要,会另开 `phoneCode` 端点。
+- 老用户如果重新登录时传了新的 `display_name` / `avatar_url`,ClawOps 会**就地覆盖**写入,无需再单独调 `PUT /me/profile`。
+- `avatar_url` **必须是永久 URL**。`wxfile://` 临时路径只在小程序进程内有效,服务端拿了不能用。
+
 > `enterprise_profile` 强烈建议小程序在用户首次完善资料时收集并提交。这决定 ClawOps 给该用户渲染的 `USER.md` 内容,直接影响 LLM 回复质量(参考下方"画像生效示例")。
 
-> ⚠️ **生产服务器 `clawops.2048office.com` 已切真微信**(2026-04-28 起)。`mock_openid` 字段会被 **400 DevFieldInProd** 拒绝。前端开发请用微信开发者工具的 `wx.login()` 拿真 code 调试 —— 这跟生产链路完全一致。
->
-> 如果未来上线 staging 环境(`wx.appid` 配空的实例),才能用 `mock_openid` 调试。当前没有。
+> ⚠️ 生产环境的 `wx.backend_base_url` 配置为上游平台后端,`mock_openid` 字段会被 **400 DevFieldInProd** 拒绝。本地开发可以把 `wx.backend_base_url` 留空启用 mock 模式直接接受 `mock_openid`。
 
 **Response 200**
 
@@ -91,7 +98,8 @@
 
 | HTTP | 含义 |
 |------|------|
-| 400  | code 无效或微信验证失败 |
+| 400  | code 无效 / 已使用 / app_id 未配置 / 缺字段(`error: wechat_login_failed`,`errcode` 透传上游状态码:403=未配置 app_id,500=code 失效) |
+| 429  | 限流(同 IP 1 分钟超过 10 次) |
 | 500  | ClawOps 内部错误(进程启动失败、磁盘满等) |
 
 ---
@@ -314,11 +322,14 @@ function formatEventStatus(ev) {
 const BASE = 'https://clawops.2048office.com';   // 通配证书,nginx 反代 -> ClawOps
 
 async function login() {
-  // 1. 拿 wx.login code
+  // 1. 拿 wx.login code 和 app_id
   const { code } = await wx.login();
+  const { miniProgram } = wx.getAccountInfoSync();
+  const appId = miniProgram.appId;
 
-  // 2. (可选)拿手机号(需要用户点按钮触发)
-  // const phoneRes = await wx.getPhoneNumber(...)
+  // 2. (可选)昵称 / 头像由 chooseAvatar + nickname input 收集后传过来。
+  //    注意:chooseAvatar 拿到的是 wxfile:// 临时路径,必须先上传 OSS 换
+  //    永久 URL 再传给 ClawOps,否则保存了等于没保存。
 
   // 3. 调 ClawOps
   const res = await wx.request({
@@ -326,8 +337,10 @@ async function login() {
     method: 'POST',
     header: { 'Content-Type': 'application/json' },
     data: {
+      app_id: appId,
       code,
-      display_name: this.userInfo?.nickName,
+      display_name: this.userInfo?.nickName,        // 可选
+      avatar_url: this.userInfo?.permanentAvatarUrl, // 可选,必须是永久 URL
       // enterprise_profile: ...在用户填资料时再补
     }
   });

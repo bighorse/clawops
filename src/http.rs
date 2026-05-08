@@ -219,17 +219,29 @@ async fn health() -> Json<HealthResp> {
 
 #[derive(Deserialize)]
 struct WxLoginReq {
+    /// Mini-program app_id. Required in production. Forwarded to the
+    /// platform backend, which rejects (403) any app_id not configured
+    /// on its side — so ClawOps does not maintain its own whitelist.
+    #[serde(default)]
+    app_id: String,
     /// Code returned by `wx.login()` on the mini-program side.
     #[serde(default)]
     code: String,
-    /// Mock openid used when wx.appid is empty (dev only).
+    /// Mock openid used when wx.backend_base_url is empty (dev only).
     #[serde(default)]
     mock_openid: Option<String>,
-    /// Optional phone number (from getPhoneNumber). Stored on first login.
-    #[serde(default)]
-    phone: Option<String>,
+    /// Display name (from `<input type="nickname">` on the mini-program).
+    /// WeChat no longer exposes a code-to-nickname API since 2022, so
+    /// this can only come from the client.
     #[serde(default)]
     display_name: Option<String>,
+    /// Avatar URL (from `<button open-type="chooseAvatar">`). Caller
+    /// must already have uploaded the wxfile:// tempfile to a permanent
+    /// store — ClawOps stores the URL verbatim.
+    #[serde(default)]
+    avatar_url: Option<String>,
+    /// Optional enterprise profile JSON (rarely set on first login —
+    /// the LLM normally fills it during chat). Kept for back-compat.
     #[serde(default)]
     enterprise_profile: Option<serde_json::Value>,
 }
@@ -254,7 +266,7 @@ async fn wx_login(
 
     let session = st
         .wx
-        .code2session(&req.code, req.mock_openid.as_deref())
+        .code2session(&req.app_id, &req.code, req.mock_openid.as_deref())
         .await?;
 
     let openid = session.openid.clone();
@@ -263,13 +275,27 @@ async fn wx_login(
         is_new_user = true;
         let new = users::NewUser {
             openid: openid.clone(),
-            phone: req.phone,
+            phone: None,
             display_name: req.display_name,
+            avatar_url: req.avatar_url,
             enterprise_profile: req.enterprise_profile,
         };
         st.provisioner.provision(&new).await?;
     } else {
-        users::touch_active(&st.pool, &openid).await?;
+        // Returning user: opportunistically refresh display_name / avatar
+        // if the client supplied newer values (e.g. user changed nickname
+        // in mini-program profile page and re-logged in).
+        if req.display_name.is_some() || req.avatar_url.is_some() {
+            let patch = users::ProfilePatch {
+                display_name: req.display_name,
+                phone: None,
+                avatar_url: req.avatar_url,
+                enterprise_profile: None,
+            };
+            users::update_profile(&st.pool, &openid, &patch).await?;
+        } else {
+            users::touch_active(&st.pool, &openid).await?;
+        }
     }
 
     let s = sessions::issue(&st.pool, &openid, None).await?;
@@ -446,6 +472,7 @@ async fn logout_all(
 struct MyProfileResp {
     openid: String,
     display_name: Option<String>,
+    avatar_url: Option<String>,
     phone: Option<String>,
     enterprise_profile: Option<serde_json::Value>,
 }
@@ -462,6 +489,7 @@ async fn get_my_profile(
     Ok(Json(MyProfileResp {
         openid: u.openid,
         display_name: u.display_name,
+        avatar_url: u.avatar_url,
         phone: u.phone,
         enterprise_profile: prof,
     }))
@@ -508,6 +536,8 @@ struct ProvisionReq {
     #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde(default)]
     enterprise_profile: Option<serde_json::Value>,
 }
 
@@ -520,6 +550,7 @@ async fn admin_provision(
         openid: req.openid,
         phone: req.phone,
         display_name: req.display_name,
+        avatar_url: req.avatar_url,
         enterprise_profile: req.enterprise_profile,
     };
     let out = st.provisioner.provision(&new).await?;

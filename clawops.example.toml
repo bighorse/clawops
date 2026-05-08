@@ -40,9 +40,18 @@ max_cost_per_day_cents = 500
 tavily_api_key = ""
 
 [wx]
-# WeChat mini-program credentials. Leave empty during local dev to use mock login.
-appid = ""
-secret = ""
+# Platform backend that exchanges wx.login `code` for `openid`.
+# ClawOps does NOT call WeChat's jscode2session directly — the upstream
+# backend already holds the AppSecret and consumes the (single-use) code.
+# Endpoint shape:
+#   POST {backend_base_url}/message/wechat/applets/{app_id}/open_id
+#   body: {"code": "<wx.login code>", "client": "clawops"}
+#   200:  {"data": {"open_id": "..."}}
+#   403:  unconfigured app_id   500: code expired/used
+# Leave empty for local dev — mini-program then sends `mock_openid` directly.
+backend_base_url = "https://bdhrapi.2048office.com"
+# Backend P99 is hundreds of ms; 30s tolerates upstream WeChat hiccups.
+exchange_timeout_secs = 30
 
 [reaper]
 # Minutes of idle time (based on users.last_active_at) before stopping a process.
@@ -86,3 +95,30 @@ api_base = "https://bdhrapi.2048office.com/commodity"
 # `{id}` is the literal placeholder the LLM substitutes per product.
 # Example outputs: /pages/products/detail?id=42
 detail_path_template = "/pages/products/detail?id={id}"
+
+[activity]
+# Community-event catalogue API (forums / roadshows / matchmaking /
+# training sessions held in Huairou Science City). Same shape as
+# [commodity]: provisioner injects api_base + detail_path_template
+# into the activity-recommend SKILL. Empty api_base disables the skill.
+# Endpoints sit under /shared/event/* — the api_base points at that
+# subtree so the SKILL can reach list/detail without repeating the
+# /shared/event prefix.
+api_base = "https://bdhrapi.2048office.com/shared/event"
+detail_path_template = "/pages/activity/details/Index?obj_id={id}"
+
+[policy]
+# Policy catalogue API (national / Beijing / Huairou-district policies
+# affecting park enterprises, plus declarations, announcements, FAQs,
+# categories). Empty api_base disables the policy skill.
+api_base = "https://bdhrapi.2048office.com/policies"
+detail_path_template = "/pages/policy/detail?id={id}"
+
+[general_information]
+# Static-knowledge skill carrying the Huairou Science City service
+# handbook (6 大科学装置 / 14 交叉平台 / 17 科教设施 / 政策清单 /
+# 入驻流程 / 联络方式) inlined into each user's prompt. No external
+# API — flipping enabled=false simply skips rendering the SKILL.md
+# so the daemon LLM no longer holds (and won't try to answer with)
+# that knowledge.
+enabled = true

@@ -30,11 +30,22 @@ fn extract_host(url: &str) -> Option<String> {
 /// disables the http_request tool).
 fn http_allowed_domains_toml(cfg: &Config) -> String {
     let mut hosts: Vec<String> = Vec::new();
+    let push_unique = |hosts: &mut Vec<String>, h: String| {
+        if !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    };
     if let Some(h) = extract_host(&cfg.commodity.api_base) {
-        hosts.push(h);
+        push_unique(&mut hosts, h);
+    }
+    if let Some(h) = extract_host(&cfg.activity.api_base) {
+        push_unique(&mut hosts, h);
+    }
+    if let Some(h) = extract_host(&cfg.policy.api_base) {
+        push_unique(&mut hosts, h);
     }
     if let Some(h) = extract_host(&cfg.lead.webhook_url) {
-        hosts.push(h);
+        push_unique(&mut hosts, h);
     }
     let quoted: Vec<String> = hosts.iter().map(|h| format!("\"{h}\"")).collect();
     format!("[{}]", quoted.join(", "))
@@ -187,6 +198,7 @@ impl Provisioner {
             "openid": user.openid,
             "phone": user.phone,
             "display_name": user.display_name,
+            "avatar_url": user.avatar_url,
             "linux_uid": user.linux_uid,
             "port": port,
             "workspace_path": layout.workspace_dir,
@@ -207,6 +219,19 @@ impl Provisioner {
                 "api_base": self.cfg.commodity.api_base,
                 "detail_path_template": self.cfg.commodity.detail_path_template,
                 "enabled": !self.cfg.commodity.api_base.is_empty(),
+            },
+            "activity": {
+                "api_base": self.cfg.activity.api_base,
+                "detail_path_template": self.cfg.activity.detail_path_template,
+                "enabled": !self.cfg.activity.api_base.is_empty(),
+            },
+            "policy": {
+                "api_base": self.cfg.policy.api_base,
+                "detail_path_template": self.cfg.policy.detail_path_template,
+                "enabled": !self.cfg.policy.api_base.is_empty(),
+            },
+            "general_information": {
+                "enabled": self.cfg.general_information.enabled,
             },
             "lead": {
                 "webhook_url": self.cfg.lead.webhook_url,
@@ -333,6 +358,7 @@ impl Provisioner {
             "openid": user.openid,
             "phone": user.phone,
             "display_name": user.display_name,
+            "avatar_url": user.avatar_url,
             "linux_uid": user.linux_uid,
             "port": port_for_config,
             "workspace_path": layout.workspace_dir,
@@ -353,6 +379,19 @@ impl Provisioner {
                 "api_base": self.cfg.commodity.api_base,
                 "detail_path_template": self.cfg.commodity.detail_path_template,
                 "enabled": !self.cfg.commodity.api_base.is_empty(),
+            },
+            "activity": {
+                "api_base": self.cfg.activity.api_base,
+                "detail_path_template": self.cfg.activity.detail_path_template,
+                "enabled": !self.cfg.activity.api_base.is_empty(),
+            },
+            "policy": {
+                "api_base": self.cfg.policy.api_base,
+                "detail_path_template": self.cfg.policy.detail_path_template,
+                "enabled": !self.cfg.policy.api_base.is_empty(),
+            },
+            "general_information": {
+                "enabled": self.cfg.general_information.enabled,
             },
             "lead": {
                 "webhook_url": self.cfg.lead.webhook_url,
@@ -450,6 +489,7 @@ impl Provisioner {
             "openid": user.openid,
             "phone": user.phone,
             "display_name": user.display_name,
+            "avatar_url": user.avatar_url,
             "linux_uid": user.linux_uid,
             "port": user.port,
             "workspace_path": layout.workspace_dir,

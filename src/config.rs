@@ -19,6 +19,12 @@ pub struct Config {
     #[serde(default)]
     pub commodity: CommodityConfig,
     #[serde(default)]
+    pub activity: ActivityConfig,
+    #[serde(default)]
+    pub policy: PolicyConfig,
+    #[serde(default)]
+    pub general_information: GeneralInformationConfig,
+    #[serde(default)]
     pub lead: LeadConfig,
 }
 
@@ -166,12 +172,116 @@ impl Default for CommodityConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// Activity catalogue API for Huairou Science City community events
+/// (forums / roadshows / matchmaking sessions / training). Same
+/// pattern as `CommodityConfig` — provisioner injects api_base +
+/// detail_path_template into each user's SKILL.md so the daemon LLM
+/// uses http_request to query the catalogue. Empty api_base
+/// disables the activity skill (treated like commodity).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ActivityConfig {
+    #[serde(default)]
+    pub api_base: String,
+    #[serde(default = "default_activity_detail_path_template")]
+    pub detail_path_template: String,
+}
+
+fn default_activity_detail_path_template() -> String {
+    "/pages/activity/details/Index?obj_id={id}".into()
+}
+
+impl Default for ActivityConfig {
+    fn default() -> Self {
+        Self {
+            api_base: String::new(),
+            detail_path_template: default_activity_detail_path_template(),
+        }
+    }
+}
+
+/// Policy catalogue API. Same pattern as `CommodityConfig`. The skill
+/// also exposes ancillary resources (categories tree, policy
+/// declarations, announcements, FAQs) to help the LLM ground its
+/// answers in real data instead of stale handbook numbers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PolicyConfig {
+    #[serde(default)]
+    pub api_base: String,
+    #[serde(default = "default_policy_detail_path_template")]
+    pub detail_path_template: String,
+}
+
+fn default_policy_detail_path_template() -> String {
+    "/pages/policy/detail?id={id}".into()
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            api_base: String::new(),
+            detail_path_template: default_policy_detail_path_template(),
+        }
+    }
+}
+
+/// Static-knowledge skill carrying the Huairou Science City service
+/// handbook (facilities, policies, onboarding flow, contacts) inlined
+/// into each user's prompt. No external API — flipping `enabled` to
+/// false simply skips rendering the SKILL.md, so the LLM no longer
+/// holds that knowledge and won't try to answer those questions.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GeneralInformationConfig {
+    #[serde(default = "default_general_information_enabled")]
+    pub enabled: bool,
+}
+
+fn default_general_information_enabled() -> bool {
+    true
+}
+
+impl Default for GeneralInformationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_general_information_enabled(),
+        }
+    }
+}
+
+/// WeChat code-to-openid exchange settings.
+///
+/// ClawOps does **not** call WeChat's `jscode2session` directly — that
+/// would consume the same `access_token` the upstream platform backend
+/// already uses, and the wx `code` is single-use. Instead, ClawOps POSTs
+/// the code to the platform's exchange endpoint and gets back the openid.
+///
+/// Endpoint shape:
+///   `POST {backend_base_url}/message/wechat/applets/{app_id}/open_id`
+///   body: `{"code": "...", "client": "clawops"}`
+///   resp 200: `{"data": {"open_id": "..."}}`
+///   non-200: `{"message": "..."}`  (403 = unconfigured app_id, 500 = code expired/used)
+///
+/// Mock mode: leave `backend_base_url` empty for local dev — the request
+/// body's `mock_openid` is trusted directly. Production deployments MUST
+/// set `backend_base_url`; doing so also makes `mock_openid` rejected.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WxConfig {
     #[serde(default)]
-    pub appid: String,
-    #[serde(default)]
-    pub secret: String,
+    pub backend_base_url: String,
+    #[serde(default = "default_wx_exchange_timeout_secs")]
+    pub exchange_timeout_secs: u64,
+}
+
+fn default_wx_exchange_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for WxConfig {
+    fn default() -> Self {
+        Self {
+            backend_base_url: String::new(),
+            exchange_timeout_secs: default_wx_exchange_timeout_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

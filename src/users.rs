@@ -8,6 +8,7 @@ pub struct User {
     pub openid: String,
     pub phone: Option<String>,
     pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
     pub enterprise_profile: Option<String>,
     pub linux_uid: String,
     pub workspace_path: String,
@@ -24,6 +25,7 @@ pub struct NewUser {
     pub openid: String,
     pub phone: Option<String>,
     pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
     pub enterprise_profile: Option<serde_json::Value>,
 }
 
@@ -55,13 +57,14 @@ pub async fn insert_provisioning(
 
     sqlx::query(
         r#"INSERT INTO users
-           (openid, phone, display_name, enterprise_profile, linux_uid, workspace_path,
+           (openid, phone, display_name, avatar_url, enterprise_profile, linux_uid, workspace_path,
             port, paired_token_enc, status, created_at, last_active_at)
-           VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'provisioning', ?, ?)"#,
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'provisioning', ?, ?)"#,
     )
     .bind(&new.openid)
     .bind(&new.phone)
     .bind(&new.display_name)
+    .bind(&new.avatar_url)
     .bind(&profile_json)
     .bind(linux_uid)
     .bind(workspace_path)
@@ -122,6 +125,7 @@ pub async fn touch_active(pool: &SqlitePool, openid: &str) -> Result<()> {
 pub struct ProfilePatch {
     pub display_name: Option<String>,
     pub phone: Option<String>,
+    pub avatar_url: Option<String>,
     pub enterprise_profile: Option<serde_json::Value>,
 }
 
@@ -137,6 +141,9 @@ pub async fn update_profile(
     }
     if patch.phone.is_some() {
         set_parts.push("phone = ?");
+    }
+    if patch.avatar_url.is_some() {
+        set_parts.push("avatar_url = ?");
     }
     if patch.enterprise_profile.is_some() {
         set_parts.push("enterprise_profile = ?");
@@ -154,6 +161,9 @@ pub async fn update_profile(
         q = q.bind(v);
     }
     if let Some(v) = &patch.phone {
+        q = q.bind(v);
+    }
+    if let Some(v) = &patch.avatar_url {
         q = q.bind(v);
     }
     if let Some(v) = &patch.enterprise_profile {
@@ -219,6 +229,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for User {
             openid: row.try_get("openid")?,
             phone: row.try_get("phone")?,
             display_name: row.try_get("display_name")?,
+            avatar_url: row.try_get("avatar_url")?,
             enterprise_profile: row.try_get("enterprise_profile")?,
             linux_uid: row.try_get("linux_uid")?,
             workspace_path: row.try_get("workspace_path")?,
