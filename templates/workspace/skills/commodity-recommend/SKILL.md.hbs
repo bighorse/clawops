@@ -64,19 +64,25 @@
 
 ### Step 2:搜索服务(自动执行)
 
+⚠️ **/services/products 端点必须带这两个状态过滤** —— `status=ONLINE&shop_status=ONLINE`。前者剔除产品自身下架/审核中的;后者剔除产品挂在已下线商家名下的"幽灵产品"。**没带这两个参数的查询都是错的**,会推荐出已经摘下来的、用户点进去看不到的产品。
+
 ```
 http_request GET {{commodity.api_base}}/services/products
   ?keyword=<速查表的值>
+  &status=ONLINE
+  &shop_status=ONLINE
   &page_size=10
   &page_index=1
 ```
 
-如果 `data_count < 3`,补一把推荐:
+如果 `data_count < 3`,补一把运营推荐:
 
 ```
 http_request GET {{commodity.api_base}}/services/products/recommend_list
   ?page_size=5
 ```
+
+⚠️ `recommend_list` 端点**不支持** `status` / `shop_status` 参数(只接受 page 参数),所以拿到的结果**必须端侧过滤**:对每条产品,丢弃 `status != "ONLINE"` 或 `shop.status != "ONLINE"`(商家信息嵌在产品里)的条目,再做后续展示。
 
 如果用户**完全没说具体需求**(只问"你们都有什么"),改走分类:
 
@@ -133,7 +139,7 @@ http_request GET {{commodity.api_base}}/services/products/<obj_id>
 
 | 用户问什么 | 调哪个端点 | 拿哪个字段 | 注意 |
 |-----------|-----------|-----------|------|
-| 多少**项服务 / 多少款产品 / 几个服务**(意图模糊但隐含产品计数) | `GET {{commodity.api_base}}/services/products?page_size=1&status=ONLINE` | `data.data_count` | 默认只数**已上线**(status=ONLINE) — 草稿/下架/审核中不算 |
+| 多少**项服务 / 多少款产品 / 几个服务**(意图模糊但隐含产品计数) | `GET {{commodity.api_base}}/services/products?page_size=1&status=ONLINE&shop_status=ONLINE` | `data.data_count` | 必须**两层过滤**:`status=ONLINE`(产品自身在线) + `shop_status=ONLINE`(商家在线)。少一个都会把幽灵产品算进来 |
 | 多少**家服务商 / 入驻商户 / 供应商** | `GET {{commodity.api_base}}/shops?page_size=1&status=ONLINE` | `data.data_count` | 同上,只数 ONLINE — 不要把 CHECKING/REJECT 算进去 |
 | 多少**个一级分类 / 几个方向** | `GET {{commodity.api_base}}/categories?tree=true&page_size=50` | **响应里 `name` 字段去重后的个数** | ⚠️ **不要直接用 `data_count`** — 该 API 当前数据脏,同名分类有重复行(实测 20 行 / 9 个不同名),`data_count` 拿到的是行数不是真分类数 |
 
