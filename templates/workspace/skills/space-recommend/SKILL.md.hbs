@@ -193,9 +193,18 @@ GET 端点 + query 参数(参考"主要端点"表)。用户给了 `name` 关键�
 API 列表端点**不支持** `status` 查询参数,所以 LLM **必须端侧过滤**。对返回的 `.data.data[]`,只保留满足以下**全部**条件的:
 
 1. **`status == 2` 严格过滤**(空间模块的 status 枚举:**`2` 才是已上线**;`1` 是已下线、`-1`/`0`/其它任何值统统当作不可用全部丢弃)。⚠️ 这一步不能跳 —— 把下线/删除的房源推给用户,用户点链接看到的是空白或别的内容,信任度立刻崩。⚠️ **注意空间模块的 status 语义跟 commodity 模块不同**(commodity 用 "ONLINE"/"OFFLINE" 字符串),不要套用其它 skill 的过滤值
-2. `name` / `park_name` / `workshop_name` 跟用户诉求**真实相关**(光含关键字不够,要语义相关)
-3. 价格相关字段(`price_low`/`average_price`/`unit_price`/`lease_price`)若全为 0 / null,在简介里写"价格面议",**不要**编造数字
-4. 面积相关字段(`area`/`gross_floor_area`/`floorage`)同上 — 0 / null 写"面积详询"
+
+2. **父子级联过滤**(只针对 `office` / `station`):这两个子表都隶属某个 `maker_space`(通过 `maker_space_id` 字段挂载),后端数据可能出现"父级 maker_space `status=1`(下线),但其下 office / station 仍 `status=2`(上线)"的不一致状态。此时**只要父级下线,所有子级一律丢弃**,因为子资源点击进去看到的是父级 maker_space 详情页,父页面会显示"已下线",用户体验崩。
+   - 流程上要求:**任何**对 `/space_show/office/list?maker_space_id=X` 或 `/space_show/station/list?maker_space_id=X` 的查询,LLM **必须先**(本轮已有 / 或额外调一次)`/space_show/maker_space/item?maker_space_id=X`,确认父级 `status == 2`;父级不是 2 → 整片子级**全丢**,告诉用户"该众创空间已停止公开招商,目前没有可推荐的独立办公室/工位",**不要**展示任何空置房源
+   - 正常流程(Step 1 速查表里"先列众创空间,再下钻")已经隐含这点:`maker_space/list` 拉回来后,Step 3 #1 先按 `status==2` 过滤,只对**过滤后**留下的 maker_space 才发起 office/station 查询;这条流程跑对了就**不会**踩坑
+
+3. `workshop` 和 `industrial_land` **不**做级联检查 —— 它们是顶层资源(workshop 没有 park_id 字段、industrial_land 也是独立的),只看自身 `status==2` 就行
+
+4. `name` / `park_name` / `workshop_name` 跟用户诉求**真实相关**(光含关键字不够,要语义相关)
+
+5. 价格相关字段(`price_low`/`average_price`/`unit_price`/`lease_price`)若全为 0 / null,在简介里写"价格面议",**不要**编造数字
+
+6. 面积相关字段(`area`/`gross_floor_area`/`floorage`)同上 — 0 / null 写"面积详询"
 
 留 TOP 5。
 
@@ -277,18 +286,29 @@ http_request GET {{{space.api_base}}}/space_show/maker_space/item?maker_space_id
 ## 自检(回答前必过)
 
 1. **status 端侧过滤**:我列出来的每条,`status` 字段是不是 **`2`**(空间模块的"已上线")?有任何 `1` / `-1` / `0` / 其它值**回去删**。API 列表端点不带 status 过滤参数,所以这一步只能在 LLM 端做,不能省。**⚠️ 不要套用 commodity 模块的 ONLINE/OFFLINE 字符串语义**,空间模块用的是数字枚举且 `2` 才是上线。
-2. **我列的空间 id**,是不是来自这一轮 `http_request` 响应的 `data.data[].id`?如果不是,**不要回答** — 必须先调 API。
-3. **逐字段过 API 原文**:对每一条空间,我列的**每个字段**(名字、地址、面积、价格、招商方向、电梯、承重、电力、联系人、联系电话),都能在 API 响应里找到对应字段值吗?如果不能,这条字段是我自己**推论 / 补全 / 美化**出来的 — **回去删**,只留有 API 原值的字段。
-4. **名字字面对比**:我写出的名字,跟 API `workshop_name` / `park_name` / `name` 字段**一字不差**吗?加了"基地"、"中心"、"·"分隔符等都算违反,**回去改成 API 原名**。
-5. **联系电话原样**:格式是不是跟 API `contact_tel` 原值完全一致?加了短横线、空格、括号都不行。
-3. **我的链接** `[查看详情](path)` 里:
+
+2. **父子级联过滤**(office / station):我列的每条 office / station,它的父 maker_space 我**今天确认过 status==2** 吗?没确认过 → 回去**先查父级 status**,父级 `status != 2` 则整片子级**全删**,不展示也不留链接。这条只针对 office 和 station(它们的链接落点是父 maker_space 详情页);workshop / industrial_land 不需要做这一步。
+
+3. **我列的空间 id**,是不是来自这一轮 `http_request` 响应的 `data.data[].id`?如果不是,**不要回答** — 必须先调 API。
+
+4. **逐字段过 API 原文**:对每一条空间,我列的**每个字段**(名字、地址、面积、价格、招商方向、电梯、承重、电力、联系人、联系电话),都能在 API 响应里找到对应字段值吗?如果不能,这条字段是我自己**推论 / 补全 / 美化**出来的 — **回去删**,只留有 API 原值的字段。
+
+5. **名字字面对比**:我写出的名字,跟 API `workshop_name` / `park_name` / `name` 字段**一字不差**吗?加了"基地"、"中心"、"·"分隔符等都算违反,**回去改成 API 原名**。
+
+6. **联系电话原样**:格式是不是跟 API `contact_tel` 原值完全一致?加了短横线、空格、括号都不行。
+
+7. **我的链接** `[查看详情](path)` 里:
    - 园区类资源 → 用 `{{{space.park_detail_path_template}}}`,把 `{id}` 换成真 id 数字
    - 众创空间类资源 → 用 `{{{space.maker_space_detail_path_template}}}`,把 `{id}` 换成真 id 数字
    - 厂房/工位/办公室 → 链回它的所属园区或众创空间,**不要**自己造一个不存在的子页面
-4. **`description`/`profile`/`investment_policy`** 字段有没有 HTML 标签残留?如果有,**回去剥**再展示。
-5. **价格 0/null**有没有写成"面议"?编了具体数字就**回去删**。
-6. **写操作**(新增/编辑/审核/删除/需求提交) 有没有调 POST(除了 `/parks/query_list`)?如果调了,**回去删** — 我们只引导用户去小程序自己点。
-7. **POST `/parks/query_list`** body 里 `average_price` 有没有用错档位字符串?只允许 `"[0,30)"`、`"[30,50]"`、`"[50,70]"`、`"(70,)"` 四种之一。
+
+8. **`description`/`profile`/`investment_policy`** 字段有没有 HTML 标签残留?如果有,**回去剥**再展示。
+
+9. **价格 0/null**有没有写成"面议"?编了具体数字就**回去删**。
+
+10. **写操作**(新增/编辑/审核/删除/需求提交) 有没有调 POST(除了 `/parks/query_list`)?如果调了,**回去删** — 我们只引导用户去小程序自己点。
+
+11. **POST `/parks/query_list`** body 里 `average_price` 有没有用错档位字符串?只允许 `"[0,30)"`、`"[30,50]"`、`"[50,70]"`、`"(70,)"` 四种之一。
 
 任一项答 No,**回去重新执行**。
 
