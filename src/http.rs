@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/auth/wx-login", post(wx_login))
+        .route("/auth/wecom-login", post(wecom_login))
         .route("/auth/logout", post(logout))
         .route("/auth/logout-all", post(logout_all))
         .route("/chat", post(chat))
@@ -252,6 +253,67 @@ struct WxLoginResp {
     openid: String,
     is_new_user: bool,
     expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// POST /auth/wecom-login — provision a user identified by their
+/// Enterprise WeChat `uin` (string ID assigned by the wecom platform
+/// when a WeChat user adds our enterprise contact). This is a
+/// server-to-server endpoint called by the platform's wecom bot
+/// backend, not by an end-user device.
+///
+/// Identity model: the uin user is **completely independent** of any
+/// mini-program (wx-login) user — they get their own daemon, workspace,
+/// memory, and chat history. We synthesise an openid of the form
+/// `uin:<uin>` to keep the existing users table primary key intact;
+/// nothing downstream needs to change.
+#[derive(Deserialize)]
+struct WecomLoginReq {
+    /// Enterprise WeChat-assigned uin (≤128 chars; caller validates format).
+    uin: String,
+    /// Optional display name fetched from wecom contact profile.
+    #[serde(default)]
+    display_name: Option<String>,
+    /// Optional avatar URL fetched from wecom contact profile.
+    #[serde(default)]
+    avatar_url: Option<String>,
+}
+
+async fn wecom_login(
+    _: AdminGuard,
+    State(st): State<AppState>,
+    Json(req): Json<WecomLoginReq>,
+) -> std::result::Result<Json<WxLoginResp>, Error> {
+    let openid = format!("uin:{}", req.uin);
+    let mut is_new_user = false;
+    if users::get(&st.pool, &openid).await?.is_none() {
+        is_new_user = true;
+        let new = users::NewUser {
+            openid: openid.clone(),
+            phone: None,
+            display_name: req.display_name,
+            avatar_url: req.avatar_url,
+            enterprise_profile: None,
+        };
+        st.provisioner.provision(&new).await?;
+    } else if req.display_name.is_some() || req.avatar_url.is_some() {
+        let patch = users::ProfilePatch {
+            display_name: req.display_name,
+            phone: None,
+            avatar_url: req.avatar_url,
+            enterprise_profile: None,
+        };
+        users::update_profile(&st.pool, &openid, &patch).await?;
+    } else {
+        users::touch_active(&st.pool, &openid).await?;
+    }
+
+    let s = sessions::issue(&st.pool, &openid, None).await?;
+    Ok(Json(WxLoginResp {
+        token: s.token,
+        openid,
+        is_new_user,
+        expires_at: s.expires_at,
+    }))
 }
 
 async fn wx_login(
