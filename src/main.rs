@@ -45,6 +45,20 @@ enum Cmd {
         openid: String,
     },
 
+    /// Re-render IDENTITY.md / SOUL.md / USER.md / config.toml / skills/* /
+    /// sops/* for one or more users from current templates, then restart
+    /// their daemon. Use after deploying template changes to roll out the
+    /// new prompts/SOPs to existing users without making them re-pair.
+    /// paired_token is preserved — existing client sessions stay valid.
+    RefreshWorkspace {
+        /// Single openid to refresh. Mutually exclusive with --all.
+        #[arg(long, conflicts_with = "all")]
+        openid: Option<String>,
+        /// Refresh every user in the DB (sequentially, stopping on first error).
+        #[arg(long)]
+        all: bool,
+    },
+
     /// List all known users.
     List,
 
@@ -145,6 +159,29 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Stop { openid } => {
             provisioner.stop(&openid).await?;
             println!("stopped: {openid}");
+        }
+        Cmd::RefreshWorkspace { openid, all } => {
+            if !all && openid.is_none() {
+                anyhow::bail!("refresh-workspace requires --openid <id> or --all");
+            }
+            let targets: Vec<String> = if all {
+                sqlx::query_scalar::<_, String>("SELECT openid FROM users")
+                    .fetch_all(&pool)
+                    .await?
+            } else {
+                vec![openid.expect("checked above")]
+            };
+            println!("refreshing {} user(s)...", targets.len());
+            for oid in &targets {
+                match provisioner.refresh_workspace(oid).await {
+                    Ok(()) => println!("  ok: {oid}"),
+                    Err(e) => {
+                        eprintln!("  FAILED: {oid} — {e}");
+                        anyhow::bail!("refresh failed at {oid}");
+                    }
+                }
+            }
+            println!("done: refreshed {} user(s)", targets.len());
         }
         Cmd::List => {
             let rows: Vec<users::User> = sqlx::query_as(
