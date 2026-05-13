@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
+    pub policy_match: PolicyMatchConfig,
+    #[serde(default)]
     pub space: SpaceConfig,
     #[serde(default)]
     pub general_information: GeneralInformationConfig,
@@ -222,6 +224,63 @@ impl Default for PolicyConfig {
         Self {
             api_base: String::new(),
             detail_path_template: default_policy_detail_path_template(),
+        }
+    }
+}
+
+/// Policy-match SOP backend. Unlike `PolicyConfig` (which points at the
+/// public 2048office policy catalogue for the query-style policy-recommend
+/// skill), this points at the internal ztagent-service-api that owns the
+/// enterprise profile + policy match writeback. The SOP calls three
+/// endpoints in one run: profile-sync (GET), policy-list (GET), and
+/// save-result (POST, also triggers the mini-program card push).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PolicyMatchConfig {
+    /// Base URL of ztagent-service-api, e.g. "https://bdhrapi.2048office.com".
+    /// Empty disables policy-match — daemon http_request will fail.
+    #[serde(default)]
+    pub api_base: String,
+    /// GET path returning {enterprise_id, qualification_enterprise_id,
+    /// basic_info, qualification_info, bocha_info}. NEW endpoint to be
+    /// added in ztagent-service-api (synchronous, no rabbitmq).
+    #[serde(default = "default_pm_enterprise_profile_path")]
+    pub enterprise_profile_path: String,
+    /// GET path for policy catalogue. Existing CRUD on `PolicySummary`.
+    #[serde(default = "default_pm_policy_list_path")]
+    pub policy_list_path: String,
+    /// POST path to persist match result and trigger mini-program push.
+    /// NEW endpoint to be added in ztagent-service-api (atomic delete+insert
+    /// of EnterprisePolicySummary + EnterprisePolicySummaryCondition rows).
+    #[serde(default = "default_pm_save_match_result_path")]
+    pub save_match_result_path: String,
+    /// Mini-program detail path the LLM puts in card-style links so the
+    /// front-end can intercept clicks and wx.navigateTo. `{enterprise_id}`
+    /// is replaced at render time by the LLM.
+    #[serde(default = "default_pm_detail_path_template")]
+    pub mini_program_detail_path_template: String,
+}
+
+fn default_pm_enterprise_profile_path() -> String {
+    "/agent/enterprise_profile_sync".into()
+}
+fn default_pm_policy_list_path() -> String {
+    "/policy_summary".into()
+}
+fn default_pm_save_match_result_path() -> String {
+    "/agent/save_match_result".into()
+}
+fn default_pm_detail_path_template() -> String {
+    "/pages/policy_match/index?enterprise_id={enterprise_id}".into()
+}
+
+impl Default for PolicyMatchConfig {
+    fn default() -> Self {
+        Self {
+            api_base: String::new(),
+            enterprise_profile_path: default_pm_enterprise_profile_path(),
+            policy_list_path: default_pm_policy_list_path(),
+            save_match_result_path: default_pm_save_match_result_path(),
+            mini_program_detail_path_template: default_pm_detail_path_template(),
         }
     }
 }

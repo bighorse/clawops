@@ -1,0 +1,233 @@
+# 政策匹配 SOP (policy-match)
+
+基于企业画像主动匹配适用政策。**对话内** 由 LLM 在识别到政策匹配意图后通过 `sop_execute('policy-match', payload={...})` 触发；**外部** 可通过 POST `/sop/policy-match` webhook 触发。
+
+> ⚠️ **与 policy-recommend skill 的边界**:
+> - `policy-recommend` skill = 用户问什么搜什么(对接外部 2048office `/policies/*` 公开 API,查询型)
+> - `policy-match` SOP(本流程)= 基于当前企业的完整画像(工商+资质+三方搜索)主动匹配适用政策,**写库 + 触发小程序政策匹配页卡片推送**,推荐型
+> - 用户问"政策是什么/有哪些政策" → policy-recommend
+> - 用户问"我能申请什么政策 / 帮我匹配政策 / 我企业适合什么政策" → policy-match(本 SOP)
+
+> ⚠️ **后端依赖**: 本 SOP 调用 ztagent-service-api 的三个内部接口
+> - `GET {{{policy_match.api_base}}}{{{policy_match.enterprise_profile_path}}}` — 同步取企业完整画像
+> - `GET {{{policy_match.api_base}}}{{{policy_match.policy_list_path}}}` — 取政策清单(~100 条全量)
+> - `POST {{{policy_match.api_base}}}{{{policy_match.save_match_result_path}}}` — 写匹配结果 + 触发小程序卡片推送
+>
+> 三个接口都是同步的,无 rabbitmq/异步等待。所有"AI 匹配"由本地 LLM 在 SOP step 内完成,**不依赖** FastGPT 或外部 agent。
+
+## Inputs
+
+`sop_execute('policy-match', payload={...})` 期望的 payload:
+
+- `enterprise_name` (string, **优先级最高**): 用户消息中明确指定的企业名(例:用户说"帮华为公司匹配下政策" → `enterprise_name="华为"`)
+- `openid` (string, 必填): 当前用户 openid,作为 `agent_user_info` 透传给后端 API
+
+**enterprise_name 兜底链**(按优先级):
+1. payload 里明确传入的 `enterprise_name`(用户消息指定)
+2. `memory_recall(query="user_profile_company_name")` 拿用户画像里的企业全称
+3. IDENTITY.md 里渲染的 `{{enterprise.company_name}}`(provision 时注入)
+4. 都没有 → narrate "请告诉我要为哪家企业匹配政策" 并以 `sop_advance status=Failed` 终止
+
+## 工作目录
+
+所有产物落到相对路径 `case/policy-match/<enterprise_safe>/`:
+
+- `<enterprise_safe>` 规范化规则: 取 enterprise_name 全文,把空格 / `/` / `:` / `*` / `?` / `"` / `<` / `>` / `|` 替换成 `_`,其余字符(含中文)保留
+- step 1 启动时 narrate 出 `enterprise_safe = "..."`,后续所有 step 严格复用同一字符串
+
+## Steps
+
+1. **取企业画像** — 同步调后端拿工商 + 资质 + 三方搜索完整画像。
+   - tools: http_request, file_write, memory_recall
+   - notes:
+     (1) 按上文"enterprise_name 兜底链"确定 `enterprise_name`。**禁止**凭对话上下文猜测企业名 — 兜底链全部失败必须以 Failed 终止,不要硬编一个"示例企业"。
+     (2) 计算 `enterprise_safe`,narrate 出 `enterprise_name="..."` 和 `enterprise_safe="..."`,后续 step 复用。
+     (3) 调用接口:
+        ```
+        http_request GET {{{policy_match.api_base}}}{{{policy_match.enterprise_profile_path}}}
+          ?enterprise_name=<enterprise_name>
+          &agent_user_info={{openid}}
+        ```
+        期望响应 `data` 含: `enterprise_id`, `qualification_enterprise_id`, `basic_info`(工商), `qualification_info`(专利/商标/资质证书/荣誉), `bocha_info`(三方搜索摘要)。
+     (4) **精简后**落盘到 `case/policy-match/<enterprise_safe>/profile.json`,严格按以下 schema(**file_write 之前先剥离冗余,降低后续 step 的 context 压力**):
+        ```json
+        {
+          "enterprise_id": <int>,
+          "qualification_enterprise_id": <int>,
+          "enterprise_name": "<原文>",
+          "basic_info": "<原文,通常 < 1 KB,全保留>",
+          "qualification_info": "<原文,通常 5-10 KB,全保留 — 资质决定能申请什么政策>",
+          "bocha_info_summary": "<bocha_info 截首 1500 字,保留经营范围 + 行业关键词;丢弃年报/财报/历史公告等长内容>"
+        }
+        ```
+        **禁止**把完整 `bocha_info`(常达 30 KB)直接 dump 进 profile.json — step 3-4 LLM 处理时 context 会爆,deepseek 100K+ input 易 hang。
+     (5) **【P0】记下 `enterprise_id`**:后续 step 5 写库要用。在 narrate 中显式回报 `enterprise_id=<值>`。
+     (6) **降级**: 接口 4xx/5xx → narrate "企业画像服务暂时不可用,请稍后再试",`sop_advance status=Failed`。
+     (7) **数据空兜底**: 返回 `data` 为 `null` 或 `enterprise_id` 缺失 → 同上 Failed,**不要**自己捏造 enterprise_id。
+
+2. **取候选政策清单** — 一次性拉全量启用中的政策(库总量约 100 条,可全量塞入 LLM context)。
+   - tools: http_request, file_write
+   - notes:
+     (1) 调用:
+        ```
+        http_request GET {{{policy_match.api_base}}}{{{policy_match.policy_list_path}}}
+          ?no_pagination=true
+          &status=ONLINE
+          &order_by_fields=is_top
+          &order_by_types=DESC
+        ```
+        响应 `data.data[]` 为政策清单,每条含: `id`, `name`, `sponsor`, `department`, `support_money`, `support_decimal_money`, `policy_direction`, `policy_belong`, `application_at`, `application_date_at`, `application_method`, `application_condition`, `application_material`, `link`, `description`, `policy_basis`, `published_at` 等字段。
+     (2) **逐条精简后**落盘到 `case/policy-match/<enterprise_safe>/candidates.json`。每条政策**只保留**对匹配 + 展示有用的字段:
+        ```json
+        {
+          "policies": [
+            {
+              "id": <int>,
+              "name": "<政策名>",
+              "policy_direction": "<政策方向>",
+              "policy_belong": "<政策所属范畴>",
+              "application_condition": "<申报条件原文,step 4 拆解依据>",
+              "application_at": "<申报开始/窗口>",
+              "application_date_at": "<申报截止>",
+              "support_money": "<支持内容文本>",
+              "support_decimal_money": <数字,最高奖励金额>,
+              "link": "<原文链接,step 6 展示用>",
+              "status": "ONLINE"
+            }
+          ]
+        }
+        ```
+        **禁止**保留: `description`(摘要,常含 HTML 残留 + 数百字)、`sponsor`/`department`/`contact_information`(发文单位,匹配无关)、`application_method`/`application_material`(申报方式/材料,step 1-5 不需要)、`policy_basis`(政策依据)、`published_at`/`created_at`/`updated_at`(时间戳,匹配无关) — 这些字段对每条政策合起来通常 800B-1.5KB,100 条就是 80-150 KB,精简后 candidates.json 应该在 30-50 KB 量级。
+     (3) **size 自检**: 落盘后期望 `case/.../candidates.json` 30-60 KB(若 < 5 KB 说明 LLM 偷懒只写元信息没写 data 数组,**必须重写**;若 > 100 KB 说明精简没生效,也要重写)。
+     (4) **降级**: 接口 4xx/5xx → narrate "政策库暂时不可用,请稍后再试",`sop_advance status=Failed`。
+
+3. **LLM 匹配筛选** — 读企业画像 + 政策清单,LLM 选出适用的政策。
+   - tools: file_read, file_write
+   - notes:
+     (1) file_read `case/policy-match/<enterprise_safe>/profile.json` 和 `candidates.json`。
+     (2) 对每条候选政策,综合判断企业是否适用,判断维度:
+        - **行业匹配**: 政策的 `policy_direction` / `policy_belong` 是否覆盖企业主营行业(`basic_info` 里的经营范围 / `bocha_info` 里的行业关键词)
+        - **资质门槛**: 政策 `application_condition` 若明示要求"高新企业 / 专精特新 / 国家级资质",企业 `qualification_info` 里没有对应资质则**降级排序**(不直接淘汰 — 用户可能即将获得)
+        - **规模匹配**: 政策若按企业规模分档(小微 / 中型 / 大型),与 `basic_info` 里的注册资本 / 参保人数对齐
+        - **时效**: `application_at` 若为过期日期(< 当前日期)且非长期有效,标记 `expired=true` 但**仍保留**(用户可能问"今年错过了下一波什么时候") — 排序时排最后
+     (3) 输出选 **TOP 10**(不够 10 条就有几条放几条),写入 `case/policy-match/<enterprise_safe>/match.json`,schema:
+        ```json
+        {
+          "enterprise_id": <从 step 1 拿>,
+          "enterprise_name": "<原始企业名>",
+          "matched_policies": [
+            {
+              "policy_summary_id": <候选 id>,
+              "policy_summary_name": "<政策名>",
+              "match_reason": "<1 句话理由,30 字内>",
+              "expired": false,
+              "rank": 1
+            }
+          ]
+        }
+        ```
+     (4) **【P0 反幻觉】**: `policy_summary_id` 必须来自 step 2 拉到的 `candidates.json` 中真实出现的 `id`。**禁止**凭训练记忆生造政策 id 或政策名 — 生造的 id 在 step 5 写库会被后端外键拒绝,且会把假信息推送给用户的小程序。
+     (5) **零匹配兜底**: 如果全量政策都不适用(罕见,通常企业画像极不完整时发生),`matched_policies` 写空数组,narrate "企业画像信息不足以匹配政策,建议在小程序补全企业资质后重试",仍推进到下一步(下游会处理空列表)。
+
+4. **条件分析** — 对每条匹配政策的申报条件做逐项拆解,标注企业满足情况。
+   - tools: file_read, file_write
+   - notes:
+     (1) file_read `profile.json` 和 `match.json`。
+     (2) 对 `matched_policies[]` 里每条政策,**读它的 `application_condition` 字段**(在 step 2 拉的 `candidates.json` 对应 id 里能找到),把整段条件文本拆成 3-8 个**离散条件项**(例:"申报主体需为高新技术企业"、"上年度营收 ≥ 500 万"、"研发人员占比 ≥ 10%")。
+     (3) 对每项条件,基于 `profile.json` 里的信息判断 `match_status`:
+        - `"yes"`: 企业明确满足(例:profile 里有"高新技术企业"证书)
+        - `"no"`: 企业明确不满足(例:营收要求 500 万但企业上年度营收 100 万)
+        - `"partial"`: 部分满足或临界(例:营收要求 500 万,企业 480 万)
+        - `"unknown"`: 画像缺失对应信息(例:政策要求研发人员占比,画像里没有该字段) — **不要**编造数字,标 unknown
+     (4) 输出写入 `case/policy-match/<enterprise_safe>/condition.json`,schema:
+        ```json
+        {
+          "enterprise_id": <从 match.json>,
+          "conditions_by_policy": [
+            {
+              "policy_summary_id": <id>,
+              "policy_summary_name": "<政策名>",
+              "conditions": [
+                {
+                  "requirement": "<条件原文或精炼描述>",
+                  "enterprise_profile": "<企业对应字段实际值,unknown 则写 'N/A'>",
+                  "match_status": "yes|no|partial|unknown"
+                }
+              ]
+            }
+          ]
+        }
+        ```
+     (5) **`requirement` 字段不要漏写**:写库时后端按这个字段建 `EnterprisePolicySummaryCondition` 行,空字符串会污染前端展示。
+
+5. **写库 + 触发小程序卡片推送** — 把匹配结果 + 条件分析一次性原子写入后端,后端触发小程序政策匹配页卡片推送。
+   - tools: file_read, http_request
+   - notes:
+     (1) file_read `match.json` 和 `condition.json`,合并组装为请求 body。
+     (2) 调用:
+        ```
+        http_request POST {{{policy_match.api_base}}}{{{policy_match.save_match_result_path}}}
+          Content-Type: application/json
+          body: {
+            "enterprise_id": <step 1 拿到的>,
+            "agent_user_info": "{{openid}}",
+            "matched_policies": [
+              {
+                "policy_summary_id": <id>,
+                "match_reason": "...",
+                "rank": 1,
+                "expired": false,
+                "conditions": [
+                  {"requirement": "...", "enterprise_profile": "...", "match_status": "yes"}
+                ]
+              }
+            ]
+          }
+        ```
+     (3) 期望后端语义(本 SOP 假定后端契约):**原子替换** — 先按 `enterprise_id` 清空旧 `EnterprisePolicySummary` + `EnterprisePolicySummaryCondition`,再写入新数据,**同时触发** Redis weapp 推送通道(小程序政策匹配页卡片由前端订阅 SSE/轮询拿到刷新)。
+     (4) **降级**:
+        - 接口 4xx → 大概率是 schema 不匹配或 enterprise_id 不存在,narrate 错误内容,**仍继续 step 6** 把已算出的结果在对话里展示给用户(不至于让用户白等),但提醒"小程序政策匹配页可能未同步"
+        - 接口 5xx → narrate "结果保存暂时失败",继续 step 6 展示对话回复,但提醒"请稍后到小程序政策匹配页刷新"
+     (5) **空匹配跳过**: `matched_policies` 为空数组时,**不调** POST(避免清空用户已有匹配数据),直接推进到 step 6。
+
+6. **对话回复概要 + 引导留资** — 在飞书/小程序对话内输出可读的概要,引导用户到小程序看详情 + 主动建议留资。
+   - tools: file_read
+   - notes:
+     (1) file_read `match.json` 和 `condition.json`,组织对话回复。
+     (2) **回复格式**(严格):
+        ```
+        已为 **<enterprise_name>** 匹配 <N> 条适用政策(完整条件分析已同步到小程序政策匹配页):
+
+        **TOP 3 优先级**:
+        (1) **<政策名 1>** — <match_reason>
+        (2) **<政策名 2>** — <match_reason>
+        (3) **<政策名 3>** — <match_reason>
+
+        其余 <N-3> 条 + 每条详细条件评估 → [小程序政策匹配页]({{{policy_match.mini_program_detail_path_template}}})
+
+        ⚠️ 以上为基于当前画像的初步匹配,具体可行性以政策原文和评审结论为准。
+
+        想让政策顾问帮您做一次资质评估/申报路径规划吗?留个手机号或微信号即可。
+        ```
+     (3) 链接里的 `{enterprise_id}` 占位符,**手动替换**成 step 1 拿到的 `enterprise_id` 数字(LLM 在 narrate 里渲染时替换)。
+     (4) **N≤3 的边界**: 匹配数小于 3 条时,"TOP 3 优先级"段直接列实际条数;`其余 N-3 条` 段省略不写。
+     (5) **零匹配**: `matched_policies` 为空时,回复:
+        ```
+        基于当前掌握的 <enterprise_name> 画像信息,暂未匹配到强相关的政策。这通常是因为企业资质/营收/研发等关键字段在画像里尚未完整。建议:
+        (1) 在小程序补全企业资质(高新/专精特新/研发投入等)
+        (2) 补全后再让我重新匹配一次
+
+        或者您希望政策顾问主动联系您,基于详细沟通后给出推荐?留个手机号或微信号即可。
+        ```
+     (6) **【P0 输出契约】**:回复**不要**夹杂"我调了 API"、"step 5 失败"、"json 解析异常"这类内部日志。后端写库失败时只说"小程序政策匹配页可能稍后才同步,请刷新"。
+     (7) **不要**在本步主动调 `memory_store` 或飞书 webhook 留资 — 留资发生在用户**后续回复了联系方式**之后,由 IDENTITY.md 里的留资规则触发(本 SOP 至此已 Completed)。
+
+## SOP 结束后的留资跟进(交由 IDENTITY.md 规则处理)
+
+本 SOP 跑完后,如果用户后续消息里提供了**手机号/微信号/邮箱**,由 IDENTITY.md 里的"政策匹配留资"规则触发(参考 policy-recommend skill 的同款逻辑,memory category 改用 `policy-match-lead` 区分):
+
+1. `memory_store(key="policy-match-lead-<联系方式末四位>-<日期>", content="<合并的诉求+联系方式+企业名+匹配出的政策方向>", category="policy-match-lead")`
+2. 调飞书 webhook(IDENTITY 里 `{{lead.webhook_url}}` 已配置时):POST {"msg_type":"text","content":{"text":"📋 政策匹配留资\n企业:<name>\n联系人:<称呼>\n联系方式:<...>\n匹配政策:<TOP 3 政策名>\n诉求:<评估资质/申报指导/...>\n时间戳:<YYYY-MM-DD HH:MM>"}}
+3. 给用户回:"好的,已经登记,政策顾问会在 1 个工作日内主动联系您。"
+
+这部分写在 IDENTITY.md 的"政策匹配留资"段,不放在本 SOP 内 —— SOP 必须同步完成,无法等待用户后续回话。

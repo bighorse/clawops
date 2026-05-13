@@ -44,6 +44,9 @@ fn http_allowed_domains_toml(cfg: &Config) -> String {
     if let Some(h) = extract_host(&cfg.policy.api_base) {
         push_unique(&mut hosts, h);
     }
+    if let Some(h) = extract_host(&cfg.policy_match.api_base) {
+        push_unique(&mut hosts, h);
+    }
     // Space service has no enable toggle — its host is always whitelisted.
     if let Some(h) = extract_host(&cfg.space.api_base) {
         push_unique(&mut hosts, h);
@@ -234,6 +237,14 @@ impl Provisioner {
                 "detail_path_template": self.cfg.policy.detail_path_template,
                 "enabled": !self.cfg.policy.api_base.is_empty(),
             },
+            "policy_match": {
+                "api_base": self.cfg.policy_match.api_base,
+                "enterprise_profile_path": self.cfg.policy_match.enterprise_profile_path,
+                "policy_list_path": self.cfg.policy_match.policy_list_path,
+                "save_match_result_path": self.cfg.policy_match.save_match_result_path,
+                "mini_program_detail_path_template": self.cfg.policy_match.mini_program_detail_path_template,
+                "enabled": !self.cfg.policy_match.api_base.is_empty(),
+            },
             "space": {
                 "api_base": self.cfg.space.api_base,
                 "park_detail_path_template": self.cfg.space.park_detail_path_template,
@@ -284,6 +295,32 @@ impl Provisioner {
                 let tpl_text = std::fs::read_to_string(&src_skill_md)?;
                 let rendered = hb.render_template(&tpl_text, &ctx)?;
                 std::fs::write(&dest_path, rendered)?;
+            }
+        }
+
+        // Render SOPs: each templates/workspace/sops/<name>/{SOP.toml.hbs,
+        // SOP.md.hbs} becomes <workspace>/sops/<name>/{SOP.toml,SOP.md}.
+        // zeroclaw's SopEngine loads anything under workspace/sops/<name>/
+        // when [sop].enabled = true in config.toml (see docs/reference/sop).
+        let tpl_sops_dir = tpl_dir.join("sops");
+        if tpl_sops_dir.is_dir() {
+            for entry in std::fs::read_dir(&tpl_sops_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let sop_name = entry.file_name();
+                let dest_dir = layout.workspace_dir.join("sops").join(&sop_name);
+                std::fs::create_dir_all(&dest_dir)?;
+                for fname in &["SOP.toml", "SOP.md"] {
+                    let src = entry.path().join(format!("{fname}.hbs"));
+                    if !src.exists() {
+                        continue;
+                    }
+                    let tpl_text = std::fs::read_to_string(&src)?;
+                    let rendered = hb.render_template(&tpl_text, &ctx)?;
+                    std::fs::write(dest_dir.join(fname), rendered)?;
+                }
             }
         }
 
@@ -399,6 +436,14 @@ impl Provisioner {
                 "detail_path_template": self.cfg.policy.detail_path_template,
                 "enabled": !self.cfg.policy.api_base.is_empty(),
             },
+            "policy_match": {
+                "api_base": self.cfg.policy_match.api_base,
+                "enterprise_profile_path": self.cfg.policy_match.enterprise_profile_path,
+                "policy_list_path": self.cfg.policy_match.policy_list_path,
+                "save_match_result_path": self.cfg.policy_match.save_match_result_path,
+                "mini_program_detail_path_template": self.cfg.policy_match.mini_program_detail_path_template,
+                "enabled": !self.cfg.policy_match.api_base.is_empty(),
+            },
             "space": {
                 "api_base": self.cfg.space.api_base,
                 "park_detail_path_template": self.cfg.space.park_detail_path_template,
@@ -465,6 +510,31 @@ impl Provisioner {
                 let tpl_text = std::fs::read_to_string(&src_skill_md)?;
                 let rendered = hb.render_template(&tpl_text, &ctx)?;
                 std::fs::write(&dest_path, rendered)?;
+            }
+        }
+
+        // Re-render every SOP (clear stale sops first; mirror skills logic).
+        let dest_sops = layout.workspace_dir.join("sops");
+        let _ = std::fs::remove_dir_all(&dest_sops);
+        let tpl_sops_dir = tpl_dir.join("sops");
+        if tpl_sops_dir.is_dir() {
+            for entry in std::fs::read_dir(&tpl_sops_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let sop_name = entry.file_name();
+                let dest_dir = dest_sops.join(&sop_name);
+                std::fs::create_dir_all(&dest_dir)?;
+                for fname in &["SOP.toml", "SOP.md"] {
+                    let src = entry.path().join(format!("{fname}.hbs"));
+                    if !src.exists() {
+                        continue;
+                    }
+                    let tpl_text = std::fs::read_to_string(&src)?;
+                    let rendered = hb.render_template(&tpl_text, &ctx)?;
+                    std::fs::write(dest_dir.join(fname), rendered)?;
+                }
             }
         }
 

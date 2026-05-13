@@ -102,6 +102,14 @@ open_skills_enabled = false
 enabled = true
 max_run_history = 30
 
+# ── SOP engine ─────────────────────────────────────────────
+# SOP engine is auto-enabled when <workspace>/sops/<name>/ exists.
+# This block is intentionally minimal — SopConfig defaults are fine.
+# (No `enabled` field exists in SopConfig; defaults: sops_dir=<workspace>/sops,
+# default_execution_mode=supervised, max_concurrent_total=4.)
+# Used by the policy-match SOP routed from IDENTITY.
+[sop]
+
 # ── Channels — disabled, gateway-only access via ClawOps ───
 [channels_config]
 cli = false

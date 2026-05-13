@@ -114,6 +114,34 @@ detail_path_template = "/pages/activity/details/Index?obj_id={id}"
 api_base = "https://bdhrapi.2048office.com/policies"
 detail_path_template = "/pages/policy/detail?id={id}"
 
+[policy_match]
+# Policy-match SOP backend (ztagent-service-api internal endpoints).
+# Differs from [policy] above: that one targets the public 2048office
+# /policies catalogue (query-style policy-recommend skill); this one
+# targets internal endpoints that own the enterprise profile snapshot
+# + match-result writeback + mini-program card push trigger.
+#
+# Endpoints (relative to api_base):
+#   GET  enterprise_profile_path  → 同步取企业完整画像
+#                                   (工商 + 资质 + 三方搜索),无 rabbitmq
+#                                   ⚠️ NEW endpoint — backend must add
+#   GET  policy_list_path         → 政策清单(全量,~100 条) — 复用现有
+#                                   /policy_summary CRUD,无需新增
+#   POST save_match_result_path   → 原子写入匹配结果 + 触发小程序卡片推送
+#                                   ⚠️ NEW endpoint — backend must add
+#
+# Empty api_base disables policy-match SOP (daemon http_request fails).
+# All policy-match endpoints (including /policy_summary CRUD) live under
+# `/wecom` on the real backend, hence the suffix on api_base.
+api_base = "https://bdhrapi.2048office.com/wecom"
+enterprise_profile_path = "/agent/enterprise_profile_sync"
+policy_list_path = "/policy_summary"
+save_match_result_path = "/agent/save_match_result"
+# Mini-program deeplink shown to user in SOP reply concise card. The
+# LLM substitutes `{enterprise_id}` (returned by enterprise_profile_sync)
+# at render time.
+mini_program_detail_path_template = "/pages/policy_match/index?enterprise_id={enterprise_id}"
+
 [space]
 # Space-resource catalogue API (园区 / 众创空间 / 厂房 / 独立办公室 /
 # 工位 / 产业用地). Unlike commodity/activity/policy, **no enable
