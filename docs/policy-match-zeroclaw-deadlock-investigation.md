@@ -119,6 +119,62 @@ case/policy-match/<enterprise_safe>/
 - `135dab4` sop step 1 add fields param
 
 **附**: 完整 commit 链 (zeroclaw bighorse fork feat/prior-art-layer1)
-- `3e4044b6` providers: SSE idle timeout (v8 — 路径错)
-- `083982ea` providers: send phase timeout + tracing (v9 — 路径错)
-- `4d36d089` reliable: outer 240s timeout (v10 — 路径对但 timer 也失效)
+- `3e4044b6` providers: SSE idle timeout (v8 — 路径错,SOP 走 chat() 不走 chat_stream())
+- `083982ea` providers: send phase timeout + tracing (v9 — 同上)
+- `4d36d089` reliable: outer 240s timeout (v10 — 路径对,但 agent/loop_.rs 不走 reliable.rs!)
+- `f3761983` config: pool_max_idle_per_host(0) (v17 — 误诊为 socket leak,实际不是)
+- `4b9ee210` providers: pool fix for compatible.rs UA path (v18 — 同上误诊)
+- `e39581c2` agent: outer 240s timeout in loop_.rs (v19 — 真正修对了路径但 timer 仍未触发)
+
+## v15-v19 追加发现
+
+### v16 突破 (qwen `wire_api=chat_completions` 强制)
+
+加 `[model_providers.qwen] wire_api = "chat_completions"` 后,SOP **首次进入 step 3** (sop_advance count=2)。说明默认 zeroclaw 尝试 OpenAI Responses API 探测,失败后 fallback 到 chat_completions 也失效。**这是一个真实 bug 修复但不是死锁根因**。
+
+geneline `[model_providers]` 段:
+```toml
+[model_providers]
+[model_providers.qwen]
+name = "qwen"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+wire_api = "chat_completions"
+```
+
+注意:必须**同时去掉** top-level `api_url` 才会生效,否则 zeroclaw 把 url 当 custom provider 处理,绕过 [model_providers.qwen] section。
+
+### v17-v18 误诊 (reqwest pool leak)
+
+诊断时看到 daemon `/proc/PID/fd` 有 3-4 个 socket fd 但 `ss` 找不到 → 误判为 reqwest keep-alive 半关闭 socket。加 `pool_max_idle_per_host(0)` 修复后仍死锁。**重新核查发现这些是 UNIX socket (tokio runtime 内部) + TCP LISTEN (gateway 监听端口)**,不是 reqwest pool socket。属于错误诊断。
+
+### v19 突破诊断 (绕过 reliable.rs)
+
+发现 `src/agent/loop_.rs:2407` 直接调用 `provider.chat().await`,**完全绕过 reliable.rs**。这就是为什么 v10 在 reliable.rs 加的 240s outer timeout 永远不触发——agent loop 根本不走那条路径。
+
+v19 在 agent loop 直接加 `tokio::time::timeout(240s, ...)` 包装。**但仍然死锁,而且 240s timeout 仍未触发**!
+
+### v19 最终事实
+
+- v19 daemon (PID 1003166, 22:26 启动) 用 v19 binary ✓
+- binary 含 "outer timeout" 字符串 ✓ (源码也含 4 处 `CHAT_OUTER_TIMEOUT_SECS`)
+- Daemon hang 5 futex + 1 ep_poll (经典 tokio runtime 空闲态)
+- 0 outbound TCP 到 LLM provider 或 backend
+- step 2 `tool.start tool=http_request` 触发但 `tool.call success` 一直不来
+- **没有任何 timeout error log,说明 tokio::time::timeout 的定时器也没在 fire**
+
+## 真正的残余根因 (未解)
+
+`tokio::time::timeout(240s, future)` 应该在 240s 后无条件触发,即使被包的 future hang。但 v19 5+ 分钟没 fire,说明 **tokio runtime 自己的 timer driver 也卡了**,无法 wake 任何 sleeping future。
+
+这是 zeroclaw daemon 内部某处 **持有 sync primitive (std::sync::Mutex 或类似) 穿越 .await** 导致 worker thread 永久 park,timer driver 跟着挂了。具体位置需要:
+
+1. **tokio-console 接入** - 实时看每个 task 的 wake 状态、被谁持锁、谁 await 谁
+2. **gdb attach to PID** - 查 daemon 主线程 stack trace,看 Rust 函数栈具体在哪行 .await
+3. **strace -f -e futex** - 看 futex 等待的具体地址和 owner
+4. **在 geneline 同环境复现** - 如果 geneline 跑同 SOP 不死锁,差异就在 host/环境层
+
+## 最终结论 (2026-05-13 22:35)
+
+19 轮调试 + 6 个 commit 后,**zeroclaw runtime 在 SOP 第 5-9 次 LLM call 后必死锁** 这个核心问题仍未解。多个怀疑方向 (timeout 配置/pool/channel/feature/wire_api/scheduler 参数) 都被排除。剩余可能性需要本次预算外的工具 (tokio-console / gdb) 才能定位。
+
+**业务层成果完整保留** (后端 fields 契约上线, SOP 设计前 2 步实测跑通)。Daemon 死锁问题作为 zeroclaw 仓库 issue 跟踪,留待下次有 tokio-console 接入或在 geneline 同环境复现验证后修复。
