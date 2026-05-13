@@ -73,11 +73,10 @@
         http_request GET {{{policy_match.api_base}}}{{{policy_match.policy_list_path}}}
           ?no_pagination=true
           &status=ONLINE
-          &order_by_fields=is_top
-          &order_by_types=DESC
           &fields=id,name,policy_direction,policy_belong,application_condition,application_at,application_date_at,support_money,support_decimal_money,link,status
         ```
-        响应 `data.data[]` 每条政策只含上述 11 个字段(响应体压到 ~67 KB)。
+        响应 `data.data[]` 每条政策只含上述 11 个字段(响应体压到 ~30 KB)。
+        ⚠️ **禁止**在 URL 里加 `order_by_fields` / `order_by_types` — 与 `no_pagination=true` 同用时后端返回 400。
      (2) 落盘到 `case/policy-match/<enterprise_safe>/candidates.json` — **直接保存响应的 `data.data[]` 数组**,无需再裁剪字段(后端已按 fields 过滤好)。schema:
         ```json
         {
@@ -86,9 +85,9 @@
           ]
         }
         ```
-     (3) **size 自检**: 落盘后期望 `case/.../candidates.json` 50-80 KB(若 < 5 KB 说明 LLM 偷懒只写元信息没写 data 数组,**必须重写**;若 > 150 KB 说明 fields 参数没生效,检查调用 URL)。
+     (3) **size 自检**: 落盘后期望 `case/.../candidates.json` 20-60 KB(若 < 5 KB 说明 LLM 偷懒只写元信息没写 data 数组,**必须重写**;若 > 150 KB 说明 fields 参数没生效,检查调用 URL)。
      (4) **降级**:
-        - 接口 4xx → 大概率是 fields 参数后端不识别,**重试不带 fields**(后端兼容):去掉 `&fields=...` 再调一次,拿全字段;
+        - 接口 4xx → **不要**修改 fields 参数重试；改为 narrate "政策库接口异常(4xx)",`sop_advance status=Failed`。
         - 接口 5xx 或网络错误 → narrate "政策库暂时不可用,请稍后再试",`sop_advance status=Failed`。
 
 3. **LLM 匹配筛选** — 读企业画像 + 政策清单,LLM 选出适用的政策。
