@@ -42,25 +42,26 @@
    - notes:
      (1) 按上文"enterprise_name 兜底链"确定 `enterprise_name`。**禁止**凭对话上下文猜测企业名 — 兜底链全部失败必须以 Failed 终止,不要硬编一个"示例企业"。
      (2) 计算 `enterprise_safe`,narrate 出 `enterprise_name="..."` 和 `enterprise_safe="..."`,后续 step 复用。
-     (3) 调用接口:
+     (3) 调用接口 — **必须带 `fields` 参数**,否则全字段响应约 73 KB(含 `bocha_info`)撑爆 context:
         ```
         http_request GET {{{policy_match.api_base}}}{{{policy_match.enterprise_profile_path}}}
           ?enterprise_name=<enterprise_name>
           &agent_user_info={{openid}}
+          &fields=enterprise_id,qualification_enterprise_id,enterprise_name,basic_info,qualification_info
         ```
-        期望响应 `data` 含: `enterprise_id`, `qualification_enterprise_id`, `basic_info`(工商), `qualification_info`(专利/商标/资质证书/荣誉), `bocha_info`(三方搜索摘要)。
-     (4) **精简后**落盘到 `case/policy-match/<enterprise_safe>/profile.json`,严格按以下 schema(**file_write 之前先剥离冗余,降低后续 step 的 context 压力**):
+        期望响应 `data` 含: `enterprise_id`, `qualification_enterprise_id`, `enterprise_name`, `basic_info`(工商), `qualification_info`(专利/商标/资质证书/荣誉)。
+        ⚠️ **不要**拉 `bocha_info`(三方网页搜索数据 60+ KB,policy-match 业务用不上,官方注册信息 `basic_info` 才是政策对齐依据)。
+     (4) 落盘到 `case/policy-match/<enterprise_safe>/profile.json` — **直接保存响应的 `data` 对象**,无需再裁剪字段(后端已按 fields 过滤好)。schema:
         ```json
         {
           "enterprise_id": <int>,
           "qualification_enterprise_id": <int>,
           "enterprise_name": "<原文>",
-          "basic_info": "<原文,通常 < 1 KB,全保留>",
-          "qualification_info": "<原文,通常 5-10 KB,全保留 — 资质决定能申请什么政策>",
-          "bocha_info_summary": "<bocha_info 截首 1500 字,保留经营范围 + 行业关键词;丢弃年报/财报/历史公告等长内容>"
+          "basic_info": "<原文>",
+          "qualification_info": "<原文>"
         }
         ```
-        **禁止**把完整 `bocha_info`(常达 30 KB)直接 dump 进 profile.json — step 3-4 LLM 处理时 context 会爆,deepseek 100K+ input 易 hang。
+        **size 自检**: 落盘后期望 `profile.json` 8-15 KB(若 > 30 KB 说明 fields 参数没生效,检查调用 URL)。
      (5) **【P0】记下 `enterprise_id`**:后续 step 5 写库要用。在 narrate 中显式回报 `enterprise_id=<值>`。
      (6) **降级**: 接口 4xx/5xx → narrate "企业画像服务暂时不可用,请稍后再试",`sop_advance status=Failed`。
      (7) **数据空兜底**: 返回 `data` 为 `null` 或 `enterprise_id` 缺失 → 同上 Failed,**不要**自己捏造 enterprise_id。
@@ -96,7 +97,7 @@
    - notes:
      (1) file_read `case/policy-match/<enterprise_safe>/profile.json` 和 `candidates.json`。
      (2) 对每条候选政策,综合判断企业是否适用,判断维度:
-        - **行业匹配**: 政策的 `policy_direction` / `policy_belong` 是否覆盖企业主营行业(`basic_info` 里的经营范围关键词)
+        - **行业匹配**: 政策的 `policy_direction` / `policy_belong` 是否覆盖企业主营行业(`basic_info` 里的经营范围 / 行业分类关键词)
         - **规模匹配**: 政策若按企业规模分档(小微 / 中型 / 大型),与 `basic_info` 里的注册资本 / 参保人数对齐
         - **资质信号**: 从政策 `name` + `policy_direction` 判断是否需要"高新 / 专精特新 / 国家级资质",与 `qualification_info` 对照;`application_condition` 在 step 4 拉取,此步骤不用
         - **时效**: `application_at` 若为过期日期(< 当前日期)且非长期有效,标记 `expired=true` 但**仍保留**(用户可能问"今年错过了下一波什么时候") — 排序时排最后
