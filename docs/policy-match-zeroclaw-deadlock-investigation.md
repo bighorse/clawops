@@ -1,0 +1,124 @@
+# policy-match SOP E2E 调试报告 — zeroclaw daemon 死锁未解 (2026-05-13)
+
+> **状态**: SOP 业务设计已验证（step 1-2 实测跑通，产物文件齐全），但 zeroclaw runtime 在 SOP 中段必死锁，root cause 未定位，需源码级深调。
+>
+> **当前位置**: `clawops/templates/workspace/sops/policy-match/SOP.md.hbs` 已迭代到可工作版本；后端 `/wecom/agent/enterprise_profile_sync` 和 `/wecom/policy_summary` 已加 `fields` 参数。daemon 死锁是阻塞 SOP 完整 E2E 的唯一剩余问题。
+
+---
+
+## 业务层成果 (已验证)
+
+### 后端契约扩展 (P0, 已上线)
+
+- `GET /wecom/policy_summary?fields=...` — 政策清单字段裁剪
+  - 详见 [policy-match-api-contract-addendum-fields.md](policy-match-api-contract-addendum-fields.md)
+  - smoke test 通过：100 条政策响应 150KB → fields 过滤后 67KB → 进一步去 `application_condition` 后 28KB
+- `GET /wecom/agent/enterprise_profile_sync?fields=...` — 企业画像字段裁剪
+  - 详见 [policy-match-api-contract-addendum-profile-fields.md](policy-match-api-contract-addendum-profile-fields.md)
+  - smoke test 通过：91KB → fields 过滤后 13KB（排除 `bocha_info`）
+
+### SOP 设计迭代
+
+- step 1: `enterprise_profile_sync` 加 fields 参数（排除 `bocha_info`）
+- step 2: `policy_summary` 加 fields 参数（**排除 application_condition** — 67KB→28KB）
+- step 4 新增：单独拉取 `id,application_condition` 用于条件分析
+- step 2 URL 去掉 `order_by_fields` / `order_by_types`（与 `no_pagination=true` 同用时后端返回 400）
+- IDENTITY 第零原则加 `sop_execute('policy-match')` 强制触发规则
+
+### E2E v11 实测产物 (qwen3.6-plus + 生产 binary)
+
+```
+case/policy-match/<enterprise_safe>/
+├── profile.json   (7327 bytes — qwen 严格保存 API 响应)
+└── candidates.json (28266 bytes — 10 字段 × 36 条 ONLINE 政策)
+```
+
+业务逻辑无误，与 SOP schema 完全对齐。
+
+---
+
+## 死锁现象
+
+每次 E2E 在 5-9 次 LLM call 后 daemon 完全卡死：
+
+- **线程状态**: 5 个 worker `futex_wait_queue_me` + 1 个 io driver `ep_poll`
+- **CPU**: 0%
+- **无 outbound TCP** 到任何 LLM provider
+- **日志最后一条**: 通常是 `tool.call success` 或 `llm.request` 发出，**没有对应的 `llm.response`**
+- **持续时间**: 至少 30+ 分钟（已观察），未自愈
+
+特征与"普通 tokio runtime 空闲态"难以区分（都是 worker park 在 futex），但实际是 spawn future 在 `.await` 后 wake 永不到达。
+
+## 14 轮调试时间线 (2026-05-13)
+
+| 版本 | 假设 | 行为 |
+|------|------|------|
+| v3-v5 | deepseek stream-protocol error / order_by 400 | 修了 `is_stream_protocol_error()` + 去 order_by — 不解决静默 hang |
+| v6/v7 | enterprise profile 91KB 撑爆 context | 后端加 fields 后 context 从 70K→55K — 仍死锁 |
+| v8 | SSE chunk loop 缺 idle timeout | `compatible.rs::sse_bytes_to_chunks` 加 `tokio::time::timeout(90s)` — 走的是 `chat_stream` 路径，**SOP 实际用 `chat()`，修复完全没触达** |
+| v9 | reqwest `send().await` headers phase 不可靠 | 给 `chat_stream::send()` 加 120s outer timeout + tracing — 同样路径错误 |
+| v10 | `reliable.rs::provider.chat()` 外层 hung | 给 `provider.chat()` 加 240s outer timeout — **代码路径正确但 tokio timer 也未触发**，证实"runtime 自身 wake 机制坏了" |
+| v11 | deepseek 服务侧不稳定 | 切 qwen3.6-plus + 生产 binary — 跑得更深（首次 step 2 出 candidates.json），但 step 2→3 间 LLM call 仍死锁 |
+| v12 | `[agent] compact_context = true` 引入 spawn task 泄漏 | 关掉仍死锁 |
+| v13 | `[scheduler]` 和 `[agent]` 限制太低 (max_tasks=16, max_concurrent=2, max_tool_iterations=80) | 提到 geneline 水平 (64/4/160/60) 仍死锁 |
+| v14 | binary 缺 `--features channel-feishu`（geneline 显式加） | 加上重编仍死锁 |
+
+## 已排除的假设清单
+
+| 假设 | 排除证据 |
+|------|---------|
+| deepseek 服务端 stream-protocol error | v9 加 `is_stream_protocol_error()` non-retryable + qwen 也死锁 |
+| SSE chunk-to-chunk idle hang | v8 加 idle timeout 90s 但代码路径错误，且 v10 修正路径后 tokio timer 也失效 |
+| reqwest send headers phase | v9 加 send 包装 timeout 仍未触发 |
+| `provider.chat()` 调用未超时 | v10 加 240s outer 仍未触发 |
+| context 过大 (>70K) 撑爆 deepseek | qwen 在 ~67K context 也死锁 |
+| `compact_context = true` 触发 spawn task 泄漏 | v12 关掉仍死锁 |
+| `scheduler.max_tasks=16` 不够 | v13 提到 64 仍死锁 |
+| `agent.max_tool_iterations=80` 不够 | v13 提到 160 仍死锁 |
+| `agent.max_history_messages=30` 不够 | v13 提到 60 仍死锁 |
+| 缺 `channel-feishu` / `channel-lark` feature | v14 编进去仍死锁 |
+| provider 特定 (deepseek vs qwen) | qwen 也死锁，只是位置稍后 |
+| Binary 版本 (1.4.0 vs ebc5eb1f) | 两个版本都死锁 |
+
+## 残余可能根因 (未验证)
+
+1. **服务器多租户负载**：120.48.131.72 上 11 个生产 daemon 共享 host，可能某个共享资源（文件描述符、内核 socket 状态）受限。geneline 跑在不同环境，不受此限。
+2. **SOP engine spawn task 泄漏**：每次 SOP step 之间 `sop_advance` 可能 spawn 后台 task 持有 future 引用，task 完成后 wake 信号丢失。但需读 `src/sop/engine.rs` 源码验证。
+3. **reqwest connection pool 半关闭 socket**：经过多次大 context (>50K) LLM call，pool 可能积累半关闭连接占住 epoll readiness slot，新 LLM call 复用时永远不 ready。需 strace + tcpdump 验证。
+4. **Tokio runtime 配置**：clawops daemon 启动未显式指定 worker_threads / blocking_threads，默认值在多租户下可能不够。geneline 单租户跑不会触发。
+
+## 进一步调试建议
+
+需要在 zeroclaw daemon 上启用以下能力 (clawops 生产环境暂不动):
+
+1. **tokio-console** — 实时看 task tree、wake / await 状态、卡住的 future
+2. **`RUST_LOG=zeroclaw=trace`** — 看 SOP engine 内部所有 spawn 点
+3. **strace -p $DPID -f -e trace=futex,epoll_*,read,write** — 内核态系统调用追踪
+4. **重现条件最小化**：在 geneline / pharmaclaw 同环境跑相同 SOP 看是否复现（若不复现，根因在多租户 host）
+
+## 结论
+
+- **业务交付**：policy-match SOP 设计本身 work（后端 fields 参数 + SOP 拆 application_condition + IDENTITY 触发规则全部验证）。后端契约已上线生效。
+- **不交付**：daemon 完整 E2E（卡在 step 3 LLM 匹配），原因是 zeroclaw runtime 死锁。
+- **下一步**：暂不修 zeroclaw runtime（超出本次预算），保留所有已 commit 的 SOP / 后端契约改动。死锁问题作为 zeroclaw issue 跟踪，等后续有 tokio-console 接入或在 geneline 同环境复现验证后再修。
+
+## 不动的部分
+
+- `clawops/templates/workspace/config.toml.hbs` — 不加 fallback 段（11 生产用户用同模板，改了风险大）
+- `clawops/templates/workspace/IDENTITY.md.hbs` — policy-match 触发规则已 commit
+- `clawops/templates/workspace/sops/policy-match/SOP.md.hbs` — 已迭代到可工作版本（前 2 步验证通过）
+- `/usr/local/bin/zeroclaw` — 生产 11 用户共用，不替换
+
+---
+
+**附**: 完整 commit 链 (clawops main branch)
+- `df98211` smoke test backend fields
+- `1cc3d80` sop step 2 remove order_by
+- `2a5f27e` sop move application_condition to step 4
+- `313bdcf` docs profile-fields addendum
+- `135dab4` sop step 1 add fields param
+
+**附**: 完整 commit 链 (zeroclaw bighorse fork feat/prior-art-layer1)
+- `3e4044b6` providers: SSE idle timeout (v8 — 路径错)
+- `083982ea` providers: send phase timeout + tracing (v9 — 路径错)
+- `4d36d089` reliable: outer 240s timeout (v10 — 路径对但 timer 也失效)
