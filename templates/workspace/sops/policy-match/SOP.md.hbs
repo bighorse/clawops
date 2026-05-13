@@ -68,38 +68,28 @@
 2. **取候选政策清单** — 一次性拉全量启用中的政策(库总量约 100 条,可全量塞入 LLM context)。
    - tools: http_request, file_write
    - notes:
-     (1) 调用:
+     (1) 调用 — **必须带 `fields` 参数**裁剪响应,否则全字段响应约 150 KB 撑爆 LLM context:
         ```
         http_request GET {{{policy_match.api_base}}}{{{policy_match.policy_list_path}}}
           ?no_pagination=true
           &status=ONLINE
           &order_by_fields=is_top
           &order_by_types=DESC
+          &fields=id,name,policy_direction,policy_belong,application_condition,application_at,application_date_at,support_money,support_decimal_money,link,status
         ```
-        响应 `data.data[]` 为政策清单,每条含: `id`, `name`, `sponsor`, `department`, `support_money`, `support_decimal_money`, `policy_direction`, `policy_belong`, `application_at`, `application_date_at`, `application_method`, `application_condition`, `application_material`, `link`, `description`, `policy_basis`, `published_at` 等字段。
-     (2) **逐条精简后**落盘到 `case/policy-match/<enterprise_safe>/candidates.json`。每条政策**只保留**对匹配 + 展示有用的字段:
+        响应 `data.data[]` 每条政策只含上述 11 个字段(响应体压到 ~67 KB)。
+     (2) 落盘到 `case/policy-match/<enterprise_safe>/candidates.json` — **直接保存响应的 `data.data[]` 数组**,无需再裁剪字段(后端已按 fields 过滤好)。schema:
         ```json
         {
           "policies": [
-            {
-              "id": <int>,
-              "name": "<政策名>",
-              "policy_direction": "<政策方向>",
-              "policy_belong": "<政策所属范畴>",
-              "application_condition": "<申报条件原文,step 4 拆解依据>",
-              "application_at": "<申报开始/窗口>",
-              "application_date_at": "<申报截止>",
-              "support_money": "<支持内容文本>",
-              "support_decimal_money": <数字,最高奖励金额>,
-              "link": "<原文链接,step 6 展示用>",
-              "status": "ONLINE"
-            }
+            { "id": <int>, "name": "...", "policy_direction": "...", "policy_belong": "...", "application_condition": "...", "application_at": "...", "application_date_at": "...", "support_money": "...", "support_decimal_money": <num>, "link": "...", "status": "ONLINE" }
           ]
         }
         ```
-        **禁止**保留: `description`(摘要,常含 HTML 残留 + 数百字)、`sponsor`/`department`/`contact_information`(发文单位,匹配无关)、`application_method`/`application_material`(申报方式/材料,step 1-5 不需要)、`policy_basis`(政策依据)、`published_at`/`created_at`/`updated_at`(时间戳,匹配无关) — 这些字段对每条政策合起来通常 800B-1.5KB,100 条就是 80-150 KB,精简后 candidates.json 应该在 30-50 KB 量级。
-     (3) **size 自检**: 落盘后期望 `case/.../candidates.json` 30-60 KB(若 < 5 KB 说明 LLM 偷懒只写元信息没写 data 数组,**必须重写**;若 > 100 KB 说明精简没生效,也要重写)。
-     (4) **降级**: 接口 4xx/5xx → narrate "政策库暂时不可用,请稍后再试",`sop_advance status=Failed`。
+     (3) **size 自检**: 落盘后期望 `case/.../candidates.json` 50-80 KB(若 < 5 KB 说明 LLM 偷懒只写元信息没写 data 数组,**必须重写**;若 > 150 KB 说明 fields 参数没生效,检查调用 URL)。
+     (4) **降级**:
+        - 接口 4xx → 大概率是 fields 参数后端不识别,**重试不带 fields**(后端兼容):去掉 `&fields=...` 再调一次,拿全字段;
+        - 接口 5xx 或网络错误 → narrate "政策库暂时不可用,请稍后再试",`sop_advance status=Failed`。
 
 3. **LLM 匹配筛选** — 读企业画像 + 政策清单,LLM 选出适用的政策。
    - tools: file_read, file_write
