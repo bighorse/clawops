@@ -92,33 +92,53 @@
         - 接口 4xx → **不要**修改 fields 参数重试；改为 narrate "政策库接口异常(4xx)",`sop_advance status=Failed`。
         - 接口 5xx 或网络错误 → narrate "政策库暂时不可用,请稍后再试",`sop_advance status=Failed`。
 
-3. **LLM 匹配筛选** — 读企业画像 + 政策清单,LLM 选出适用的政策。
+3. **LLM 匹配筛选(分 2 阶段,避免单次 LLM call 超 240s 红线)** — 读企业画像 + 政策清单,LLM 用粗筛 → 精筛分两次完成 Top 10 选择。
    - tools: file_read, file_write
    - notes:
-     (1) file_read `case/policy-match/<enterprise_safe>/profile.json` 和 `candidates.json`。
-     (2) 对每条候选政策,综合判断企业是否适用,判断维度:
+     **拆分理由**: 历史观察 qwen3.6-plus/deepseek-v4-pro 一次性"100 条 → Top 10 + 完整 match_reason"的 LLM call 在 70K context 下 > 240s,撞 zeroclaw `reliable.rs` 硬编码 outer timeout。拆成两次小 LLM call(各 ≤ 90s)既绕开 timeout,也让 LLM 注意力更集中。
+
+     ### 3a. 粗筛 — 100 条 → Top 20(只输出 id 列表,不写 reason)
+     - file_read `case/policy-match/<enterprise_safe>/profile.json` 和 `candidates.json`。
+     - 对每条候选政策,**快速**综合判断企业是否适用,判断维度:
         - **行业匹配**: 政策的 `policy_direction` / `policy_belong` 是否覆盖企业主营行业(`basic_info` 里的经营范围 / 行业分类关键词)
         - **规模匹配**: 政策若按企业规模分档(小微 / 中型 / 大型),与 `basic_info` 里的注册资本 / 参保人数对齐
-        - **资质信号**: 从政策 `name` + `policy_direction` 判断是否需要"高新 / 专精特新 / 国家级资质",与 `qualification_info` 对照;`application_condition` 在 step 4 拉取,此步骤不用
-        - **时效**: `application_at` 若为过期日期(< 当前日期)且非长期有效,标记 `expired=true` 但**仍保留**(用户可能问"今年错过了下一波什么时候") — 排序时排最后
-     (3) 输出选 **TOP 10**(不够 10 条就有几条放几条),写入 `case/policy-match/<enterprise_safe>/match.json`,schema:
+        - **资质信号**: 从政策 `name` + `policy_direction` 判断是否需要"高新 / 专精特新 / 国家级资质",与 `qualification_info` 对照
+        - **时效**: `application_at` 若过期(< 当前日期)且非长期有效,标记 `expired=true` 但**仍保留**(排序时排最后)
+     - 选 **TOP 20**(候选不够 20 条就有几条放几条),写入 `case/policy-match/<enterprise_safe>/match_coarse.json`,**schema 极简**(粗筛阶段不写 match_reason,节省 output tokens):
         ```json
         {
           "enterprise_id": <从 step 1 拿>,
+          "enterprise_name": "<原始企业名>",
+          "coarse_ids": [
+            {"policy_summary_id": <候选 id>, "policy_summary_name": "<政策名>", "expired": false, "rank": 1}
+          ]
+        }
+        ```
+     - **【P0 反幻觉】**: `policy_summary_id` 必须来自 `candidates.json` 中真实出现的 `id`,**禁止**凭训练记忆生造。
+     - **size 自检**: `match_coarse.json` 期望 2-5 KB,`coarse_ids[]` 长度 ≤ 20;> 8 KB 说明 LLM 写了多余字段(例如把 reason 也写进来了),重写。
+     - **零匹配兜底**: 全量政策都不适用 → `coarse_ids` 写空数组,跳过 3b 直接进 step 4(step 4 会处理空列表)。
+
+     ### 3b. 精筛 — Top 20 → Top 10(带 match_reason)
+     - file_read `match_coarse.json` 和 `candidates.json`。
+     - 从 `coarse_ids[]` 的 20 个 id 中,基于 `candidates.json` 里这 20 条对应的详情,精选 **TOP 10**,为每条写 **15 字内** match_reason(精简,不要"该政策"等冗余开头)。
+     - 输出写入 `case/policy-match/<enterprise_safe>/match.json`,schema:
+        ```json
+        {
+          "enterprise_id": <从 match_coarse.json 拿>,
           "enterprise_name": "<原始企业名>",
           "matched_policies": [
             {
               "policy_summary_id": <候选 id>,
               "policy_summary_name": "<政策名>",
-              "match_reason": "<1 句话理由,30 字内>",
+              "match_reason": "<≤ 15 字>",
               "expired": false,
               "rank": 1
             }
           ]
         }
         ```
-     (4) **【P0 反幻觉】**: `policy_summary_id` 必须来自 step 2 拉到的 `candidates.json` 中真实出现的 `id`。**禁止**凭训练记忆生造政策 id 或政策名 — 生造的 id 在 step 5 写库会被后端外键拒绝,且会把假信息推送给用户的小程序。
-     (5) **零匹配兜底**: 如果全量政策都不适用(罕见,通常企业画像极不完整时发生),`matched_policies` 写空数组,narrate "企业画像信息不足以匹配政策,建议在小程序补全企业资质后重试",仍推进到下一步(下游会处理空列表)。
+     - **【P0 反幻觉】**: `policy_summary_id` 必须从 3a 的 `coarse_ids[]` 选,不要重新引入 candidates 里被 3a 淘汰的 id。
+     - **零匹配处理**: 3a 输出空 `coarse_ids` 时,3b 直接写空 `matched_policies[]`,narrate "企业画像信息不足以匹配政策,建议在小程序补全企业资质后重试",推进到 step 4。
 
 4. **条件分析** — 对每条匹配政策的申报条件做逐项拆解,标注企业满足情况。
    - tools: file_read, http_request, file_write
