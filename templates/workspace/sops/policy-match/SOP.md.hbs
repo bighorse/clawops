@@ -212,7 +212,7 @@
 6. **对话回复概要 + 引导留资** — 在飞书/小程序对话内输出可读的概要,引导用户到小程序看详情 + 主动建议留资。
    - tools: file_read
    - notes:
-     (1) file_read `match.json` 和 `condition.json`,组织对话回复。
+     (1) file_read `profile.json` + `match.json` + `condition.json`,组织对话回复(profile.json 用来取 `qualification_enterprise_id`,作为小程序深链 url 的 `id` 参数)。
      (2) **回复格式**(严格):
         ```
         已为 **<enterprise_name>** 匹配 <N> 条适用政策(完整条件分析已同步到小程序政策匹配页):
@@ -228,7 +228,7 @@
 
         想让政策顾问帮您做一次资质评估/申报路径规划吗?留个手机号或微信号即可。
         ```
-     (3) 链接里的 `{enterprise_id}` 占位符,**手动替换**成 step 1 拿到的 `enterprise_id` 数字(LLM 在 narrate 里渲染时替换)。
+     (3) 链接里的 `{qualification_enterprise_id}` 占位符,**手动替换**成 step 1 `profile.json` 里读到的 `qualification_enterprise_id` 数字(注意:**不是 `enterprise_id`** — `enterprise_id` 是 step 5 写库的主键,小程序深链按资质企业表的主键 `qualification_enterprise_id` 路由)。
      (4) **N≤3 的边界**: 匹配数小于 3 条时,"TOP 3 优先级"段直接列实际条数;`其余 N-3 条` 段省略不写。
      (5) **零匹配**: `matched_policies` 为空时,回复:
         ```

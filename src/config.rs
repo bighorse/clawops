@@ -254,8 +254,10 @@ pub struct PolicyMatchConfig {
     #[serde(default = "default_pm_save_match_result_path")]
     pub save_match_result_path: String,
     /// Mini-program detail path the LLM puts in card-style links so the
-    /// front-end can intercept clicks and wx.navigateTo. `{enterprise_id}`
-    /// is replaced at render time by the LLM.
+    /// front-end can intercept clicks and wx.navigateTo.
+    /// `{qualification_enterprise_id}` is replaced at render time by the LLM
+    /// with the value from step 1's profile.json (NOT `enterprise_id` —
+    /// the mini-program routes by the qualification table PK).
     #[serde(default = "default_pm_detail_path_template")]
     pub mini_program_detail_path_template: String,
 }
@@ -270,7 +272,7 @@ fn default_pm_save_match_result_path() -> String {
     "/agent/save_match_result".into()
 }
 fn default_pm_detail_path_template() -> String {
-    "/pages/policy_match/index?enterprise_id={enterprise_id}".into()
+    "/pages/recommendation/index?id={qualification_enterprise_id}".into()
 }
 
 impl Default for PolicyMatchConfig {
