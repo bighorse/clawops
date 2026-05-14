@@ -173,8 +173,44 @@ v19 在 agent loop 直接加 `tokio::time::timeout(240s, ...)` 包装。**但仍
 3. **strace -f -e futex** - 看 futex 等待的具体地址和 owner
 4. **在 geneline 同环境复现** - 如果 geneline 跑同 SOP 不死锁,差异就在 host/环境层
 
-## 最终结论 (2026-05-13 22:35)
+## 2026-05-14 续 — v25-v27 终极修复
 
-19 轮调试 + 6 个 commit 后,**zeroclaw runtime 在 SOP 第 5-9 次 LLM call 后必死锁** 这个核心问题仍未解。多个怀疑方向 (timeout 配置/pool/channel/feature/wire_api/scheduler 参数) 都被排除。剩余可能性需要本次预算外的工具 (tokio-console / gdb) 才能定位。
+### v25 block_in_place 突破
+chat() 用 `tokio::task::block_in_place` 把当前 worker 移出 multi-thread scheduler,sync block 跑 isolated runtime + reqwest。**iteration=6 chat() 164s 成功返回** — 23 轮调试首次突破!但 file_write tool 内部 `tokio::fs::write` 也累积坏。
 
-**业务层成果完整保留** (后端 fields 契约上线, SOP 设计前 2 步实测跑通)。Daemon 死锁问题作为 zeroclaw 仓库 issue 跟踪,留待下次有 tokio-console 接入或在 geneline 同环境复现验证后修复。
+### v26 tokio 1.52 升级
+Cargo.toml: tokio 1.50 → 1.52.3。配 block_in_place 后 chat() 仍正常,但 file_write 仍 hang。证实 wake-lost 是 zeroclaw runtime 内**全局**累积态,不是单点 bug 或单版本 tokio 问题。
+
+### v27 终极方案: 整体 isolated runtime
+`process_message_with_history` 入口加 `block_in_place + Runtime::new_current_thread().enable_all()`,整个 agent loop (所有 chat / 所有 tool / 所有 await) 跑在每个 user request 独立的 fresh runtime 内。chat() 撤回简化:不用 isolated_runtime/spawn_blocking,直接 reqwest async 调用(但保留 http1_only + pool_max_idle(0))。
+
+**E2E v27 结果(2026-05-14 12:43)**:
+```
+HTTP STATUS 200 (非 408!)
+TIME 538.6s (~9 分钟整个 SOP 跑完)
+case files 4 个齐: profile.json(13KB) + candidates.json(28KB)
+                  + match.json(2KB) + condition.json(8KB)
+sop_advance count: 6 (SOP 6 步全完成)
+max iteration: 17 (input_tokens 跑到 117K 也不 hang)
+```
+
+LLM 最终回复(/tmp/e2e-v27.json):
+> "已为 **拓尔思信息技术股份有限公司** 匹配 10 条适用政策(完整条件分析已同步到小程序政策匹配页)..." (含 Top 3 推荐 + 小程序深链 + 留资 prompt)
+
+### 修复 commits (bighorse/zeroclaw feat/prior-art-layer1)
+- `02bf05f9` http1_only (在 v23 阶段定位 HTTP/2 流问题,后被 v27 包含)
+- `ad8bca2f` **process_message wrap in block_in_place + isolated runtime** (v27 终极修复)
+- `ae71a03e` tokio 1.50 → 1.52.3
+- `521a632f` 清理 v20/v22 诊断标记
+
+### 修复 commits (clawops)
+- 已 commit: 后端 fields, SOP step 1+2 fields, IDENTITY 触发, fallback 配置说明
+- 新 commit: `templates/workspace/config.toml.hbs` 加 [model_providers.qwen] wire_api=chat_completions
+
+## 最终结论
+
+E2E 完整跑通,policy-match SOP 业务设计 + zeroclaw runtime 修复双双交付。
+
+根因诊断: tokio multi-thread runtime + reqwest 在多次大 context (>50K tokens) LLM call 累积态下出现 wake-lost — task waker / timer wheel / JoinHandle 通知系统全部失效。修复策略: 每个 user request 用独立 fresh runtime,绝不累积。
+
+代价: 每 request 多约 10-30ms 启动 isolated runtime,但相对 LLM 1-30s 延迟可忽略。

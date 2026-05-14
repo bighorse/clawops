@@ -7,13 +7,26 @@
 {{#if llm.api_key}}
 api_key = "{{llm.api_key}}"
 {{/if}}
-{{#if llm.api_url}}
-api_url = "{{llm.api_url}}"
-{{/if}}
 default_provider = "{{llm.default_provider}}"
 default_model = "{{llm.default_model}}"
 default_temperature = {{llm.default_temperature}}
 provider_timeout_secs = {{llm.provider_timeout_secs}}
+
+# 2026-05-14 强制 wire_api = "chat_completions" 跳过 Responses API 探测。
+# 不写这段时,zeroclaw 把 api_url 当 custom provider 处理,而 dashscope
+# 不支持 OpenAI Responses API,fallback 到 chat_completions 也未生效,
+# 表现为 SOP 跑几次 LLM 后 daemon 进入 wake-lost 累积态(详见
+# zeroclaw bighorse/feat/prior-art-layer1 commit 02bf05f9 + ad8bca2f)。
+# clawops 用户全用 qwen3.6-plus + dashscope,这段是必备配置。
+[model_providers]
+[model_providers.qwen]
+name = "qwen"
+{{#if llm.api_url}}
+base_url = "{{llm.api_url}}"
+{{else}}
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+{{/if}}
+wire_api = "chat_completions"
 
 # ── Observability ──────────────────────────────────────────
 [observability]
