@@ -410,6 +410,10 @@ async fn chat(
         let mut builder = st
             .http
             .post(&url)
+            // policy-match SOP can run 9-10 min end-to-end; the shared
+            // st.http timeout is 120s for general use, so override per
+            // /chat forward to match the mini-program wx.request timeout.
+            .timeout(std::time::Duration::from_secs(900))
             .json(&serde_json::json!({"message": req.content}));
         if let Some(token) = &user.paired_token_enc {
             builder = builder.header("Authorization", format!("Bearer {token}"));
