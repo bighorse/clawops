@@ -1,14 +1,6 @@
-//! SOP async task tracking — persistence for the
-//! "POST /chat → identify SOP intent → spawn background task" flow.
-//!
-//! The chat handler creates a row (pending), the sop_runner background
-//! task transitions to running → done|failed, and the /me/sop/tasks
-//! handler queries by openid. Cache hits create a fresh row directly
-//! at status=done (deeplink/qualification_enterprise_id copied from a
-//! prior done task within ttl).
-
 use crate::Result;
 use chrono::{DateTime, Duration, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
@@ -311,4 +303,38 @@ pub async fn find_cached_done(
         .await?,
     };
     Ok(row)
+}
+
+/// Find the most recent pending task for (openid, sop_name).
+/// Used by the webhook handler to resolve which task to mark done.
+pub async fn find_pending_by_sop(
+    pool: &SqlitePool,
+    openid: &str,
+    sop_name: &str,
+) -> Result<Option<String>> {
+    let task_id: Option<String> = sqlx::query_scalar(
+        "SELECT task_id FROM sop_tasks WHERE openid = ? AND sop_name = ? \
+         AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(openid)
+    .bind(sop_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(task_id)
+}
+
+/// Extract the first mini-program deeplink and numeric id from response text.
+/// Pattern: `/pages/<path>?id=<digits>` (or `&id=<digits>`).
+pub fn extract_deeplink_and_qid(text: &str) -> (Option<String>, Option<i64>) {
+    let re = match Regex::new(r"(/pages/[a-zA-Z0-9_/]+\?id=(\d+))") {
+        Ok(r) => r,
+        Err(_) => return (None, None),
+    };
+    if let Some(caps) = re.captures(text) {
+        let path = caps.get(1).map(|m| m.as_str().to_string());
+        let id = caps.get(2).and_then(|m| m.as_str().parse::<i64>().ok());
+        (path, id)
+    } else {
+        (None, None)
+    }
 }

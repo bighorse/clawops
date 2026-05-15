@@ -31,12 +31,8 @@ pub struct Config {
     pub general_information: GeneralInformationConfig,
     #[serde(default)]
     pub lead: LeadConfig,
-    #[serde(default)]
-    pub intent_classifier: IntentClassifierConfig,
-    /// Per-SOP metadata used by the LLM intent classifier and the
-    /// task list display. Key is the sop_name (e.g. "policy-match").
-    /// Adding a new SOP only requires a new entry here + creating the
-    /// daemon-side SOP.md.hbs; no clawops code change.
+    /// Per-SOP metadata for the task list display.
+    /// Key is the sop_name (e.g. "policy-match").
     #[serde(default)]
     pub sop_metadata: HashMap<String, SopMetadata>,
 }
@@ -56,71 +52,6 @@ pub struct SopMetadata {
 
 fn default_sop_cache_ttl_days() -> u32 {
     7
-}
-
-/// LLM-based intent classifier config. Routes user messages into one of
-/// the SOPs in [sop_metadata] or "normal_chat". Uses a lightweight model
-/// (deepseek-v4-flash by default) for fast classification (~1-2s).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct IntentClassifierConfig {
-    /// If false, intent classifier is disabled and all /chat requests go
-    /// straight to daemon as before (legacy sync mode).
-    #[serde(default = "default_intent_classifier_enabled")]
-    pub enabled: bool,
-    /// API endpoint (OpenAI-compatible chat completions).
-    #[serde(default = "default_intent_classifier_url")]
-    pub api_url: String,
-    /// API key. Empty disables classification (falls back to normal_chat).
-    #[serde(default)]
-    pub api_key: String,
-    /// Model name.
-    #[serde(default = "default_intent_classifier_model")]
-    pub model: String,
-    /// Cache TTL for classification results (seconds). Same message
-    /// within this window won't re-call the LLM.
-    #[serde(default = "default_intent_cache_ttl_secs")]
-    pub cache_ttl_secs: u64,
-    /// Minimum confidence to treat a classification as a SOP trigger.
-    /// Below threshold falls back to normal_chat. Default 0.7.
-    #[serde(default = "default_intent_min_confidence")]
-    pub min_confidence: f32,
-    /// HTTP timeout for the classifier call (seconds). Default 5s
-    /// (failure → fallback to normal_chat, daemon handles natively).
-    #[serde(default = "default_intent_timeout_secs")]
-    pub timeout_secs: u64,
-}
-
-impl Default for IntentClassifierConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_intent_classifier_enabled(),
-            api_url: default_intent_classifier_url(),
-            api_key: String::new(),
-            model: default_intent_classifier_model(),
-            cache_ttl_secs: default_intent_cache_ttl_secs(),
-            min_confidence: default_intent_min_confidence(),
-            timeout_secs: default_intent_timeout_secs(),
-        }
-    }
-}
-
-fn default_intent_classifier_enabled() -> bool {
-    true
-}
-fn default_intent_classifier_url() -> String {
-    "https://api.deepseek.com/chat/completions".into()
-}
-fn default_intent_classifier_model() -> String {
-    "deepseek-v4-flash".into()
-}
-fn default_intent_cache_ttl_secs() -> u64 {
-    600
-}
-fn default_intent_min_confidence() -> f32 {
-    0.7
-}
-fn default_intent_timeout_secs() -> u64 {
-    5
 }
 
 /// Lead-submission notification settings. When a user leaves contact

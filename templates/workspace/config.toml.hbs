@@ -34,6 +34,7 @@ backend = "log"
 runtime_trace_mode = "rolling"
 runtime_trace_path = "state/runtime-trace.jsonl"
 runtime_trace_max_entries = 300
+event_webhook_url = "{{sop_webhook.event_webhook_url}}"
 
 # ── Autonomy ───────────────────────────────────────────────
 # Multi-tenant safety: shell auto_approve is OFF, forbidden_paths
@@ -158,6 +159,7 @@ trust_forwarded_headers = false
 rate_limit_max_keys = 1000
 idempotency_ttl_secs = 300
 idempotency_max_keys = 1000
+owner_openid = "{{sop_webhook.owner_openid}}"
 
 # ── Tools (web search + http + fetch) ──────────────────────
 {{#if llm.tavily_api_key}}

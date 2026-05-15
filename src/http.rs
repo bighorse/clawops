@@ -1,9 +1,7 @@
 use crate::auth::WxClient;
 use crate::config::Config;
-use crate::intent_classifier::IntentClassifier;
 use crate::limits::{self, AppLimiters};
 use crate::provisioner::Provisioner;
-use crate::sop_runner;
 use crate::sop_tasks;
 use crate::{chat_history, sessions, users, Error, Result};
 use axum::body::Body;
@@ -33,9 +31,6 @@ pub struct AppState {
     /// SSE connection) filter by openid (stripped before forwarding).
     /// Capacity 256 is plenty given event frequency (a few/sec at peak).
     pub sop_event_tx: broadcast::Sender<JsonValue>,
-    /// LLM-based intent classifier. Wrapped in Arc for cheap clone in
-    /// each chat handler invocation. None when feature disabled.
-    pub intent_classifier: Arc<IntentClassifier>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -58,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/issue-token", post(admin_issue_token))
         .route("/admin/refresh-workspace/:openid", post(admin_refresh_workspace))
         .route("/admin/refresh-all-workspaces", post(admin_refresh_all_workspaces))
+        .route("/internal/sop-event", post(internal_sop_event))
         .with_state(state)
 }
 
@@ -458,160 +454,12 @@ async fn chat(
     AuthOpenid(openid): AuthOpenid,
     Json(req): Json<ChatReq>,
 ) -> std::result::Result<Json<ChatResp>, Error> {
-    // Rate-limit by openid (defends LLM-cost blast radius if a token leaks)
     limits::check(&st.limiters.chat_per_user, &openid)
         .map_err(|retry| Error::RateLimited { retry_after_secs: retry })?;
 
     let user = st.provisioner.ensure_running(&openid).await?;
     users::touch_active(&st.pool, &user.openid).await?;
 
-    // ── Intent classification ─────────────────────────────────────
-    // Run the LLM classifier on the user message. On any failure or
-    // confidence below threshold, fall through to the legacy sync
-    // daemon path (normal_chat). On SOP hit, return immediately with
-    // a "task queued" message and let sop_runner do the work.
-    let classify = st.intent_classifier.classify(&req.content).await;
-    let min_conf = st.cfg.intent_classifier.min_confidence;
-    let sop_match = if classify.is_sop_trigger(min_conf) {
-        st.cfg.sop_metadata.get(&classify.intent).cloned()
-            .map(|m| (classify.intent.clone(), m))
-    } else {
-        None
-    };
-
-    if let Some((sop_name, sop_meta)) = sop_match {
-        // Resolve enterprise_name for the SOP.
-        // Only enterprise_profile.company_name (server-verified) is trusted as a
-        // full legal name. brain.db memory often holds abbreviated names (简称)
-        // that fail the enterprise_profile_sync lookup step, so we treat it as
-        // an unverified hint and always ask the user to confirm/provide the full name.
-        let db_user = users::get(&st.pool, &user.openid).await.ok().flatten();
-
-        // Only accept enterprise_profile.company_name if it looks like a full
-        // legal name (ends with 公司/集团 etc.). Abbreviated names fail step 1.
-        let enterprise_name: Option<String> = db_user
-            .as_ref()
-            .and_then(|u| u.enterprise_profile.as_ref())
-            .and_then(|s| serde_json::from_str::<JsonValue>(s).ok())
-            .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from))
-            .filter(|n| looks_like_full_company_name(n));
-
-        // If no verified full name, ask user. Surface the brain.db hint (if any)
-        // so the user can correct it, but be explicit about needing the full name.
-        if enterprise_name.is_none() {
-            let linux_uid = db_user.as_ref().map(|u| u.linux_uid.as_str()).unwrap_or("");
-            let memory_hint =
-                read_enterprise_name_from_memory(&st.cfg.zeroclaw.home_base, linux_uid).await;
-
-            let prompt = match memory_hint {
-                Some(hint) => format!(
-                    "您好！我在记忆中找到企业名称「{}」，但政策匹配需要营业执照上的完整企业全称（通常以「有限公司」结尾）才能准确查询。\
-                     \n请提供完整的企业全称，我将立即为您发起匹配。",
-                    hint
-                ),
-                None => "请提供您企业的完整全称（营业执照上的名称，通常以「有限公司」结尾），我将为您发起政策匹配评测。".to_string(),
-            };
-            tracing::debug!(openid = %user.openid, "SOP triggered but no verified enterprise_name — asking user");
-            if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &prompt).await {
-                tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
-            }
-            return Ok(Json(ChatResp {
-                response: prompt,
-                model: Some("clawops-router".to_string()),
-                openid: user.openid,
-            }));
-        } else {
-
-        // Cache check (per-openid, sop_name + enterprise_name, within ttl)
-        let cached = sop_tasks::find_cached_done(
-            &st.pool,
-            &user.openid,
-            &sop_name,
-            enterprise_name.as_deref(),
-            sop_meta.cache_ttl_days,
-        )
-        .await
-        .ok()
-        .flatten();
-
-        let task_id = sop_tasks::new_task_id();
-        let display_name_cn = sop_meta.display_name_cn.clone();
-
-        let chat_response_text = if let Some(prev) = cached {
-            // Cache hit: copy deeplink + ids into a fresh row at status=done.
-            sop_tasks::insert_cached_done(
-                &st.pool,
-                &task_id,
-                &user.openid,
-                &sop_name,
-                enterprise_name.as_deref(),
-                prev.enterprise_id,
-                prev.qualification_enterprise_id,
-                prev.deeplink.as_deref(),
-                prev.response_text.as_deref(),
-                sop_meta.estimated_seconds,
-            )
-            .await?;
-            // Emit SSE: created (with sub-event "done" implied next)
-            emit_sop_event(&st, &task_id, &user.openid, "created");
-            emit_sop_event(&st, &task_id, &user.openid, "done");
-            format!(
-                "已为您找到上次「{}」结果,可在右上角任务列表查看",
-                display_name_cn
-            )
-        } else {
-            // Cache miss: insert pending + spawn background runner.
-            sop_tasks::insert_pending(
-                &st.pool,
-                &task_id,
-                &user.openid,
-                &sop_name,
-                enterprise_name.as_deref(),
-                sop_meta.estimated_seconds,
-            )
-            .await?;
-            // Emit "created" now so the frontend can immediately show
-            // the task in the list (enterprise_name already stored above).
-            emit_sop_event(&st, &task_id, &user.openid, "created");
-            sop_runner::spawn(sop_runner::SopRunCtx {
-                pool: st.pool.clone(),
-                http: st.http.clone(),
-                provisioner: st.provisioner.clone(),
-                cfg: st.cfg.clone(),
-                sop_event_tx: st.sop_event_tx.clone(),
-                task_id: task_id.clone(),
-                openid: user.openid.clone(),
-                sop_name: sop_name.clone(),
-                user_message: req.content.clone(),
-            });
-            let minutes = (sop_meta.estimated_seconds + 59) / 60;
-            format!(
-                "已开始「{}」,预计 {} 分钟,可在右上角任务列表查看进度",
-                display_name_cn, minutes
-            )
-        };
-
-        // Persist chat turn so frontend onLoad can re-render
-        if let Err(e) = chat_history::record_turn(
-            &st.pool,
-            &user.openid,
-            &req.content,
-            &chat_response_text,
-        )
-        .await
-        {
-            tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
-        }
-
-        return Ok(Json(ChatResp {
-            response: chat_response_text,
-            model: Some("clawops-router".to_string()),
-            openid: user.openid,
-        }));
-        } // else enterprise_name.is_some()
-    } // if let Some(sop_match)
-
-    // ── Normal chat path (no SOP triggered) ───────────────────────
     let (response_text, model) = if !st.provisioner.backend.launches_daemon() {
         (format!("[mock] echo: {}", req.content), Some("mock".into()))
     } else {
@@ -656,38 +504,6 @@ async fn chat(
         chat_history::record_turn(&st.pool, &user.openid, &req.content, &response_text).await
     {
         tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
-    }
-
-    // Detect "silent SOP": zeroclaw used its conversation memory to run a SOP
-    // (e.g. user said "重新跑") even though clawops classified it as normal_chat.
-    // If the response contains a deeplink we retroactively create a done task so
-    // the frontend task list stays in sync.
-    let (deeplink, qid) = sop_runner::extract_deeplink_and_qid(&response_text);
-    if let Some(ref dl) = deeplink {
-        if let Some(sop_name) = sop_name_from_deeplink(dl, &st.cfg) {
-            let task_id = sop_tasks::new_task_id();
-            tracing::info!(
-                openid = %user.openid,
-                task_id = %task_id,
-                sop_name = %sop_name,
-                "silent SOP detected in normal_chat response — retroactively creating done task"
-            );
-            let _ = sop_tasks::insert_cached_done(
-                &st.pool,
-                &task_id,
-                &user.openid,
-                &sop_name,
-                None, // enterprise_name unknown at this point
-                None,
-                qid,
-                Some(dl.as_str()),
-                Some(&response_text),
-                0,
-            )
-            .await;
-            emit_sop_event(&st, &task_id, &user.openid, "created");
-            emit_sop_event(&st, &task_id, &user.openid, "done");
-        }
     }
 
     Ok(Json(ChatResp {
@@ -1038,57 +854,126 @@ async fn list_my_sop_tasks(
     }))
 }
 
-/// Read `user_profile_company_name` from the user's zeroclaw brain.db.
-/// Opens the DB read-only so we never contend with zeroclaw's writer.
-async fn read_enterprise_name_from_memory(
-    home_base: &std::path::Path,
-    linux_uid: &str,
-) -> Option<String> {
-    if linux_uid.is_empty() {
-        return None;
-    }
-    let db_path = home_base
-        .join(linux_uid)
-        .join(".zeroclaw/workspace/memory/brain.db");
-    if !db_path.exists() {
-        return None;
-    }
-    let opts = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(&db_path)
-        .read_only(true);
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(opts)
-        .await
-        .ok()?;
-    let result: Option<String> = sqlx::query_scalar(
-        "SELECT content FROM memories WHERE key = 'user_profile_company_name' LIMIT 1",
-    )
-    .fetch_optional(&pool)
-    .await
-    .ok()
-    .flatten();
-    pool.close().await;
-    result
+// ────────────────────────────────────────────────────────────────────
+// POST /internal/sop-event — zeroclaw daemon lifecycle webhook
+//
+// Payload (JSON):
+//   { "event": "starting", "sop_name": "...", "openid": "..." }
+//   { "event": "done",     "sop_name": "...", "openid": "...", "response_text": "..." }
+//
+// The daemon fires "starting" when sop_execute tool is called (allows
+// immediate task creation + SSE "created" before the run finishes).
+// It fires "done" after the full agent loop completes with the
+// response_text, which may contain a deeplink we extract.
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SopEventPayload {
+    event: String,
+    sop_name: String,
+    openid: Option<String>,
+    #[serde(default)]
+    response_text: Option<String>,
 }
 
-/// Return true if `name` looks like a full Chinese company legal name.
-/// Abbreviated names (简称) typically lack these suffixes and are too short.
-fn looks_like_full_company_name(name: &str) -> bool {
-    const SUFFIXES: &[&str] = &[
-        "有限公司", "有限责任公司", "股份有限公司", "股份合作公司",
-        "集团有限公司", "集团股份有限公司", "合伙企业", "研究院", "研究所",
-    ];
-    let ch_count = name.chars().count();
-    ch_count >= 6 && SUFFIXES.iter().any(|s| name.ends_with(s))
-}
+async fn internal_sop_event(
+    State(st): State<AppState>,
+    Json(payload): Json<SopEventPayload>,
+) -> std::result::Result<Json<serde_json::Value>, Error> {
+    let openid = match payload.openid.as_deref().filter(|s| !s.is_empty()) {
+        Some(o) => o.to_string(),
+        None => {
+            tracing::warn!("sop-event missing openid — ignored");
+            return Ok(Json(serde_json::json!({"ok": false, "reason": "missing openid"})));
+        }
+    };
 
-/// Map a deeplink path to a SOP name using the configured sop_metadata.
-/// For now we match /pages/recommendation/* → policy-match.
-fn sop_name_from_deeplink(deeplink: &str, cfg: &crate::config::Config) -> Option<String> {
-    if deeplink.contains("/recommendation/") && cfg.sop_metadata.contains_key("policy-match") {
-        Some("policy-match".to_string())
-    } else {
-        None
+    match payload.event.as_str() {
+        "starting" => {
+            let sop_meta = st.cfg.sop_metadata.get(&payload.sop_name).cloned();
+            let estimated_seconds = sop_meta.map(|m| m.estimated_seconds).unwrap_or(540);
+            let task_id = sop_tasks::new_task_id();
+            tracing::info!(
+                openid = %openid,
+                task_id = %task_id,
+                sop_name = %payload.sop_name,
+                "sop webhook: starting"
+            );
+            sop_tasks::insert_pending(
+                &st.pool,
+                &task_id,
+                &openid,
+                &payload.sop_name,
+                None,
+                estimated_seconds,
+            )
+            .await?;
+            emit_sop_event(&st, &task_id, &openid, "created");
+            Ok(Json(serde_json::json!({"ok": true, "task_id": task_id})))
+        }
+        "done" => {
+            let response_text = payload.response_text.as_deref().unwrap_or("");
+            let task_id = sop_tasks::find_pending_by_sop(
+                &st.pool,
+                &openid,
+                &payload.sop_name,
+            )
+            .await?;
+            let task_id = match task_id {
+                Some(id) => id,
+                None => {
+                    // No pending task found — create a done row directly (e.g.
+                    // daemon was restarted and clawops missed the "starting" event).
+                    let id = sop_tasks::new_task_id();
+                    tracing::info!(
+                        openid = %openid,
+                        task_id = %id,
+                        sop_name = %payload.sop_name,
+                        "sop webhook: done without prior pending — inserting done directly"
+                    );
+                    let (deeplink, _qid) = sop_tasks::extract_deeplink_and_qid(response_text);
+                    sop_tasks::insert_cached_done(
+                        &st.pool,
+                        &id,
+                        &openid,
+                        &payload.sop_name,
+                        None,
+                        None,
+                        None,
+                        deeplink.as_deref(),
+                        Some(response_text),
+                        0,
+                    )
+                    .await?;
+                    emit_sop_event(&st, &id, &openid, "created");
+                    emit_sop_event(&st, &id, &openid, "done");
+                    return Ok(Json(serde_json::json!({"ok": true, "task_id": id})));
+                }
+            };
+
+            let (deeplink, _qid) = sop_tasks::extract_deeplink_and_qid(response_text);
+            tracing::info!(
+                openid = %openid,
+                task_id = %task_id,
+                sop_name = %payload.sop_name,
+                deeplink = ?deeplink,
+                "sop webhook: done"
+            );
+            sop_tasks::mark_done(
+                &st.pool,
+                &task_id,
+                None,
+                None,
+                deeplink.as_deref(),
+                response_text,
+            )
+            .await?;
+            emit_sop_event(&st, &task_id, &openid, "done");
+            Ok(Json(serde_json::json!({"ok": true, "task_id": task_id})))
+        }
+        other => {
+            tracing::warn!(event = other, "sop-event unknown event type — ignored");
+            Ok(Json(serde_json::json!({"ok": false, "reason": "unknown event"})))
+        }
     }
 }

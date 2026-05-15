@@ -259,6 +259,10 @@ impl Provisioner {
                 "enabled": !self.cfg.lead.webhook_url.is_empty(),
             },
             "http_allowed_domains_toml": http_allowed_domains_toml(&self.cfg),
+            "sop_webhook": {
+                "owner_openid": user.openid,
+                "event_webhook_url": format!("http://127.0.0.1:{}/internal/sop-event", self.cfg.server.port),
+            },
         });
 
         let mut hb = Handlebars::new();
@@ -458,6 +462,10 @@ impl Provisioner {
                 "enabled": !self.cfg.lead.webhook_url.is_empty(),
             },
             "http_allowed_domains_toml": http_allowed_domains_toml(&self.cfg),
+            "sop_webhook": {
+                "owner_openid": user.openid,
+                "event_webhook_url": format!("http://127.0.0.1:{}/internal/sop-event", self.cfg.server.port),
+            },
         });
 
         let mut hb = Handlebars::new();
