@@ -556,8 +556,26 @@ async fn chat(
                 }));
             }
 
-            // Enterprise name valid — replace zeroclaw's internal-name message with Chinese.
+            // Enterprise name valid — create the pending task here (not in the webhook,
+            // to avoid orphan rows when validation blocks the request).
             let sop_meta = st.cfg.sop_metadata.get(sop_name.as_str());
+            let estimated_seconds = sop_meta.map(|m| m.estimated_seconds).unwrap_or(540);
+            let task_id = sop_tasks::new_task_id();
+            if let Err(e) = sop_tasks::insert_pending(
+                &st.pool,
+                &task_id,
+                &user.openid,
+                sop_name,
+                enterprise_name.as_deref(),
+                estimated_seconds,
+            )
+            .await
+            {
+                tracing::warn!(openid = %user.openid, task_id = %task_id, "failed to insert pending sop task: {e}");
+            } else {
+                emit_sop_event(&st, &task_id, &user.openid, "created");
+            }
+
             let display_name = sop_meta
                 .map(|m| m.display_name_cn.as_str())
                 .unwrap_or(sop_name.as_str());
@@ -967,26 +985,15 @@ async fn internal_sop_event(
 
     match payload.event.as_str() {
         "starting" => {
-            let sop_meta = st.cfg.sop_metadata.get(&payload.sop_name).cloned();
-            let estimated_seconds = sop_meta.map(|m| m.estimated_seconds).unwrap_or(540);
-            let task_id = sop_tasks::new_task_id();
-            tracing::info!(
+            // Task creation is owned by /chat (after enterprise-name validation).
+            // Acting here would create orphan rows whenever /chat rejects the
+            // message for a missing company name.
+            tracing::debug!(
                 openid = %openid,
-                task_id = %task_id,
                 sop_name = %payload.sop_name,
-                "sop webhook: starting"
+                "sop webhook: starting (acknowledged; task created by /chat)"
             );
-            sop_tasks::insert_pending(
-                &st.pool,
-                &task_id,
-                &openid,
-                &payload.sop_name,
-                None,
-                estimated_seconds,
-            )
-            .await?;
-            emit_sop_event(&st, &task_id, &openid, "created");
-            Ok(Json(serde_json::json!({"ok": true, "task_id": task_id})))
+            Ok(Json(serde_json::json!({"ok": true})))
         }
         "done" => {
             let response_text = payload.response_text.as_deref().unwrap_or("");
