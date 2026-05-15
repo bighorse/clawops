@@ -1,11 +1,12 @@
-# SOP 异步任务模式 — 小程序前端对接 v2 (2026-05-15)
+# SOP 异步任务模式 — 小程序前端对接 v3 (2026-05-15)
 
-> **v2 重写说明**: 采用"现有 `/chat` 入口 + 服务端识别 + 早返回 + SSE 推任务事件 + 独立任务列表 UI"流程。前端**不需要新 API 调用代码**,只需:
-> - 监听新增的 SSE 事件 (`sop_task_created` / `sop_task_done` / `sop_task_failed`)
-> - 加一个右上角任务列表组件 + 红点提醒
-> - `GET /me/sop/tasks` 拉列表数据
+> **v3 调整说明** (在 v2 基础上):
+> - 意图识别从"clawops 正则"升级为 **LLM 分类**(deepseek-v4-flash 1 秒分类,准确率 ~99%)
+> - SSE 事件类型从 3 个(`sop_task_created`/`done`/`failed`) 合并为 **1 个 `sop_task`**,前端收到后**重新拉 `/me/sop/tasks` 全量列表**,不维护增量状态
 >
-> 替代 v1 的 `POST /sop/{sop_name}/run` 设计 (已废弃)。
+> 沿用 v2 的核心流程:"现有 `/chat` 入口 + 服务端识别 + 早返回 + SSE 推任务事件 + 独立任务列表 UI"。前端**不需要新 API 调用代码**,只需:
+> - 监听 SSE `sop_task` 事件 → 调用 `GET /me/sop/tasks` 刷新列表
+> - 加右上角任务列表组件 + 红点提醒
 
 > **适用范围**: 所有 SOP — `policy-match` (政策匹配)、即将上线的 `qualification-check` (资质评估)、未来扩展 SOP。新增 SOP 时前端**零改动**(后端配置即可)。
 
@@ -17,136 +18,141 @@
 小程序                    clawops gateway                      daemon
   │  POST /chat            │                                    │
   │  body: {"message":...} │                                    │
-  │ ────────────────────►  │ 1. keyword regex 识别 sop_name      │
+  │ ────────────────────►  │ 1. 调 LLM 做意图分类 (~1-2s)        │
+  │                        │    deepseek-v4-flash 1 次 call      │
+  │                        │    返回 {intent, confidence}        │
   │                        │                                    │
-  │                        ├─ 不命中 ─→ 转发 daemon /api/chat ──►│ 几秒返回普通对话
+  │                        ├─ intent=normal_chat ─→ 转发 daemon ─►│ 几秒返回普通对话
   │  ◄── 几秒返回 ────────│  ◄────── /api/chat response ──────  │
   │                        │                                    │
-  │                        └─ 命中 sop_name(如 policy-match)    │
+  │                        └─ intent=<sop_name>                  │
   │                            │                                │
   │                            ├─ 缓存命中(sop_name + enterprise_id, 7天内)
   │                            │   INSERT sop_tasks status=done  │
-  │                            │   推 SSE sop_task_created + sop_task_done
+  │                            │   推 SSE sop_task event         │
   │                            │   chat 返回:                    │
   │                            │     "已为您找到上次政策匹配结果,│
   │                            │      可在右上角任务列表查看"     │
   │                            │                                │
   │                            └─ 缓存未命中                     │
   │                                INSERT sop_tasks status=running
-  │                                推 SSE sop_task_created       │
+  │                                推 SSE sop_task event         │
   │                                spawn 后台 task ─────────────►│ daemon 跑 SOP 6 步 (~9 分钟)
   │                                chat 立即返回:                │
   │                                  "已开始政策匹配,预计 9 分钟,│
   │                                   可在右上角任务列表查看"     │
-  │  ◄── 5-10 秒返回 ─────│                                    │
+  │  ◄── 几秒返回 ────────│                                    │
   │                        │                                    │
-  │  ◄─── SSE sop_task_created ──── (前端右上角红点 +1)         │
-  │                        │                              ◄─── /api/chat response (9 分钟后)
-  │                        │ UPDATE sop_tasks status=done +     │
-  │                        │ result_json + deeplink             │
-  │  ◄─── SSE sop_task_done ─────── (前端右上角红点继续亮 + 列表 status=done)
+  │  ◄─── SSE sop_task ─── │                              ◄─── /api/chat response (9 分钟后)
+  │  前端 → GET /me/sop/tasks                                   │
+  │                        │ UPDATE sop_tasks status=done       │
+  │                        │ 推 SSE sop_task event              │
+  │  ◄─── SSE sop_task ─── │ (前端再次 GET /me/sop/tasks)        │
   │                        │                                    │
-  │  用户点右上角 → GET /me/sop/tasks                          │
-  │                        │ SELECT * FROM sop_tasks            │
-  │                        │ WHERE openid=? AND created_at > 30d ago
-  │  ◄── 任务列表 ────────│                                    │
-  │                        │                                    │
+  │  用户点右上角 → 已有最新任务列表数据                          │
   │  用户点 done 任务 → wx.navigateTo(task.deeplink)
 ```
 
 ### 关键设计
 
 - **前端 `POST /chat` 调用方式不变**,只是 chat 响应在 SOP 命中场景下变成提示文案(不再挂 9 分钟)
-- **意图识别在 clawops 端用正则**(命中率 ~95%,漏识别时 chat 同步等 daemon 跑完——和当前生产一致,**不做兜底**)
+- **意图识别在 clawops 端用 LLM 分类**(deepseek-v4-flash 1-2 秒,准确率 ~99%,边缘 case 走 normal_chat 同步,**不做兜底**)
+- **SSE 事件只有 1 种类型 `sop_task`** — 前端不维护增量,收到事件后**直接重新拉 `/me/sop/tasks` 全量**,服务端是 single source of truth
 - **任务列表是独立 UI 组件**(右上角入口),不污染聊天历史
 - **聊天 history 只存提示文案 + 普通对话**,SOP 的实际结果在任务列表里看
-- **缓存命中也走任务流程**(任务瞬时 done),UX 统一
+- **缓存命中也走任务流程**(任务瞬时 done,推一次 sop_task event),UX 统一
 
 ---
 
-## 2. 后端识别的关键词
+## 2. 后端意图识别 (LLM 分类)
 
-clawops 用以下正则匹配 user message,命中对应 SOP:
+clawops 在 `POST /chat` 入口先调一次 LLM 做意图分类(deepseek-v4-flash 或同档轻量模型),~1-2 秒返回:
 
-| SOP | 正则(JS 等价) | 触发示例 |
-|---|---|---|
-| `policy-match` | `/政策\|匹配\|补贴\|申报\|适用/` | "帮我匹配下政策"、"看看有什么补贴"、"我能申报什么" |
-| `qualification-check` | `/资质\|评估\|认证\|高新\|专精特新/`(待上线) | "帮我评估下资质"、"我能申高新吗" |
+```
+LLM prompt:
+  你是政策小助手前置分类器。判断用户意图,从以下分类选一个:
+  - policy-match: 用户希望系统帮他匹配政策(政策匹配/补贴申报/扶持优惠 等意图)
+  - qualification-check: 用户希望系统评估企业资质(资质评估/高新认定 等意图)
+  - normal_chat: 其他对话/咨询/闲聊/打招呼
 
-**漏识别风险**: 用户说话方式特殊(如"我们企业属于科技创新型,想找点扶持") 可能不命中 → chat 走同步,挂 9 分钟。这种情况罕见,**前端不需要兜底处理**(用户接受这种边缘 case)。
+  仅输出 JSON: {"intent": "<分类名>", "confidence": 0.0-1.0}
 
-> 前端无需在客户端做关键词匹配 — 服务端识别就够,前端只看 SSE 事件响应。
+用户消息: <message>
+```
+
+服务端处理逻辑:
+- `intent != "normal_chat"` 且 `confidence ≥ 0.7` → 触发 SOP 异步任务(命中 SOP)
+- 否则 → 转发到 daemon `/api/chat` 同步处理(普通对话)
+
+**SOP 支持清单**:
+
+| SOP | 中文名 | 预估耗时 | 触发示例 |
+|---|---|---|---|
+| `policy-match` | 政策匹配 | 9 分钟 | "帮我匹配下政策"、"看看有什么补贴可以申报" |
+| `qualification-check`(待上线) | 资质评估 | 3 分钟 | "帮我评估下资质"、"我能申高新吗" |
+
+**为什么不用正则**:
+- LLM 能理解"我们想找些扶持"这种隐含表达,正则会漏
+- 准确率 ~99% vs 正则 ~95%
+- 新增 SOP 时只动 prompt 不动正则代码,扩展性更好
+- 多花 1-2 秒和 ~$0.001 / chat 成本可接受
+
+**漏识别 (~1%)**: LLM 也可能误判 normal_chat → chat 走同步,挂 9 分钟。这种情况罕见,**前端不需要兜底处理**。
+
+> 前端无需在客户端做意图识别 — 服务端识别就够,前端只看 SSE 事件响应。
 
 ---
 
-## 3. SSE 事件 schema
+## 3. SSE 事件 schema (统一 `sop_task` 单事件)
 
-接现有 `/events?token=...` 长连接,新增 3 个事件类型:
-
-### 3.1 `sop_task_created`
-
-任务创建时立即推送(缓存命中和未命中都推):
+接现有 `/events?token=...` 长连接,新增 **1 种事件类型**:
 
 ```json
 {
-  "type": "sop_task_created",
+  "type": "sop_task",
   "task_id": "tsk_abc123",
-  "sop_name": "policy-match",
-  "sop_name_cn": "政策匹配",
-  "enterprise_name": "中拓产业云(北京)科技服务有限公司",
-  "status": "running",                  // running / done(缓存命中时)
-  "estimated_seconds": 540,             // 预计时长,running 时有效
-  "created_at": "2026-05-15T08:00:00Z"
+  "event": "created"
 }
 ```
 
-前端应:
-- 右上角红点 +1
-- 任务列表(如果当前展开)插入一条记录
+**字段说明**:
 
-### 3.2 `sop_task_done`
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `type` | string | ✓ | 固定 `"sop_task"` |
+| `task_id` | string | ✓ | 触发本次事件的 task ID |
+| `event` | string | ✓ | 子事件类型:`"created"` / `"done"` / `"failed"` |
 
-任务完成(daemon SOP 跑完 + 后端写完库):
+**触发时机**:
 
-```json
-{
-  "type": "sop_task_done",
-  "task_id": "tsk_abc123",
-  "sop_name": "policy-match",
-  "sop_name_cn": "政策匹配",
-  "status": "done",
-  "deeplink": "/pages/recommendation/index?id=100",
-  "completed_at": "2026-05-15T08:09:00Z"
-}
-```
+| event | 时机 |
+|---|---|
+| `created` | clawops 识别 SOP 意图 + INSERT 任务后(缓存未命中场景);**缓存命中场景不推 `created`**,直接推 `done`(任务瞬时完成) |
+| `done` | daemon SOP 跑完 + clawops 写库后;或缓存命中场景立即推 |
+| `failed` | daemon 报错/超时后 |
 
-前端应:
-- 任务列表对应条目 status 改 `done`
-- 红点保持(直到用户打开列表查看)
+**前端处理(简化)**:
+- 收到 `sop_task` 事件,**不管 event 子类型,统一调用 `GET /me/sop/tasks`** 拉最新列表
+- 拉到列表后,**对比本地缓存**找到 `task_id` 对应的任务,根据 status (`running` / `done` / `failed`) 决定 UI 行为:
+  - 新任务(本地没有的 task_id) → 红点 +1,显示新任务进入列表
+  - 任务 done → 红点保持,UI 显示"已完成"
+  - 任务 failed → 红点保持,UI 显示错误文案
 
-### 3.3 `sop_task_failed`
+**为什么用统一事件**:
+- 前端不维护增量状态,服务端列表是 single source of truth
+- 不怕事件丢失/乱序
+- SSE payload 极简,后端少传字段
+- 多 task 并发场景天然支持(收到任意事件就刷新整个列表)
 
-任务失败(daemon 报错/超时):
+**`event` 字段的可选用途**:
+- 直接根据 `event=created` 显示 toast "已开始政策匹配"
+- `event=done` 显示 toast "政策匹配已完成,点击查看"
+- `event=failed` 显示 toast "政策匹配失败"
+- (如果前端不想做这种细分提示,可以完全忽略 `event` 字段,只看 task_id 触发刷新)
 
-```json
-{
-  "type": "sop_task_failed",
-  "task_id": "tsk_abc123",
-  "sop_name": "policy-match",
-  "sop_name_cn": "政策匹配",
-  "status": "failed",
-  "error": "服务繁忙,请稍后重试",      // 人类可读
-  "completed_at": "2026-05-15T08:05:00Z"
-}
-```
+### 3.1 现有事件(可保留监听,但本流程不依赖)
 
-前端应:
-- 任务列表对应条目改 `failed` + 显示 error 文案
-- 红点保持
-
-### 3.4 现有事件(可保留监听,但本流程不依赖)
-
-`/events` 仍推送 daemon 内部事件:`tool_call_start` / `tool_call` / `agent_start` / `agent_end` / `llm_request` 等。**前端可以忽略这些**,只看 sop_task_* 三种就够了。
+`/events` 仍推送 daemon 内部事件:`tool_call_start` / `tool_call` / `agent_start` / `agent_end` / `llm_request` 等。**前端可以忽略这些**,只看 `sop_task` 事件就够了。
 
 ---
 
@@ -219,15 +225,9 @@ Body:
 
 ## 6. 前端集成
 
-### 6.1 SSE 监听代码示例
+### 6.1 SSE 监听代码示例(简化版)
 
 ```javascript
-const SOP_NAME_CN = {
-  'policy-match': '政策匹配',
-  'qualification-check': '资质评估',
-  // 新 SOP 上线时加一行,但实际后端会推 sop_name_cn 字段,这里只作 fallback
-};
-
 let sseTask = null;
 
 function connectSSE(pairedToken) {
@@ -248,40 +248,41 @@ function connectSSE(pairedToken) {
       if (!m) continue;
       try {
         const ev = JSON.parse(m[1]);
-        switch (ev.type) {
-          case 'sop_task_created':
-            taskStore.add({
-              task_id: ev.task_id,
-              sop_name: ev.sop_name,
-              sop_name_cn: ev.sop_name_cn,
-              enterprise_name: ev.enterprise_name,
-              status: ev.status,
-              estimated_seconds: ev.estimated_seconds,
-              created_at: ev.created_at,
-            });
-            updateRedDot(); // 红点 +1
-            break;
-
-          case 'sop_task_done':
-            taskStore.update(ev.task_id, {
-              status: 'done',
-              deeplink: ev.deeplink,
-              completed_at: ev.completed_at,
-            });
-            // 红点保持亮,用户点开列表后才清除
-            break;
-
-          case 'sop_task_failed':
-            taskStore.update(ev.task_id, {
-              status: 'failed',
-              error: ev.error,
-              completed_at: ev.completed_at,
-            });
-            break;
+        if (ev.type === 'sop_task') {
+          // 统一处理:任何 sop_task 事件都触发刷新列表
+          refreshTasks(ev.task_id, ev.event);
         }
       } catch(e) {}
     }
   });
+}
+
+async function refreshTasks(triggeredTaskId, eventSubtype) {
+  const res = await wxRequest({
+    url: `${API}/me/sop/tasks?limit=50`,
+    header: { 'Authorization': `Bearer ${pairedToken}` },
+  });
+
+  // 找到本次事件触发的 task,根据 status 决定 UI 行为
+  const triggered = res.tasks.find(t => t.task_id === triggeredTaskId);
+  const wasInLocal = taskStore.has(triggeredTaskId);
+
+  // 用服务端最新数据覆盖整个本地列表 (single source of truth)
+  taskStore.replaceAll(res.tasks);
+
+  // UI 反馈(可选,根据 event 子类型给不同 toast)
+  if (triggered) {
+    if (eventSubtype === 'created' && !wasInLocal) {
+      // 新任务进入
+      updateRedDot();
+      wx.showToast({ title: `已开始${triggered.sop_name_cn}`, icon: 'none' });
+    } else if (eventSubtype === 'done') {
+      updateRedDot();
+      wx.showToast({ title: `${triggered.sop_name_cn}已完成,点击右上角查看`, icon: 'success' });
+    } else if (eventSubtype === 'failed') {
+      wx.showToast({ title: `${triggered.sop_name_cn}失败: ${triggered.error}`, icon: 'error' });
+    }
+  }
 }
 ```
 
