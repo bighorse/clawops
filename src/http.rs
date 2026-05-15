@@ -480,35 +480,35 @@ async fn chat(
     };
 
     if let Some((sop_name, sop_meta)) = sop_match {
-        // Resolve enterprise_name (needed for cache key + task display).
-        // Priority: 1) enterprise_profile.company_name in users table
-        //           2) user_profile_company_name from zeroclaw brain.db
-        //           3) None → fall through to daemon (daemon asks user)
+        // Resolve enterprise_name for the SOP.
+        // Only enterprise_profile.company_name (server-verified) is trusted as a
+        // full legal name. brain.db memory often holds abbreviated names (简称)
+        // that fail the enterprise_profile_sync lookup step, so we treat it as
+        // an unverified hint and always ask the user to confirm/provide the full name.
         let db_user = users::get(&st.pool, &user.openid).await.ok().flatten();
 
-        let enterprise_name: Option<String> = {
-            // Priority 1: users.enterprise_profile
-            let from_profile = db_user
-                .as_ref()
-                .and_then(|u| u.enterprise_profile.as_ref())
-                .and_then(|s| serde_json::from_str::<JsonValue>(s).ok())
-                .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from));
+        let enterprise_name: Option<String> = db_user
+            .as_ref()
+            .and_then(|u| u.enterprise_profile.as_ref())
+            .and_then(|s| serde_json::from_str::<JsonValue>(s).ok())
+            .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from));
 
-            if from_profile.is_some() {
-                from_profile
-            } else {
-                // Priority 2: zeroclaw memory brain.db
-                let linux_uid = db_user.as_ref().map(|u| u.linux_uid.as_str()).unwrap_or("");
-                read_enterprise_name_from_memory(&st.cfg.zeroclaw.home_base, linux_uid).await
-            }
-        };
-
-        // If no enterprise name found, reply asking the user to provide it.
-        // Once they tell the daemon their company name the memory will be
-        // stored in brain.db and the next trigger will find it here.
+        // If no verified full name, ask user. We optionally surface the brain.db
+        // hint so the user can correct it ("我知道您叫XX，请提供全称").
         if enterprise_name.is_none() {
-            tracing::debug!(openid = %user.openid, "SOP triggered but no enterprise_name — asking user");
-            let prompt = "请问您的企业名称是什么？提供后我将为您启动政策匹配评测。".to_string();
+            let linux_uid = db_user.as_ref().map(|u| u.linux_uid.as_str()).unwrap_or("");
+            let memory_hint =
+                read_enterprise_name_from_memory(&st.cfg.zeroclaw.home_base, linux_uid).await;
+
+            let prompt = match memory_hint {
+                Some(hint) => format!(
+                    "您好！我在记忆中找到企业名称「{}」，但政策匹配需要营业执照上的企业全称才能准确查询。\
+                     \n请提供完整的企业全称，我将立即为您发起匹配。",
+                    hint
+                ),
+                None => "请提供您企业的全称（营业执照上的名称），我将为您发起政策匹配评测。".to_string(),
+            };
+            tracing::debug!(openid = %user.openid, "SOP triggered but no verified enterprise_name — asking user");
             if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &prompt).await {
                 tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
             }
