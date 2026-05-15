@@ -1,19 +1,25 @@
 use crate::auth::WxClient;
 use crate::config::Config;
+use crate::intent_classifier::IntentClassifier;
 use crate::limits::{self, AppLimiters};
 use crate::provisioner::Provisioner;
+use crate::sop_runner;
+use crate::sop_tasks;
 use crate::{chat_history, sessions, users, Error, Result};
-use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
 use axum::body::Body;
+use axum::extract::FromRequestParts;
 use axum::extract::{Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use sqlx::SqlitePool;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,6 +29,13 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub wx: Arc<WxClient>,
     pub limiters: Arc<AppLimiters>,
+    /// Broadcast channel for SOP task events. Subscribers (each /events
+    /// SSE connection) filter by openid (stripped before forwarding).
+    /// Capacity 256 is plenty given event frequency (a few/sec at peak).
+    pub sop_event_tx: broadcast::Sender<JsonValue>,
+    /// LLM-based intent classifier. Wrapped in Arc for cheap clone in
+    /// each chat handler invocation. None when feature disabled.
+    pub intent_classifier: Arc<IntentClassifier>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -37,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/me/profile", axum::routing::put(update_my_profile))
         .route("/me/profile", get(get_my_profile))
         .route("/me/chat-history", get(get_my_chat_history))
+        .route("/me/sop/tasks", get(list_my_sop_tasks))
         .route("/admin/users", get(list_users))
         .route("/admin/users/:openid", get(get_user))
         .route("/admin/provision", post(admin_provision))
@@ -129,12 +143,17 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// GET /events — SSE byte-stream proxy to the user's zeroclaw /api/events.
+/// GET /events — Server-Sent Events stream merging:
+///   1. The user's zeroclaw daemon /api/events (raw byte pass-through),
+///   2. ClawOps' own `sop_task` events broadcast from the chat handler
+///      and sop_runner.
+///
 /// Auth via `Authorization: Bearer <session_token>` (or `?token=` for
-/// EventSource clients that can't set headers). Each request opens its own
-/// upstream connection (1:1); when the client disconnects, hyper drops the
-/// stream and the upstream TCP connection is closed automatically. No SSE
-/// parsing — bytes pass through unchanged.
+/// EventSource clients that can't set headers).
+///
+/// Per-user filtering: sop_task events carry an `openid` field in the
+/// broadcast payload; this handler strips it before forwarding and
+/// only forwards events matching the connected user's openid.
 #[derive(Deserialize)]
 struct EventsQuery {
     #[serde(default)]
@@ -158,43 +177,94 @@ async fn events(
     let user = st.provisioner.ensure_running(&openid).await?;
     users::touch_active(&st.pool, &user.openid).await?;
 
-    if !st.provisioner.backend.launches_daemon() {
-        // Mock backend: no real upstream, emit a one-shot synthetic event
-        // so end-to-end SSE plumbing on the client side can be exercised.
-        let body = format!(
+    // mpsc channel used to merge both streams into a single Body::from_stream
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<axum::body::Bytes, axum::Error>>(64);
+
+    // Spawn task 1: forward daemon SSE byte stream (real backend only)
+    if st.provisioner.backend.launches_daemon() {
+        let port = user.port.ok_or_else(|| {
+            Error::Other(format!("user {} has no port assigned", user.openid))
+        })?;
+        let paired_token = user
+            .paired_token_enc
+            .as_deref()
+            .ok_or_else(|| Error::Other("paired token missing".into()))?
+            .to_string();
+        let http = st.http.clone();
+        let tx_daemon = tx.clone();
+        tokio::spawn(async move {
+            let upstream = match http
+                .get(format!("http://127.0.0.1:{port}/api/events"))
+                .header(header::AUTHORIZATION, format!("Bearer {paired_token}"))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    tracing::warn!("upstream /api/events returned {}", r.status());
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("upstream /api/events fetch error: {e}");
+                    return;
+                }
+            };
+            let mut stream = upstream.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                if tx_daemon.send(Ok(bytes)).await.is_err() {
+                    break; // client disconnected
+                }
+            }
+        });
+    } else {
+        // Mock backend: emit a one-shot synthetic event so the SSE
+        // plumbing on the client side can still be exercised.
+        let mock = format!(
             "data: {{\"type\":\"mock_hello\",\"openid\":\"{}\"}}\n\n",
             user.openid
         );
-        return Ok(([
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ], body)
-            .into_response());
+        let _ = tx.send(Ok(axum::body::Bytes::from(mock))).await;
     }
 
-    let port = user.port.ok_or_else(|| {
-        Error::Other(format!("user {} has no port assigned", user.openid))
-    })?;
-    let token = user
-        .paired_token_enc
-        .as_deref()
-        .ok_or_else(|| Error::Other("paired token missing".into()))?;
+    // Spawn task 2: forward clawops sop_task broadcast (filtered by openid)
+    let mut rx_bc = st.sop_event_tx.subscribe();
+    let tx_clawops = tx.clone();
+    let openid_filter = user.openid.clone();
+    tokio::spawn(async move {
+        loop {
+            let value = match rx_bc.recv().await {
+                Ok(v) => v,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break, // channel closed
+            };
+            let event_openid = match value.get("openid").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if event_openid != openid_filter {
+                continue;
+            }
+            // Strip openid before sending to client (not needed by FE)
+            let mut clean = value.clone();
+            if let Some(obj) = clean.as_object_mut() {
+                obj.remove("openid");
+            }
+            let frame = format!("data: {}\n\n", clean);
+            if tx_clawops.send(Ok(axum::body::Bytes::from(frame))).await.is_err() {
+                break;
+            }
+        }
+    });
 
-    let upstream = st
-        .http
-        .get(format!("http://127.0.0.1:{port}/api/events"))
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .send()
-        .await?;
+    // Drop the original sender so the stream closes when both task
+    // senders drop (client disconnect + broadcast end).
+    drop(tx);
 
-    if !upstream.status().is_success() {
-        return Err(Error::Other(format!(
-            "upstream /api/events returned {}",
-            upstream.status()
-        )));
-    }
-
-    let stream = upstream.bytes_stream();
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = Body::from_stream(stream);
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -395,24 +465,129 @@ async fn chat(
     let user = st.provisioner.ensure_running(&openid).await?;
     users::touch_active(&st.pool, &user.openid).await?;
 
-    // Mock mode (no daemon launched) returns a canned echo so smoke
-    // tests of the full pipeline still work. Real mode hits the daemon.
+    // ── Intent classification ─────────────────────────────────────
+    // Run the LLM classifier on the user message. On any failure or
+    // confidence below threshold, fall through to the legacy sync
+    // daemon path (normal_chat). On SOP hit, return immediately with
+    // a "task queued" message and let sop_runner do the work.
+    let classify = st.intent_classifier.classify(&req.content).await;
+    let min_conf = st.cfg.intent_classifier.min_confidence;
+    let sop_match = if classify.is_sop_trigger(min_conf) {
+        st.cfg.sop_metadata.get(&classify.intent).cloned()
+            .map(|m| (classify.intent.clone(), m))
+    } else {
+        None
+    };
+
+    if let Some((sop_name, sop_meta)) = sop_match {
+        // Best-effort enterprise_name extraction from user profile
+        // (the SOP itself will run its own resolution chain — this is
+        // just for cache lookup + task display).
+        let enterprise_name = users::get(&st.pool, &user.openid)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|u| u.enterprise_profile)
+            .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
+            .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from));
+
+        // Cache check (per-openid, sop_name + enterprise_name, within ttl)
+        let cached = sop_tasks::find_cached_done(
+            &st.pool,
+            &user.openid,
+            &sop_name,
+            enterprise_name.as_deref(),
+            sop_meta.cache_ttl_days,
+        )
+        .await
+        .ok()
+        .flatten();
+
+        let task_id = sop_tasks::new_task_id();
+        let display_name_cn = sop_meta.display_name_cn.clone();
+
+        let chat_response_text = if let Some(prev) = cached {
+            // Cache hit: copy deeplink + ids into a fresh row at status=done.
+            sop_tasks::insert_cached_done(
+                &st.pool,
+                &task_id,
+                &user.openid,
+                &sop_name,
+                enterprise_name.as_deref(),
+                prev.enterprise_id,
+                prev.qualification_enterprise_id,
+                prev.deeplink.as_deref(),
+                prev.response_text.as_deref(),
+                sop_meta.estimated_seconds,
+            )
+            .await?;
+            // Emit SSE: created (with sub-event "done" implied next)
+            emit_sop_event(&st, &task_id, &user.openid, "created");
+            emit_sop_event(&st, &task_id, &user.openid, "done");
+            format!(
+                "已为您找到上次「{}」结果,可在右上角任务列表查看",
+                display_name_cn
+            )
+        } else {
+            // Cache miss: insert pending + spawn background runner.
+            sop_tasks::insert_pending(
+                &st.pool,
+                &task_id,
+                &user.openid,
+                &sop_name,
+                enterprise_name.as_deref(),
+                sop_meta.estimated_seconds,
+            )
+            .await?;
+            sop_runner::spawn(sop_runner::SopRunCtx {
+                pool: st.pool.clone(),
+                http: st.http.clone(),
+                provisioner: st.provisioner.clone(),
+                cfg: st.cfg.clone(),
+                sop_event_tx: st.sop_event_tx.clone(),
+                task_id: task_id.clone(),
+                openid: user.openid.clone(),
+                sop_name: sop_name.clone(),
+                user_message: req.content.clone(),
+            });
+            let minutes = (sop_meta.estimated_seconds + 59) / 60;
+            format!(
+                "已开始「{}」,预计 {} 分钟,可在右上角任务列表查看进度",
+                display_name_cn, minutes
+            )
+        };
+
+        // Persist chat turn so frontend onLoad can re-render
+        if let Err(e) = chat_history::record_turn(
+            &st.pool,
+            &user.openid,
+            &req.content,
+            &chat_response_text,
+        )
+        .await
+        {
+            tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
+        }
+
+        return Ok(Json(ChatResp {
+            response: chat_response_text,
+            model: Some("clawops-router".to_string()),
+            openid: user.openid,
+        }));
+    }
+
+    // ── Normal chat path (no SOP triggered) ───────────────────────
     let (response_text, model) = if !st.provisioner.backend.launches_daemon() {
         (format!("[mock] echo: {}", req.content), Some("mock".into()))
     } else {
         let port = user
             .port
             .ok_or_else(|| Error::Other(format!("user {} has no port assigned", user.openid)))?;
-        // /api/chat (full agent loop with tool execution); /webhook would
-        // bypass the agent loop and return raw <tool_call> XML.
         let url = format!("http://127.0.0.1:{port}/api/chat");
 
         let mut builder = st
             .http
             .post(&url)
-            // policy-match SOP can run 9-10 min end-to-end; the shared
-            // st.http timeout is 120s for general use, so override per
-            // /chat forward to match the mini-program wx.request timeout.
             .timeout(std::time::Duration::from_secs(900))
             .json(&serde_json::json!({"message": req.content}));
         if let Some(token) = &user.paired_token_enc {
@@ -442,9 +617,6 @@ async fn chat(
         (response_text, model)
     };
 
-    // Persist this turn (user + assistant) so the mini-program can
-    // re-render history on page load + scroll-back-load older messages.
-    // Non-fatal if the write fails — caller still gets the response.
     if let Err(e) =
         chat_history::record_turn(&st.pool, &user.openid, &req.content, &response_text).await
     {
@@ -456,6 +628,15 @@ async fn chat(
         model,
         openid: user.openid,
     }))
+}
+
+fn emit_sop_event(st: &AppState, task_id: &str, openid: &str, event: &str) {
+    let _ = st.sop_event_tx.send(serde_json::json!({
+        "type": "sop_task",
+        "task_id": task_id,
+        "event": event,
+        "openid": openid,
+    }));
 }
 
 #[derive(Deserialize)]
@@ -702,4 +883,90 @@ async fn admin_stop(
 ) -> std::result::Result<impl IntoResponse, Error> {
     st.provisioner.stop(&openid).await?;
     Ok(Json(serde_json::json!({"stopped": true, "openid": openid})))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// /me/sop/tasks — list current user's SOP tasks (30-day retention)
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SopTasksQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    sop_name: Option<String>,
+    #[serde(default = "default_sop_tasks_limit")]
+    limit: i64,
+}
+
+fn default_sop_tasks_limit() -> i64 {
+    50
+}
+
+#[derive(Serialize)]
+struct SopTaskView {
+    task_id: String,
+    sop_name: String,
+    sop_name_cn: String,
+    enterprise_name: Option<String>,
+    status: String,
+    deeplink: Option<String>,
+    error: Option<String>,
+    estimated_seconds: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Serialize)]
+struct SopTasksResp {
+    tasks: Vec<SopTaskView>,
+    total: i64,
+    has_more: bool,
+}
+
+async fn list_my_sop_tasks(
+    State(st): State<AppState>,
+    AuthOpenid(openid): AuthOpenid,
+    Query(q): Query<SopTasksQuery>,
+) -> std::result::Result<Json<SopTasksResp>, Error> {
+    let (rows, total) = sop_tasks::list_for_user(
+        &st.pool,
+        &openid,
+        q.status.as_deref(),
+        q.sop_name.as_deref(),
+        q.limit,
+    )
+    .await?;
+
+    let has_more = (rows.len() as i64) < total;
+
+    let tasks = rows
+        .into_iter()
+        .map(|t| {
+            let sop_name_cn = st
+                .cfg
+                .sop_metadata
+                .get(&t.sop_name)
+                .map(|m| m.display_name_cn.clone())
+                .unwrap_or_else(|| t.sop_name.clone());
+            SopTaskView {
+                task_id: t.task_id,
+                sop_name: t.sop_name,
+                sop_name_cn,
+                enterprise_name: t.enterprise_name,
+                status: t.status,
+                deeplink: t.deeplink,
+                error: t.error_message,
+                estimated_seconds: t.estimated_seconds,
+                created_at: t.created_at,
+                completed_at: t.completed_at,
+            }
+        })
+        .collect();
+
+    Ok(Json(SopTasksResp {
+        tasks,
+        total,
+        has_more,
+    }))
 }

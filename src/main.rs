@@ -2,12 +2,14 @@ use clap::{Parser, Subcommand};
 use clawops::auth::WxClient;
 use clawops::config::Config;
 use clawops::http::AppState;
-use clawops::provisioner::Provisioner;
+use clawops::intent_classifier::IntentClassifier;
 use clawops::limits::AppLimiters;
+use clawops::provisioner::Provisioner;
 use clawops::reaper::Reaper;
 use clawops::{db, http, process, users};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
@@ -100,6 +102,17 @@ async fn main() -> anyhow::Result<()> {
     let wx = Arc::new(WxClient::new(cfg.wx.clone(), http_client.clone()));
     let limiters = Arc::new(AppLimiters::new(&cfg.rate_limit));
 
+    // SOP task broadcast channel (capacity 256: subscribers see only
+    // events for their own openid after filter; bursts of all-user
+    // events still need room before slower SSE consumers catch up).
+    let (sop_event_tx, _) = broadcast::channel(256);
+
+    let intent_classifier = Arc::new(IntentClassifier::new(
+        cfg.intent_classifier.clone(),
+        cfg.sop_metadata.clone(),
+        http_client.clone(),
+    ));
+
     match cli.cmd {
         Cmd::Serve => {
             // Reaper runs alongside the HTTP server, sharing pool +
@@ -114,6 +127,8 @@ async fn main() -> anyhow::Result<()> {
                 http: http_client,
                 wx,
                 limiters,
+                sop_event_tx,
+                intent_classifier,
             };
             let app = http::router(state);
             let addr: std::net::SocketAddr =
