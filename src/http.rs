@@ -487,14 +487,17 @@ async fn chat(
         // an unverified hint and always ask the user to confirm/provide the full name.
         let db_user = users::get(&st.pool, &user.openid).await.ok().flatten();
 
+        // Only accept enterprise_profile.company_name if it looks like a full
+        // legal name (ends with 公司/集团 etc.). Abbreviated names fail step 1.
         let enterprise_name: Option<String> = db_user
             .as_ref()
             .and_then(|u| u.enterprise_profile.as_ref())
             .and_then(|s| serde_json::from_str::<JsonValue>(s).ok())
-            .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from));
+            .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from))
+            .filter(|n| looks_like_full_company_name(n));
 
-        // If no verified full name, ask user. We optionally surface the brain.db
-        // hint so the user can correct it ("我知道您叫XX，请提供全称").
+        // If no verified full name, ask user. Surface the brain.db hint (if any)
+        // so the user can correct it, but be explicit about needing the full name.
         if enterprise_name.is_none() {
             let linux_uid = db_user.as_ref().map(|u| u.linux_uid.as_str()).unwrap_or("");
             let memory_hint =
@@ -502,11 +505,11 @@ async fn chat(
 
             let prompt = match memory_hint {
                 Some(hint) => format!(
-                    "您好！我在记忆中找到企业名称「{}」，但政策匹配需要营业执照上的企业全称才能准确查询。\
+                    "您好！我在记忆中找到企业名称「{}」，但政策匹配需要营业执照上的完整企业全称（通常以「有限公司」结尾）才能准确查询。\
                      \n请提供完整的企业全称，我将立即为您发起匹配。",
                     hint
                 ),
-                None => "请提供您企业的全称（营业执照上的名称），我将为您发起政策匹配评测。".to_string(),
+                None => "请提供您企业的完整全称（营业执照上的名称，通常以「有限公司」结尾），我将为您发起政策匹配评测。".to_string(),
             };
             tracing::debug!(openid = %user.openid, "SOP triggered but no verified enterprise_name — asking user");
             if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &prompt).await {
@@ -653,6 +656,38 @@ async fn chat(
         chat_history::record_turn(&st.pool, &user.openid, &req.content, &response_text).await
     {
         tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
+    }
+
+    // Detect "silent SOP": zeroclaw used its conversation memory to run a SOP
+    // (e.g. user said "重新跑") even though clawops classified it as normal_chat.
+    // If the response contains a deeplink we retroactively create a done task so
+    // the frontend task list stays in sync.
+    let (deeplink, qid) = sop_runner::extract_deeplink_and_qid(&response_text);
+    if let Some(ref dl) = deeplink {
+        if let Some(sop_name) = sop_name_from_deeplink(dl, &st.cfg) {
+            let task_id = sop_tasks::new_task_id();
+            tracing::info!(
+                openid = %user.openid,
+                task_id = %task_id,
+                sop_name = %sop_name,
+                "silent SOP detected in normal_chat response — retroactively creating done task"
+            );
+            let _ = sop_tasks::insert_cached_done(
+                &st.pool,
+                &task_id,
+                &user.openid,
+                &sop_name,
+                None, // enterprise_name unknown at this point
+                None,
+                qid,
+                Some(dl.as_str()),
+                Some(&response_text),
+                0,
+            )
+            .await;
+            emit_sop_event(&st, &task_id, &user.openid, "created");
+            emit_sop_event(&st, &task_id, &user.openid, "done");
+        }
     }
 
     Ok(Json(ChatResp {
@@ -1035,4 +1070,25 @@ async fn read_enterprise_name_from_memory(
     .flatten();
     pool.close().await;
     result
+}
+
+/// Return true if `name` looks like a full Chinese company legal name.
+/// Abbreviated names (简称) typically lack these suffixes and are too short.
+fn looks_like_full_company_name(name: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "有限公司", "有限责任公司", "股份有限公司", "股份合作公司",
+        "集团有限公司", "集团股份有限公司", "合伙企业", "研究院", "研究所",
+    ];
+    let ch_count = name.chars().count();
+    ch_count >= 6 && SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// Map a deeplink path to a SOP name using the configured sop_metadata.
+/// For now we match /pages/recommendation/* → policy-match.
+fn sop_name_from_deeplink(deeplink: &str, cfg: &crate::config::Config) -> Option<String> {
+    if deeplink.contains("/recommendation/") && cfg.sop_metadata.contains_key("policy-match") {
+        Some("policy-match".to_string())
+    } else {
+        None
+    }
 }

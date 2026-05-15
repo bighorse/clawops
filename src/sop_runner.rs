@@ -165,7 +165,7 @@ fn user_visible(internal: &str) -> String {
     }
 }
 
-fn extract_deeplink_and_qid(text: &str) -> (Option<String>, Option<i64>) {
+pub(crate) fn extract_deeplink_and_qid(text: &str) -> (Option<String>, Option<i64>) {
     // Capture group 1: the path; group 2: id value
     let re = Regex::new(r"(/pages/[a-zA-Z0-9_/]+\?id=(\d+))").ok();
     let re = match re {
