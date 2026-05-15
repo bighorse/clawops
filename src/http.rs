@@ -460,6 +460,10 @@ async fn chat(
     let user = st.provisioner.ensure_running(&openid).await?;
     users::touch_active(&st.pool, &user.openid).await?;
 
+    // sop_started / sop_name extracted from zeroclaw response when a SOP was triggered.
+    let mut sop_started = false;
+    let mut sop_name_from_zc: Option<String> = None;
+
     let (response_text, model) = if !st.provisioner.backend.launches_daemon() {
         (format!("[mock] echo: {}", req.content), Some("mock".into()))
     } else {
@@ -488,6 +492,8 @@ async fn chat(
             )));
         }
         let body: serde_json::Value = resp.json().await?;
+        sop_started = body.get("sop_started").and_then(|v| v.as_bool()).unwrap_or(false);
+        sop_name_from_zc = body.get("sop_name").and_then(|v| v.as_str()).map(String::from);
         let response_text = body
             .get("response")
             .and_then(|v| v.as_str())
@@ -499,6 +505,66 @@ async fn chat(
             .map(|s| s.to_string());
         (response_text, model)
     };
+
+    // ── SOP post-processing ──────────────────────────────────────
+    // zeroclaw returned early because it triggered a SOP.
+    // (1) Validate enterprise name — if missing/abbreviated, override the
+    //     response with a prompt asking for the full legal name.
+    // (2) Translate the internal sop_name ("policy-match") to Chinese.
+    if sop_started {
+        if let Some(ref sop_name) = sop_name_from_zc {
+            let db_user = users::get(&st.pool, &user.openid).await.ok().flatten();
+            let enterprise_name: Option<String> = db_user
+                .as_ref()
+                .and_then(|u| u.enterprise_profile.as_ref())
+                .and_then(|s| serde_json::from_str::<JsonValue>(s).ok())
+                .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from))
+                .filter(|n| looks_like_full_company_name(n));
+
+            if enterprise_name.is_none() {
+                let linux_uid = db_user.as_ref().map(|u| u.linux_uid.as_str()).unwrap_or("");
+                let memory_hint =
+                    read_enterprise_name_from_memory(&st.cfg.zeroclaw.home_base, linux_uid).await;
+                let prompt = match memory_hint {
+                    Some(hint) => format!(
+                        "您好！我在记忆中找到企业名称「{}」，但政策匹配需要营业执照上的完整企业全称（通常以「有限公司」结尾）才能准确查询。\
+                         \n请提供完整的企业全称，我将立即为您发起匹配。",
+                        hint
+                    ),
+                    None => "请提供您企业的完整全称（营业执照上的名称，通常以「有限公司」结尾），我将为您发起政策匹配评测。".to_string(),
+                };
+                tracing::debug!(openid = %user.openid, sop_name = %sop_name,
+                    "SOP started but no verified enterprise_name — overriding response");
+                if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &prompt).await {
+                    tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
+                }
+                return Ok(Json(ChatResp {
+                    response: prompt,
+                    model: Some("clawops-router".to_string()),
+                    openid: user.openid,
+                }));
+            }
+
+            // Enterprise name valid — replace zeroclaw's internal-name message with Chinese.
+            let sop_meta = st.cfg.sop_metadata.get(sop_name.as_str());
+            let display_name = sop_meta
+                .map(|m| m.display_name_cn.as_str())
+                .unwrap_or(sop_name.as_str());
+            let minutes = sop_meta.map(|m| (m.estimated_seconds + 59) / 60).unwrap_or(9);
+            let chat_response = format!(
+                "已为您发起「{}」，预计 {} 分钟，可在右上角任务列表查看进度。",
+                display_name, minutes
+            );
+            if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &chat_response).await {
+                tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
+            }
+            return Ok(Json(ChatResp {
+                response: chat_response,
+                model,
+                openid: user.openid,
+            }));
+        }
+    }
 
     if let Err(e) =
         chat_history::record_turn(&st.pool, &user.openid, &req.content, &response_text).await
@@ -976,4 +1042,48 @@ async fn internal_sop_event(
             Ok(Json(serde_json::json!({"ok": false, "reason": "unknown event"})))
         }
     }
+}
+
+/// Read `user_profile_company_name` from the user's zeroclaw brain.db.
+/// Opens the DB read-only so we never contend with zeroclaw's writer.
+async fn read_enterprise_name_from_memory(
+    home_base: &std::path::Path,
+    linux_uid: &str,
+) -> Option<String> {
+    if linux_uid.is_empty() {
+        return None;
+    }
+    let db_path = home_base
+        .join(linux_uid)
+        .join(".zeroclaw/workspace/memory/brain.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .read_only(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .ok()?;
+    let result: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM memories WHERE key = 'user_profile_company_name' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten();
+    pool.close().await;
+    result
+}
+
+/// Return true if `name` looks like a full Chinese company legal name.
+fn looks_like_full_company_name(name: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "有限公司", "有限责任公司", "股份有限公司", "股份合作公司",
+        "集团有限公司", "集团股份有限公司", "合伙企业", "研究院", "研究所",
+    ];
+    let ch_count = name.chars().count();
+    ch_count >= 6 && SUFFIXES.iter().any(|s| name.ends_with(s))
 }
