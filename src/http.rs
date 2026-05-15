@@ -514,9 +514,12 @@ async fn chat(
     if sop_started {
         if let Some(ref sop_name) = sop_name_from_zc {
             let db_user = users::get(&st.pool, &user.openid).await.ok().flatten();
-            let linux_uid = db_user.as_ref().map(|u| u.linux_uid.as_str()).unwrap_or("").to_string();
 
-            // Three sources in priority order. Any one passing means we have a verified name.
+            // Two sources only. Memory (brain.db) is intentionally excluded: it holds the
+            // PREVIOUS company and would cause the SOP to run for the wrong company when the
+            // user switches ("换成拓尔思"). Only trust what's authoritative right now:
+            // 1. DB enterprise_profile set via the profile-update API
+            // 2. Full legal name explicitly typed in this message
             let from_db: Option<String> = db_user
                 .as_ref()
                 .and_then(|u| u.enterprise_profile.as_ref())
@@ -524,23 +527,13 @@ async fn chat(
                 .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from))
                 .filter(|n| looks_like_full_company_name(n));
 
-            // brain.db memory — only trusted when it already looks like a full legal name.
-            let from_memory: Option<String> = if from_db.is_none() {
-                read_enterprise_name_from_memory(&st.cfg.zeroclaw.home_base, &linux_uid)
-                    .await
-                    .filter(|n| looks_like_full_company_name(n))
-            } else {
-                None
-            };
-
-            // Current message — user may have typed their full name in this very turn.
-            let from_message: Option<String> = if from_db.is_none() && from_memory.is_none() {
+            let from_message: Option<String> = if from_db.is_none() {
                 extract_company_name_from_text(&req.content)
             } else {
                 None
             };
 
-            let enterprise_name = from_db.or(from_memory).or(from_message);
+            let enterprise_name = from_db.or(from_message);
 
             if enterprise_name.is_none() {
                 let prompt = "请提供您企业的完整全称（营业执照上的名称，通常以「有限公司」结尾），我将为您发起政策匹配评测。".to_string();
@@ -1062,39 +1055,6 @@ async fn internal_sop_event(
     }
 }
 
-/// Read `user_profile_company_name` from the user's zeroclaw brain.db.
-/// Opens the DB read-only so we never contend with zeroclaw's writer.
-async fn read_enterprise_name_from_memory(
-    home_base: &std::path::Path,
-    linux_uid: &str,
-) -> Option<String> {
-    if linux_uid.is_empty() {
-        return None;
-    }
-    let db_path = home_base
-        .join(linux_uid)
-        .join(".zeroclaw/workspace/memory/brain.db");
-    if !db_path.exists() {
-        return None;
-    }
-    let opts = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(&db_path)
-        .read_only(true);
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(opts)
-        .await
-        .ok()?;
-    let result: Option<String> = sqlx::query_scalar(
-        "SELECT content FROM memories WHERE key = 'user_profile_company_name' LIMIT 1",
-    )
-    .fetch_optional(&pool)
-    .await
-    .ok()
-    .flatten();
-    pool.close().await;
-    result
-}
 
 /// Return true if `name` looks like a full Chinese company legal name.
 fn looks_like_full_company_name(name: &str) -> bool {
