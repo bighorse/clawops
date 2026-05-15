@@ -1,464 +1,403 @@
-# SOP 异步任务模式 — 小程序前端对接 (2026-05-15)
+# SOP 异步任务模式 — 小程序前端对接 v2 (2026-05-15)
 
-> **替代说明**: 本文档替代 [policy-match-frontend-integration.md](policy-match-frontend-integration.md) 中的"长 HTTP 同步等待"模式。**新架构异步化**: HTTP 请求 5-10 秒内返回 task_id,任务在后台跑,前端通过 SSE + 状态查询取结果。
+> **v2 重写说明**: 采用"现有 `/chat` 入口 + 服务端识别 + 早返回 + SSE 推任务事件 + 独立任务列表 UI"流程。前端**不需要新 API 调用代码**,只需:
+> - 监听新增的 SSE 事件 (`sop_task_created` / `sop_task_done` / `sop_task_failed`)
+> - 加一个右上角任务列表组件 + 红点提醒
+> - `GET /me/sop/tasks` 拉列表数据
 >
-> **适用范围**: 所有 SOP — `policy-match` (政策匹配)、即将上线的 `qualification-check` (资质评估) 以及未来扩展的 SOP。统一接口 `POST /sop/{sop_name}/run`。
+> 替代 v1 的 `POST /sop/{sop_name}/run` 设计 (已废弃)。
+
+> **适用范围**: 所有 SOP — `policy-match` (政策匹配)、即将上线的 `qualification-check` (资质评估)、未来扩展 SOP。新增 SOP 时前端**零改动**(后端配置即可)。
 
 ---
 
-## 1. 为什么改成异步
+## 1. 整体流程
 
-旧同步模式痛点:
-- HTTP 挂 6-10 分钟,小程序进后台 = `wx.request` 被系统挂起 = 用户回来啥都没了
-- 退出小程序再进,SOP 状态丢失,只能从头再算
-- 一次匹配跑完要 0.2-0.5 元成本,重复触发烧钱
+```
+小程序                    clawops gateway                      daemon
+  │  POST /chat            │                                    │
+  │  body: {"message":...} │                                    │
+  │ ────────────────────►  │ 1. keyword regex 识别 sop_name      │
+  │                        │                                    │
+  │                        ├─ 不命中 ─→ 转发 daemon /api/chat ──►│ 几秒返回普通对话
+  │  ◄── 几秒返回 ────────│  ◄────── /api/chat response ──────  │
+  │                        │                                    │
+  │                        └─ 命中 sop_name(如 policy-match)    │
+  │                            │                                │
+  │                            ├─ 缓存命中(sop_name + enterprise_id, 7天内)
+  │                            │   INSERT sop_tasks status=done  │
+  │                            │   推 SSE sop_task_created + sop_task_done
+  │                            │   chat 返回:                    │
+  │                            │     "已为您找到上次政策匹配结果,│
+  │                            │      可在右上角任务列表查看"     │
+  │                            │                                │
+  │                            └─ 缓存未命中                     │
+  │                                INSERT sop_tasks status=running
+  │                                推 SSE sop_task_created       │
+  │                                spawn 后台 task ─────────────►│ daemon 跑 SOP 6 步 (~9 分钟)
+  │                                chat 立即返回:                │
+  │                                  "已开始政策匹配,预计 9 分钟,│
+  │                                   可在右上角任务列表查看"     │
+  │  ◄── 5-10 秒返回 ─────│                                    │
+  │                        │                                    │
+  │  ◄─── SSE sop_task_created ──── (前端右上角红点 +1)         │
+  │                        │                              ◄─── /api/chat response (9 分钟后)
+  │                        │ UPDATE sop_tasks status=done +     │
+  │                        │ result_json + deeplink             │
+  │  ◄─── SSE sop_task_done ─────── (前端右上角红点继续亮 + 列表 status=done)
+  │                        │                                    │
+  │  用户点右上角 → GET /me/sop/tasks                          │
+  │                        │ SELECT * FROM sop_tasks            │
+  │                        │ WHERE openid=? AND created_at > 30d ago
+  │  ◄── 任务列表 ────────│                                    │
+  │                        │                                    │
+  │  用户点 done 任务 → wx.navigateTo(task.deeplink)
+```
 
-异步模式解决:
-- 同企业 7 天内有结果 → 5 秒直出(缓存),不重复跑
-- 缓存 miss → 5-10 秒返回 task_id,后台跑;前端用 SSE 监听完成事件,**切后台/重进都能恢复**
-- 任务状态写库,服务器知道用户有正在跑的任务,重进时主动 catch up
+### 关键设计
+
+- **前端 `POST /chat` 调用方式不变**,只是 chat 响应在 SOP 命中场景下变成提示文案(不再挂 9 分钟)
+- **意图识别在 clawops 端用正则**(命中率 ~95%,漏识别时 chat 同步等 daemon 跑完——和当前生产一致,**不做兜底**)
+- **任务列表是独立 UI 组件**(右上角入口),不污染聊天历史
+- **聊天 history 只存提示文案 + 普通对话**,SOP 的实际结果在任务列表里看
+- **缓存命中也走任务流程**(任务瞬时 done),UX 统一
 
 ---
 
-## 2. API 速查
+## 2. 后端识别的关键词
 
-| 接口 | 方法 | 用途 |
+clawops 用以下正则匹配 user message,命中对应 SOP:
+
+| SOP | 正则(JS 等价) | 触发示例 |
 |---|---|---|
-| `/sop/{sop_name}/run` | POST | 启动 SOP(缓存 hit 直出 / miss 入队) |
-| `/sop/task/{task_id}` | GET | 查任务状态 + 结果 |
-| `/me/sop/tasks` | GET | 查当前用户进行中/完成的任务列表(重进聊天页用) |
-| `/events?token=...` | GET (SSE) | 实时事件流(任务完成信号) |
+| `policy-match` | `/政策\|匹配\|补贴\|申报\|适用/` | "帮我匹配下政策"、"看看有什么补贴"、"我能申报什么" |
+| `qualification-check` | `/资质\|评估\|认证\|高新\|专精特新/`(待上线) | "帮我评估下资质"、"我能申高新吗" |
 
-所有接口都需 `Authorization: Bearer <user-paired-token>`(沿用现有 wx.login → exchange 流程拿到的 token)。
+**漏识别风险**: 用户说话方式特殊(如"我们企业属于科技创新型,想找点扶持") 可能不命中 → chat 走同步,挂 9 分钟。这种情况罕见,**前端不需要兜底处理**(用户接受这种边缘 case)。
 
-### 2.1 `POST /sop/{sop_name}/run`
+> 前端无需在客户端做关键词匹配 — 服务端识别就够,前端只看 SSE 事件响应。
 
-启动一个 SOP。**`sop_name` 是 path 参数**,目前支持:
-- `policy-match` — 政策匹配
-- `qualification-check` — 资质评估(下一期上线)
+---
 
-```
-POST https://<clawops-gateway>/sop/policy-match/run
-Headers:
-  Authorization: Bearer <user-paired-token>
-  Content-Type: application/json
-Body:
-  {
-    "enterprise_name": "中拓产业云(北京)科技服务有限公司",  // 可选, 没传走 openid 关联的默认企业
-    "force_refresh": false   // 后端字段, 前端不暴露给用户。预留运维或后续"手动重算"按钮用。
-  }
-```
+## 3. SSE 事件 schema
 
-> **缓存命中策略**: 命中时**直接展示结果,不告知用户"这是缓存"**,UX 跟首次匹配一致(用户感知就是"5 秒拿到答案,很快")。`force_refresh` 字段后端仍接受,前端默认不暴露(后续如果要做"手动重算"按钮再加)。
+接现有 `/events?token=...` 长连接,新增 3 个事件类型:
 
-**响应分两种**:
+### 3.1 `sop_task_created`
 
-**Case A: 缓存命中**(7 天内同企业算过) — HTTP 200:
+任务创建时立即推送(缓存命中和未命中都推):
+
 ```json
 {
-  "status": "cached",
-  "task_id": "tsk_abc123",          // 历史任务的 id (可再通过 /sop/task/{id} 拿)
-  "result": {
-    "sop_name": "policy-match",
-    "response_text": "已为 **中拓产业云** 匹配 10 条适用政策...TOP 3:...→ [小程序政策匹配页](/pages/recommendation/index?id=100)",
-    "deeplink": "/pages/recommendation/index?id=100",
-    "qualification_enterprise_id": 100,
-    "enterprise_id": 28
-  },
-  "cached_at": "2026-05-14T16:30:00Z"
-}
-```
-- 前端直接 `displayMessage(result.response_text)`,不需要 loading。
-- 拦截 markdown link 跳 `wx.navigateTo({ url: result.deeplink })`。
-
-**Case B: 缓存 miss**(新任务入队) — HTTP 202:
-```json
-{
-  "status": "queued",
-  "task_id": "tsk_def456",
+  "type": "sop_task_created",
+  "task_id": "tsk_abc123",
   "sop_name": "policy-match",
-  "estimated_seconds": 540,   // 预估总耗时(政策匹配 ~9 分钟,资质评估 ~3 分钟)
-  "queued_at": "2026-05-15T08:00:00Z"
+  "sop_name_cn": "政策匹配",
+  "enterprise_name": "中拓产业云(北京)科技服务有限公司",
+  "status": "running",                  // running / done(缓存命中时)
+  "estimated_seconds": 540,             // 预计时长,running 时有效
+  "created_at": "2026-05-15T08:00:00Z"
 }
 ```
-- 前端**记住 `task_id`**(本地变量 + 持久化到 wx.setStorage,key 例如 `sop_active_task_<sop_name>`)。
-- 切到 long-loading UI(详见 §3)。
-- 监听 SSE 等 `agent_end` 事件。
 
-### 2.2 `GET /sop/task/{task_id}`
+前端应:
+- 右上角红点 +1
+- 任务列表(如果当前展开)插入一条记录
 
-任意时刻查询任务进度。
+### 3.2 `sop_task_done`
+
+任务完成(daemon SOP 跑完 + 后端写完库):
+
+```json
+{
+  "type": "sop_task_done",
+  "task_id": "tsk_abc123",
+  "sop_name": "policy-match",
+  "sop_name_cn": "政策匹配",
+  "status": "done",
+  "deeplink": "/pages/recommendation/index?id=100",
+  "completed_at": "2026-05-15T08:09:00Z"
+}
+```
+
+前端应:
+- 任务列表对应条目 status 改 `done`
+- 红点保持(直到用户打开列表查看)
+
+### 3.3 `sop_task_failed`
+
+任务失败(daemon 报错/超时):
+
+```json
+{
+  "type": "sop_task_failed",
+  "task_id": "tsk_abc123",
+  "sop_name": "policy-match",
+  "sop_name_cn": "政策匹配",
+  "status": "failed",
+  "error": "服务繁忙,请稍后重试",      // 人类可读
+  "completed_at": "2026-05-15T08:05:00Z"
+}
+```
+
+前端应:
+- 任务列表对应条目改 `failed` + 显示 error 文案
+- 红点保持
+
+### 3.4 现有事件(可保留监听,但本流程不依赖)
+
+`/events` 仍推送 daemon 内部事件:`tool_call_start` / `tool_call` / `agent_start` / `agent_end` / `llm_request` 等。**前端可以忽略这些**,只看 sop_task_* 三种就够了。
+
+---
+
+## 4. `GET /me/sop/tasks`
+
+用户点右上角任务列表时调,拉 30 天内任务。
 
 ```
-GET https://<clawops-gateway>/sop/task/tsk_def456
+GET https://<clawops-gateway>/me/sop/tasks?limit=50
 Headers: Authorization: Bearer <user-paired-token>
 ```
 
-响应:
-```json
-{
-  "task_id": "tsk_def456",
-  "sop_name": "policy-match",
-  "status": "running",          // pending | running | done | failed
-  "result": null,               // status=done 时含 result 对象,同 §2.1 Case A 的 result
-  "error": null,                // status=failed 时含人类可读错误
-  "enterprise_id": 28,
-  "qualification_enterprise_id": 100,
-  "created_at": "2026-05-15T08:00:00Z",
-  "updated_at": "2026-05-15T08:03:14Z"
-}
-```
-
-**前端调用时机**:
-1. SSE 收到 `agent_end` → 立即调一次,看 status 是 done/failed/running
-2. 切后台返回(`onShow`)→ 调一次 catch up
-3. 重进聊天页 → 先 GET `/me/sop/tasks?status=running`,如有,接着 GET `/sop/task/{id}` 拿状态
-
-### 2.3 `GET /me/sop/tasks`
-
-列当前用户的任务历史,可按 status / sop_name 过滤。
-
-```
-GET https://<clawops-gateway>/me/sop/tasks?status=running&limit=10
-GET https://<clawops-gateway>/me/sop/tasks?sop_name=policy-match&limit=20
-```
+可选 query:
+- `status=running|done|failed` — 按状态过滤
+- `sop_name=policy-match` — 按 SOP 类型过滤
+- `limit=50` — 默认 50,最大 200
 
 响应:
+
 ```json
 {
   "tasks": [
     {
-      "task_id": "tsk_def456",
+      "task_id": "tsk_abc123",
       "sop_name": "policy-match",
-      "status": "running",
+      "sop_name_cn": "政策匹配",
+      "enterprise_name": "中拓产业云(北京)科技服务有限公司",
+      "status": "done",
+      "deeplink": "/pages/recommendation/index?id=100",    // status=done 时存在
+      "error": null,                                        // status=failed 时存在
+      "estimated_seconds": 540,                            // status=running 时展示用
       "created_at": "2026-05-15T08:00:00Z",
-      "updated_at": "2026-05-15T08:03:14Z"
+      "completed_at": "2026-05-15T08:09:00Z"               // done/failed 时存在,running 时 null
     }
-  ]
+  ],
+  "total": 23,    // 30 天内任务总数
+  "has_more": false
 }
 ```
 
-**进聊天页(`onLoad`/`onShow`)时调一次**,如果有 `status=running` 的任务,直接恢复 loading UI + 监听 SSE / 轮询。
-
-### 2.4 `GET /events?token=...` (SSE,沿用)
-
-前端在聊天页 onLoad 时建立 SSE 长连接(用 `wx.request` + `enableChunked: true`),监听这些事件:
-
-| event.type | 用途 |
-|---|---|
-| `tool_call_start` + `tool="sop_execute"` | LLM 已识别 SOP 意图并启动(可显示"政策匹配中...") |
-| `agent_end` | 一次 daemon chat 跑完(可能是 SOP done,也可能是 SOP 中间某步完成的提示) |
-| `error` | daemon 端报错 |
-
-**收到 `agent_end` 后**: 调 `GET /sop/task/{active_task_id}` 看真实 status。**SSE 自己不带 result**(避免 SSE payload 暴露大数据,且 task 表是 source of truth)。
-
-> 详细 SSE 接入方法(`wx.request` chunked + 重连)见 [policy-match-frontend-integration.md §4](policy-match-frontend-integration.md) §"前端实现 1. 聊天页 onLoad 时建 SSE 长连接",代码逻辑不变,只是接入语义升级。
+**保留期限**: **30 天**,超过自动从 `/me/sop/tasks` 过滤掉(后端 reaper 不立即删除数据,只是不返回)。
 
 ---
 
-## 3. 前端状态机(支持多 SOP 并发)
+## 5. `POST /chat` 行为说明
 
-前端维护**多个 active task**(允许并发,例:用户同时触发"政策匹配 A 公司" + "资质评估 A 公司",或者"政策匹配 A" + "政策匹配 B")。每个 task 独立状态机。
+前端调用方式**不变**:
 
 ```
-              ┌── active tasks (Map: task_id → {sop_name, enterprise_name}) ──┐
-              │                                                                │
-[idle]        │   user 发触发 SOP 的消息(政策匹配/资质评估等)                  │
-  │           │                                                                │
-  ▼           │                                                                │
-POST /sop/X/run                                                                │
-  │           │                                                                │
-  ├── 200 status="cached" ─→ displayMessage(result.response_text) → [idle]    │
-  │                          (不进 active tasks Map)                            │
-  │                                                                            │
-  └── 202 status="queued" + task_id                                            │
-       │ activeTasks.set(task_id, {sop_name, enterprise_name})                 │
-       │ showLongLoadingBubble(sop_name, estimated_seconds)                    │
-       ▼                                                                       │
-   [waiting] (per task,多个 task 并行存在)                                     │
-       │                                                                       │
-       ├─ SSE event: agent_end                                                 │
-       │   → 遍历 activeTasks,每个调 GET /sop/task/{id}                        │
-       │       ├── done    → displayMessage + activeTasks.delete(id)           │
-       │       ├── failed  → showError + activeTasks.delete(id)                │
-       │       └── running → 保留在 activeTasks                                │
-       │                                                                       │
-       ├─ onShow (从后台回到前台)                                                │
-       │   → 遍历 activeTasks,逐个 GET /sop/task/{id} catch up                  │
-       │                                                                       │
-       └─ onLoad (重新进聊天页)                                                 │
-           → GET /me/sop/tasks?status=running&limit=20                         │
-              → 把所有 running task 灌进 activeTasks Map,每个进 [waiting]       │
-                                                                                │
+POST https://<clawops-gateway>/chat
+Headers:
+  Authorization: Bearer <user-paired-token>
+  Content-Type: application/json
+Body:
+  { "message": "帮我匹配下政策", "openid": "..." }
 ```
 
-### 关键细节
+响应内容根据场景变化(`response` 字段):
 
-- **多 SOP 并发**: 同一聊天会话允许多个 task 并存。例:用户先问"政策匹配",几秒后再问"帮我评估资质" — 两个任务并行跑,UI 上两个 loading bubble 同时展示(标注 SOP 类型)。
-- **同 SOP + 同企业去重(可选)**: 后端 `POST /sop/X/run` 会检查"该用户是否有同 (sop_name, enterprise_id) 的 running task" — 有则直接返回那个现存 task_id(不重复入队)。前端可以不做客户端限制,完全相信后端去重。
-- **active tasks 持久化**: 用 `wx.setStorageSync('sop_active_tasks', [...])` 存数组(每项是 `{task_id, sop_name, enterprise_name}`),跨页面跳转能恢复。但 source of truth 是服务端 `GET /me/sop/tasks` — onLoad 时**以服务端结果为准**重建 Map(本地缓存只作秒级恢复用)。
-- **进度提示**: 推荐展示"正在分析企业画像 → 匹配政策 → 评估条件"占位文案(每 30-60s 切换一次),按 sop_name 分别给不同文案。daemon 不发细粒度进度。
-- **轮询兜底(可选)**: SSE 断网恢复期间,前端可以每 30 秒主动遍历 activeTasks 调 `/sop/task/{task_id}` 作为兜底。
-- **缓存命中不占 active task 槽位**: Case A 直接 displayMessage,不进 Map,不耗 loading 资源。
+| 场景 | 响应文案 | HTTP 耗时 |
+|---|---|---|
+| 普通对话(未命中关键词) | LLM 自然回复 | 几秒(daemon 同步) |
+| SOP 缓存命中 | "已为您找到上次**政策匹配**结果,可在右上角任务列表查看" | < 200ms |
+| SOP 新任务入队 | "已开始**政策匹配**,预计 9 分钟,可在右上角任务列表查看" | 1-2s(写库 + spawn) |
+| 漏识别 SOP(罕见) | LLM 自然回复或同步等 9 分钟 | 几秒到 9 分钟 |
+
+前端**不需要解析 response 内容**——SSE 的 `sop_task_*` 事件才是 single source of truth。`response` 文案只是用户在聊天里能直接看到的提示。
 
 ---
 
-## 4. 完整示例代码 (微信小程序)
+## 6. 前端集成
+
+### 6.1 SSE 监听代码示例
 
 ```javascript
-// chat-page.js
-const API = 'https://<clawops-gateway>';
-let pairedToken = '';
-// active tasks 是 Map: task_id → {sop_name, enterprise_name, bubble_index}
-// 支持多 SOP 并发(e.g., policy-match A 公司 + qualification-check A 公司同时跑)
-const activeTasks = new Map();
+const SOP_NAME_CN = {
+  'policy-match': '政策匹配',
+  'qualification-check': '资质评估',
+  // 新 SOP 上线时加一行,但实际后端会推 sop_name_cn 字段,这里只作 fallback
+};
+
 let sseTask = null;
 
-const SOP_LOADING_TEXT = {
-  'policy-match': '政策顾问正在为您匹配适用政策...',
-  'qualification-check': '资质评估师正在评估企业资质...',
-};
-const SOP_ESTIMATED_SECONDS = {
-  'policy-match': 540,
-  'qualification-check': 180,
-};
+function connectSSE(pairedToken) {
+  sseTask = wx.request({
+    url: `${API}/events?token=${pairedToken}`,
+    method: 'GET',
+    enableChunked: true,
+  });
 
-Page({
-  data: { messages: [] },
+  let buffer = '';
+  sseTask.onChunkReceived(res => {
+    buffer += new TextDecoder().decode(new Uint8Array(res.data));
+    const frames = buffer.split('\n\n');
+    buffer = frames.pop();
 
-  onLoad() {
-    pairedToken = wx.getStorageSync('paired_token');
-    this.recoverActiveTasks();
-    this.connectSSE();
-  },
-
-  onShow() {
-    // 从后台回来,遍历所有 active tasks catch up
-    this.catchUpAllActiveTasks();
-  },
-
-  onUnload() {
-    if (sseTask) sseTask.abort();
-  },
-
-  // ────── 1. 启动 SOP ──────
-  async sendMessage(userInput) {
-    const sopName = this.detectSopFromInput(userInput);
-    if (!sopName) {
-      // 普通 chat,走 /chat (本文档外)
-      return this.sendNormalChat(userInput);
-    }
-    // 注意:不在客户端阻止"同 sop_name 双开" — 后端按 (sop_name, enterprise_id)
-    // 自动去重(返回已存在的 task_id),前端无需做客户端限制。多 SOP 并发也允许。
-
-    const enterpriseName = this.data.enterpriseName;
-    wx.request({
-      url: `${API}/sop/${sopName}/run`,
-      method: 'POST',
-      header: { 'Authorization': `Bearer ${pairedToken}` },
-      data: { enterprise_name: enterpriseName },
-      timeout: 30000,
-      success: (res) => {
-        if (res.statusCode === 200 && res.data.status === 'cached') {
-          // 缓存命中,直接展示(不进 activeTasks Map,不占 loading 槽位)
-          this.displayResult(res.data.result);
-        } else if (res.statusCode === 202 && res.data.status === 'queued') {
-          // 入队 — 添加到 activeTasks
-          const bubbleIdx = this.showLongLoadingBubble(sopName, res.data.task_id, res.data.estimated_seconds);
-          activeTasks.set(res.data.task_id, {
-            sop_name: sopName,
-            enterprise_name: enterpriseName,
-            bubble_index: bubbleIdx,
-          });
-          this.persistActiveTasks();
-        }
-      },
-      fail: (err) => {
-        wx.showToast({ title: '请求失败,请重试', icon: 'error' });
-      }
-    });
-  },
-
-  // ────── 2. SSE 监听任务完成 ──────
-  connectSSE() {
-    sseTask = wx.request({
-      url: `${API}/events?token=${pairedToken}`,
-      method: 'GET',
-      enableChunked: true,
-    });
-    let buffer = '';
-    sseTask.onChunkReceived(res => {
-      buffer += new TextDecoder().decode(new Uint8Array(res.data));
-      const frames = buffer.split('\n\n');
-      buffer = frames.pop();
-      for (const frame of frames) {
-        const m = frame.match(/^data:\s*(.+)$/m);
-        if (!m) continue;
-        try {
-          const ev = JSON.parse(m[1]);
-          if (ev.type === 'agent_end' && activeTasks.size > 0) {
-            // 一次 daemon chat 跑完 — 不知道是哪个 task,遍历所有 active 都查一遍
-            this.catchUpAllActiveTasks();
-          }
-        } catch(e) {}
-      }
-    });
-  },
-
-  // ────── 3. 遍历所有 active tasks 查状态 ──────
-  catchUpAllActiveTasks() {
-    for (const [taskId, info] of activeTasks.entries()) {
-      wx.request({
-        url: `${API}/sop/task/${taskId}`,
-        header: { 'Authorization': `Bearer ${pairedToken}` },
-        success: (res) => {
-          const task = res.data;
-          if (task.status === 'done') {
-            this.replaceBubble(info.bubble_index, task.result.response_text);
-            activeTasks.delete(taskId);
-            this.persistActiveTasks();
-          } else if (task.status === 'failed') {
-            this.replaceBubble(info.bubble_index, `${SOP_LOADING_TEXT[info.sop_name].split('正')[0]}失败:${task.error}`);
-            activeTasks.delete(taskId);
-            this.persistActiveTasks();
-          }
-          // running: 保留在 Map
-        }
-      });
-    }
-  },
-
-  // ────── 4. 进页面时恢复所有活跃任务 ──────
-  recoverActiveTasks() {
-    // 先从本地存储恢复(秒级 UI)
-    const cached = wx.getStorageSync('sop_active_tasks') || [];
-    cached.forEach(t => {
-      const bubbleIdx = this.showLongLoadingBubble(t.sop_name, t.task_id);
-      activeTasks.set(t.task_id, { ...t, bubble_index: bubbleIdx });
-    });
-    // 再从服务端取 source of truth,override 本地缓存
-    wx.request({
-      url: `${API}/me/sop/tasks?status=running&limit=20`,
-      header: { 'Authorization': `Bearer ${pairedToken}` },
-      success: (res) => {
-        const serverTasks = res.data.tasks || [];
-        // 清理本地不在服务端的 stale task
-        for (const taskId of activeTasks.keys()) {
-          if (!serverTasks.find(t => t.task_id === taskId)) {
-            activeTasks.delete(taskId);
-          }
-        }
-        // 添加服务端有但本地没有的 task
-        serverTasks.forEach(t => {
-          if (!activeTasks.has(t.task_id)) {
-            const bubbleIdx = this.showLongLoadingBubble(t.sop_name, t.task_id);
-            activeTasks.set(t.task_id, {
-              sop_name: t.sop_name,
-              bubble_index: bubbleIdx,
+    for (const frame of frames) {
+      const m = frame.match(/^data:\s*(.+)$/m);
+      if (!m) continue;
+      try {
+        const ev = JSON.parse(m[1]);
+        switch (ev.type) {
+          case 'sop_task_created':
+            taskStore.add({
+              task_id: ev.task_id,
+              sop_name: ev.sop_name,
+              sop_name_cn: ev.sop_name_cn,
+              enterprise_name: ev.enterprise_name,
+              status: ev.status,
+              estimated_seconds: ev.estimated_seconds,
+              created_at: ev.created_at,
             });
-          }
-        });
-        this.persistActiveTasks();
-      }
-    });
-  },
+            updateRedDot(); // 红点 +1
+            break;
 
-  // ────── helpers ──────
-  detectSopFromInput(input) {
-    if (/政策|匹配|补贴|申报/.test(input)) return 'policy-match';
-    if (/资质|评估|认证|高新|专精特新/.test(input)) return 'qualification-check';
-    return null;
-  },
+          case 'sop_task_done':
+            taskStore.update(ev.task_id, {
+              status: 'done',
+              deeplink: ev.deeplink,
+              completed_at: ev.completed_at,
+            });
+            // 红点保持亮,用户点开列表后才清除
+            break;
 
-  persistActiveTasks() {
-    const arr = Array.from(activeTasks.entries()).map(([id, info]) => ({
-      task_id: id,
-      sop_name: info.sop_name,
-      enterprise_name: info.enterprise_name,
-    }));
-    wx.setStorageSync('sop_active_tasks', arr);
-  },
-
-  showLongLoadingBubble(sopName, taskId, estimatedSeconds) {
-    const seconds = estimatedSeconds || SOP_ESTIMATED_SECONDS[sopName] || 300;
-    const text = `${SOP_LOADING_TEXT[sopName] || '正在处理'}(预计 ${Math.ceil(seconds / 60)} 分钟)`;
-    const msg = { role: 'assistant', text, loading: true, task_id: taskId };
-    const messages = this.data.messages.concat([msg]);
-    this.setData({ messages });
-    return messages.length - 1;
-  },
-
-  replaceBubble(index, newText) {
-    const messages = [...this.data.messages];
-    messages[index] = { ...messages[index], text: newText, loading: false };
-    this.setData({ messages });
-  },
-
-  displayResult(result) {
-    this.appendMessage({ role: 'assistant', text: result.response_text });
-    // 链接拦截:用户点 result.deeplink → wx.navigateTo
-  },
-
-  appendMessage(msg) {
-    this.setData({ messages: this.data.messages.concat([msg]) });
-  },
-});
+          case 'sop_task_failed':
+            taskStore.update(ev.task_id, {
+              status: 'failed',
+              error: ev.error,
+              completed_at: ev.completed_at,
+            });
+            break;
+        }
+      } catch(e) {}
+    }
+  });
+}
 ```
 
-> **并发 UI 提示**: 多个 task 同时在跑时,聊天列表会显示**多个 loading bubble**(各带 sop_name 文案)。完成后**按 bubble_index 原地替换**为真实 result,不会乱序。
+### 6.2 进入页面时拉历史任务
+
+```javascript
+async function loadTasks() {
+  const res = await wxRequest({
+    url: `${API}/me/sop/tasks?limit=50`,
+    header: { 'Authorization': `Bearer ${pairedToken}` },
+  });
+  taskStore.replaceAll(res.tasks);
+  updateRedDot();
+}
+```
+
+### 6.3 右上角任务列表 UI 建议
+
+#### 红点提醒
+
+- 有 `status=running` 的任务 → 红点常亮(进行中提示)
+- 有 `status=done` 但用户未查看的任务 → 红点常亮(新结果提示)
+- 用户打开任务列表 → 标记所有 done 任务为"已查看"(本地状态,可用 wx.setStorageSync 存 viewed_task_ids 数组)→ 红点消失(如果没 running)
+
+#### 任务列表展示(抽屉/弹窗)
+
+```
+┌───────────────────────────────┐
+│  任务列表                ✕    │
+├───────────────────────────────┤
+│ 🟢 政策匹配 — 已完成          │
+│    中拓产业云(北京)...        │
+│    2026-05-15 16:09           │
+│    [查看结果]  ← 点击跳 deeplink
+├───────────────────────────────┤
+│ ⏳ 政策匹配 — 进行中(剩 4 分钟) │
+│    华为技术                    │
+│    2026-05-15 17:00           │
+│    (点击 → toast"还在跑")     │
+├───────────────────────────────┤
+│ ❌ 资质评估 — 失败             │
+│    某公司                      │
+│    服务繁忙,请稍后重试         │
+│    2026-05-14 10:00           │
+└───────────────────────────────┘
+```
+
+字段:
+- 状态 icon + sop_name_cn + 状态文字
+- 企业名(辅助识别)
+- 时间戳(created_at,done 时显示 completed_at)
+- done 时:"查看结果"按钮(`wx.navigateTo({ url: task.deeplink })`)
+- running 时:点击显示"还在跑"toast(可选展示剩余预估时间)
+- failed 时:展示 error 文案,点击 toast"请重试"
+
+#### 进度条(可选优化)
+
+running 状态可以根据 `created_at + estimated_seconds` 算预计完成时间 → 显示倒计时(纯前端计算,不依赖后端推进度)。daemon 实际可能比 eta 快或慢,但用户感知更好。
 
 ---
 
-## 5. 错误处理
+## 7. 扩展到新 SOP
+
+后端添加新 SOP(如 `qualification-check`)只需:
+
+1. 在 `templates/workspace/sops/qualification-check/SOP.md.hbs` 创建 SOP 模板
+2. clawops.toml 加 SOP 元数据:
+   ```toml
+   [sop_metadata."qualification-check"]
+   display_name_cn = "资质评估"
+   estimated_seconds = 180
+   keyword_regex = "资质|评估|认证|高新|专精特新"
+   ```
+3. clawops 启动时 load metadata,识别用户消息 + 推 SSE 时填 `sop_name_cn`
+
+**前端零改动** — SSE 推过来的 `sop_name_cn` 字段直接展示,`deeplink` 字段直接 `wx.navigateTo`。
+新增的 sop_name 在 `taskStore` 自动适配。
+
+---
+
+## 8. 与现有 `/chat` 的兼容性
+
+- 当前生产仍跑同步 9 分钟模式(`/chat` 阻塞等 SOP 跑完)
+- 异步模式上线后,**前端按本文档接入**(主要工作:加 SSE 处理 + 任务列表 UI),老的 `/chat` 同步等待逻辑可以删除
+- 普通对话(非 SOP)仍走 `/chat`,行为不变(几秒返回)
+- 历史对话(已完成的 SOP)不在新的 `sop_tasks` 表里,但**没必要回填** — 用户重发"匹配政策"触发新任务即可(7 天缓存生效,实际不会重跑)
+
+---
+
+## 9. 错误处理
 
 | 现象 | 原因 | 前端处理 |
 |---|---|---|
-| `POST /sop/X/run` 返回 5xx | clawops 服务异常 | 提示"服务暂时不可用",30 秒后允许重试 |
-| `GET /sop/task/{id}` 一直返回 `running` 超过 15 分钟 | daemon hang | 提示"任务超时,请重试" + 调 `DELETE /sop/task/{id}` (后端实现) 主动取消 |
-| `status=failed` 错误为 "All providers/models failed" | LLM 服务侧抖动 | 提示"服务繁忙,请稍后重试" |
-| `status=failed` 错误含 "enterprise_name" | 企业未注册 | 提示"未找到企业,请补全企业资料" + 引导小程序企业页 |
-| SSE 连接断 | 网络/微信冻结 | onShow 重连 + 主动调 `/sop/task/{id}` catch up |
+| 任务一直 `running` 超过 15 分钟 | daemon hang | 不主动处理,等服务端 reaper 标记 failed → 推 sop_task_failed |
+| 漏识别 SOP `POST /chat` 同步挂 9 分钟 | clawops keyword 没匹配 | 同当前生产,接受;用户体验降级 |
+| SSE 断连 | 网络/微信冻结 | onShow 重连 + 调 `GET /me/sop/tasks` catch up |
+| `GET /me/sop/tasks` 5xx | clawops 异常 | 重试 3 次,失败展示"任务列表加载失败" |
 
 ---
 
-## 6. 扩展到新 SOP
+## 10. 上线时间表
 
-未来添加资质评估、规模评估、补贴申请等 SOP,前端 **无需改 API 调用代码**,只需:
+| 阶段 | 工作 | 工期 |
+|---|---|---|
+| 1. 后端实现 | clawops 加 sop_tasks 表 + `/chat` 识别分流 + 后台 spawn + `/me/sop/tasks` endpoint + SSE 事件 generator | 1.5 人天 |
+| 2. 前端实现 | SSE 监听 + 任务列表组件 + 红点 + 跳转 | 1-2 人天 |
+| 3. 联调 | 端到端测试 | 0.5 天 |
+| 4. 灰度 | 切 1 个测试号,观察 1 天 | 1 天 |
+| 5. 全量 | 11 个生产号切换 | 半天 |
 
-1. **在 `detectSopFromInput()` 加关键词分支** — 识别用户意图触发哪个 sop_name
-2. **(可选) 加 sop_name → estimated_seconds 映射** — 不同 SOP 预估时长不同(policy-match 9 分钟,qualification-check 3 分钟)
-3. **(可选) 加 sop_name → result 渲染逻辑** — 各 SOP 的 result schema 大致一致(都含 response_text + deeplink),如有特殊字段需要前端额外渲染时再细分
-
-`POST /sop/{sop_name}/run` + `GET /sop/task/{id}` 完全通用,后端按 sop_name 路由到对应 daemon SOP。
-
----
-
-## 7. 后端实现状态 + 上线时间
-
-**当前状态**: 设计中。生产仍跑同步模式(`POST /chat` 9 分钟挂),按 [policy-match-frontend-integration.md](policy-match-frontend-integration.md) 旧版接入。
-
-**预计上线**: 后端 1-1.5 人天工作量(clawops 加 `sop_tasks` 表 + 异步任务 spawn + 缓存逻辑)。
-
-**联调路径**:
-1. 后端先上 `POST /sop/policy-match/run` + `GET /sop/task/{id}`(MVP, 仅 policy-match)
-2. 前端在测试环境完成接入 + 状态机
-3. 切生产
-4. 资质 SOP 上线时,前端只加意图关键词,接口零改动
-
----
-
-## 8. 兼容性说明
-
-- 切到异步模式后,**老的同步 `POST /chat` 接口保留**(不立即废弃)— 普通对话(非 SOP)仍走 `/chat`,只有触发 SOP 的消息走新 `/sop/X/run` endpoint
-- 后端 `detectSopFromInput()` 等价的服务端意图识别**也保留**(为了 `/chat` 用户直接发"匹配政策"也能识别) — 但建议前端**主动**用关键词预判走 `/sop/X/run`,理由:
-  1. 走 `/sop/X/run` 才能享受缓存
-  2. 走 `/chat` 触发的 SOP 还是同步等 9 分钟(因为 daemon 端逻辑没变)
-  3. 前端关键词宽松匹配(宁可多识别),命中率比 LLM-based 服务端识别还高
+**总计 ~5 个工作日**。
 
 ---
 
 ## 相关文档
 
 - [policy-match-frontend-integration.md](policy-match-frontend-integration.md) — 旧同步模式(SSE 接入代码可复用)
-- [policy-match-api-contract.md](policy-match-api-contract.md) — 后端政策匹配接口契约(daemon 调的下游 API,不在本文档范围)
-- 后端架构设计(待补): `async-sop-architecture.md`
+- [policy-match-api-contract.md](policy-match-api-contract.md) — 后端政策匹配下游 API 契约
+- 后端实现 plan(待补): `async-sop-backend-implementation.md`
