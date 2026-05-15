@@ -45,9 +45,11 @@ Headers:
 Body:
   {
     "enterprise_name": "中拓产业云(北京)科技服务有限公司",  // 可选, 没传走 openid 关联的默认企业
-    "force_refresh": false   // 可选, true 时跳过缓存强制重算
+    "force_refresh": false   // 后端字段, 前端不暴露给用户。预留运维或后续"手动重算"按钮用。
   }
 ```
+
+> **缓存命中策略**: 命中时**直接展示结果,不告知用户"这是缓存"**,UX 跟首次匹配一致(用户感知就是"5 秒拿到答案,很快")。`force_refresh` 字段后端仍接受,前端默认不暴露(后续如果要做"手动重算"按钮再加)。
 
 **响应分两种**:
 
@@ -154,43 +156,50 @@ GET https://<clawops-gateway>/me/sop/tasks?sop_name=policy-match&limit=20
 
 ---
 
-## 3. 前端状态机
+## 3. 前端状态机(支持多 SOP 并发)
+
+前端维护**多个 active task**(允许并发,例:用户同时触发"政策匹配 A 公司" + "资质评估 A 公司",或者"政策匹配 A" + "政策匹配 B")。每个 task 独立状态机。
 
 ```
-[idle]
-  │ user 在聊天框发"匹配政策"消息
-  ▼
-POST /sop/policy-match/run
-  │
-  ├──── 200 status="cached" ─→ displayMessage(result.response_text) → [idle]
-  │
-  └──── 202 status="queued" + task_id
-       │ wx.setStorage("sop_active_task_policy-match", task_id)
-       │ switchToLongLoadingUI()
-       ▼
-   [waiting]
-       │
-       ├─ SSE event: agent_end
-       │   → GET /sop/task/{task_id}
-       │       ├── done    → displayMessage(result.response_text) + wx.removeStorageSync → [idle]
-       │       ├── failed  → showError(error) + wx.removeStorageSync → [idle]
-       │       └── running → 继续 [waiting]
-       │
-       ├─ onShow (从后台回到前台)
-       │   → GET /sop/task/{task_id} 同上分支处理
-       │
-       └─ onLoad (重新进聊天页)
-           → GET /me/sop/tasks?status=running
-              ├── 有 → 取最新 task_id 进入 [waiting]
-              └── 无 → [idle]
+              ┌── active tasks (Map: task_id → {sop_name, enterprise_name}) ──┐
+              │                                                                │
+[idle]        │   user 发触发 SOP 的消息(政策匹配/资质评估等)                  │
+  │           │                                                                │
+  ▼           │                                                                │
+POST /sop/X/run                                                                │
+  │           │                                                                │
+  ├── 200 status="cached" ─→ displayMessage(result.response_text) → [idle]    │
+  │                          (不进 active tasks Map)                            │
+  │                                                                            │
+  └── 202 status="queued" + task_id                                            │
+       │ activeTasks.set(task_id, {sop_name, enterprise_name})                 │
+       │ showLongLoadingBubble(sop_name, estimated_seconds)                    │
+       ▼                                                                       │
+   [waiting] (per task,多个 task 并行存在)                                     │
+       │                                                                       │
+       ├─ SSE event: agent_end                                                 │
+       │   → 遍历 activeTasks,每个调 GET /sop/task/{id}                        │
+       │       ├── done    → displayMessage + activeTasks.delete(id)           │
+       │       ├── failed  → showError + activeTasks.delete(id)                │
+       │       └── running → 保留在 activeTasks                                │
+       │                                                                       │
+       ├─ onShow (从后台回到前台)                                                │
+       │   → 遍历 activeTasks,逐个 GET /sop/task/{id} catch up                  │
+       │                                                                       │
+       └─ onLoad (重新进聊天页)                                                 │
+           → GET /me/sop/tasks?status=running&limit=20                         │
+              → 把所有 running task 灌进 activeTasks Map,每个进 [waiting]       │
+                                                                                │
 ```
 
 ### 关键细节
 
-- **任务 ID 持久化**: 用 `wx.setStorage` 存活跃 task_id,跨页面跳转、关闭重开都能恢复。完成后 `wx.removeStorageSync`。
-- **进度提示**: 仍然推荐展示"正在分析企业画像 → 匹配政策 → 评估条件"占位文案(从 SOP 启动到完成的 ~5-6 分钟内每 30-60s 切换一次),不需要真实进度(daemon 不发细粒度进度)。
-- **轮询兜底(可选)**: SSE 断网恢复期间,前端可以每 30 秒主动调一次 `/sop/task/{task_id}` 作为兜底,避免 SSE 重连失败时永久卡在 loading。
-- **防重复触发**: `wx.getStorage` 检测有活跃 task 时,**禁用**"匹配政策"按钮/输入提交,避免双开。
+- **多 SOP 并发**: 同一聊天会话允许多个 task 并存。例:用户先问"政策匹配",几秒后再问"帮我评估资质" — 两个任务并行跑,UI 上两个 loading bubble 同时展示(标注 SOP 类型)。
+- **同 SOP + 同企业去重(可选)**: 后端 `POST /sop/X/run` 会检查"该用户是否有同 (sop_name, enterprise_id) 的 running task" — 有则直接返回那个现存 task_id(不重复入队)。前端可以不做客户端限制,完全相信后端去重。
+- **active tasks 持久化**: 用 `wx.setStorageSync('sop_active_tasks', [...])` 存数组(每项是 `{task_id, sop_name, enterprise_name}`),跨页面跳转能恢复。但 source of truth 是服务端 `GET /me/sop/tasks` — onLoad 时**以服务端结果为准**重建 Map(本地缓存只作秒级恢复用)。
+- **进度提示**: 推荐展示"正在分析企业画像 → 匹配政策 → 评估条件"占位文案(每 30-60s 切换一次),按 sop_name 分别给不同文案。daemon 不发细粒度进度。
+- **轮询兜底(可选)**: SSE 断网恢复期间,前端可以每 30 秒主动遍历 activeTasks 调 `/sop/task/{task_id}` 作为兜底。
+- **缓存命中不占 active task 槽位**: Case A 直接 displayMessage,不进 Map,不耗 loading 资源。
 
 ---
 
@@ -200,21 +209,32 @@ POST /sop/policy-match/run
 // chat-page.js
 const API = 'https://<clawops-gateway>';
 let pairedToken = '';
-let activeTask = null;
+// active tasks 是 Map: task_id → {sop_name, enterprise_name, bubble_index}
+// 支持多 SOP 并发(e.g., policy-match A 公司 + qualification-check A 公司同时跑)
+const activeTasks = new Map();
 let sseTask = null;
 
+const SOP_LOADING_TEXT = {
+  'policy-match': '政策顾问正在为您匹配适用政策...',
+  'qualification-check': '资质评估师正在评估企业资质...',
+};
+const SOP_ESTIMATED_SECONDS = {
+  'policy-match': 540,
+  'qualification-check': 180,
+};
+
 Page({
-  data: { loading: false, messages: [] },
+  data: { messages: [] },
 
   onLoad() {
     pairedToken = wx.getStorageSync('paired_token');
-    this.recoverActiveTask();
+    this.recoverActiveTasks();
     this.connectSSE();
   },
 
   onShow() {
-    // 从后台回来时检查活跃任务
-    this.checkActiveTaskStatus();
+    // 从后台回来,遍历所有 active tasks catch up
+    this.catchUpAllActiveTasks();
   },
 
   onUnload() {
@@ -228,33 +248,32 @@ Page({
       // 普通 chat,走 /chat (本文档外)
       return this.sendNormalChat(userInput);
     }
+    // 注意:不在客户端阻止"同 sop_name 双开" — 后端按 (sop_name, enterprise_id)
+    // 自动去重(返回已存在的 task_id),前端无需做客户端限制。多 SOP 并发也允许。
 
-    if (this.hasActiveTask(sopName)) {
-      wx.showToast({ title: '匹配进行中,请稍候', icon: 'none' });
-      return;
-    }
-
-    this.setData({ loading: true });
+    const enterpriseName = this.data.enterpriseName;
     wx.request({
       url: `${API}/sop/${sopName}/run`,
       method: 'POST',
       header: { 'Authorization': `Bearer ${pairedToken}` },
-      data: { enterprise_name: this.data.enterpriseName },
-      timeout: 30000,   // 5-10 秒,加余量
+      data: { enterprise_name: enterpriseName },
+      timeout: 30000,
       success: (res) => {
         if (res.statusCode === 200 && res.data.status === 'cached') {
-          // 缓存命中,直接展示
+          // 缓存命中,直接展示(不进 activeTasks Map,不占 loading 槽位)
           this.displayResult(res.data.result);
-          this.setData({ loading: false });
         } else if (res.statusCode === 202 && res.data.status === 'queued') {
-          // 入队,进 waiting
-          activeTask = { task_id: res.data.task_id, sop_name: sopName };
-          wx.setStorageSync(`sop_active_task_${sopName}`, res.data.task_id);
-          this.showLongLoadingBubble(res.data.estimated_seconds);
+          // 入队 — 添加到 activeTasks
+          const bubbleIdx = this.showLongLoadingBubble(sopName, res.data.task_id, res.data.estimated_seconds);
+          activeTasks.set(res.data.task_id, {
+            sop_name: sopName,
+            enterprise_name: enterpriseName,
+            bubble_index: bubbleIdx,
+          });
+          this.persistActiveTasks();
         }
       },
       fail: (err) => {
-        this.setData({ loading: false });
         wx.showToast({ title: '请求失败,请重试', icon: 'error' });
       }
     });
@@ -277,45 +296,69 @@ Page({
         if (!m) continue;
         try {
           const ev = JSON.parse(m[1]);
-          if (ev.type === 'agent_end' && activeTask) {
-            this.checkActiveTaskStatus();   // 一次 daemon chat 结束就 catch up
+          if (ev.type === 'agent_end' && activeTasks.size > 0) {
+            // 一次 daemon chat 跑完 — 不知道是哪个 task,遍历所有 active 都查一遍
+            this.catchUpAllActiveTasks();
           }
         } catch(e) {}
       }
     });
   },
 
-  // ────── 3. catch up 任务状态 ──────
-  checkActiveTaskStatus() {
-    if (!activeTask) return;
-    wx.request({
-      url: `${API}/sop/task/${activeTask.task_id}`,
-      header: { 'Authorization': `Bearer ${pairedToken}` },
-      success: (res) => {
-        const task = res.data;
-        if (task.status === 'done') {
-          this.displayResult(task.result);
-          this.clearActiveTask();
-        } else if (task.status === 'failed') {
-          wx.showToast({ title: task.error || '匹配失败', icon: 'error' });
-          this.clearActiveTask();
+  // ────── 3. 遍历所有 active tasks 查状态 ──────
+  catchUpAllActiveTasks() {
+    for (const [taskId, info] of activeTasks.entries()) {
+      wx.request({
+        url: `${API}/sop/task/${taskId}`,
+        header: { 'Authorization': `Bearer ${pairedToken}` },
+        success: (res) => {
+          const task = res.data;
+          if (task.status === 'done') {
+            this.replaceBubble(info.bubble_index, task.result.response_text);
+            activeTasks.delete(taskId);
+            this.persistActiveTasks();
+          } else if (task.status === 'failed') {
+            this.replaceBubble(info.bubble_index, `${SOP_LOADING_TEXT[info.sop_name].split('正')[0]}失败:${task.error}`);
+            activeTasks.delete(taskId);
+            this.persistActiveTasks();
+          }
+          // running: 保留在 Map
         }
-        // running: 不动,继续 waiting
-      }
-    });
+      });
+    }
   },
 
-  // ────── 4. 进页面时恢复活跃任务 ──────
-  async recoverActiveTask() {
+  // ────── 4. 进页面时恢复所有活跃任务 ──────
+  recoverActiveTasks() {
+    // 先从本地存储恢复(秒级 UI)
+    const cached = wx.getStorageSync('sop_active_tasks') || [];
+    cached.forEach(t => {
+      const bubbleIdx = this.showLongLoadingBubble(t.sop_name, t.task_id);
+      activeTasks.set(t.task_id, { ...t, bubble_index: bubbleIdx });
+    });
+    // 再从服务端取 source of truth,override 本地缓存
     wx.request({
-      url: `${API}/me/sop/tasks?status=running&limit=1`,
+      url: `${API}/me/sop/tasks?status=running&limit=20`,
       header: { 'Authorization': `Bearer ${pairedToken}` },
       success: (res) => {
-        const tasks = res.data.tasks;
-        if (tasks && tasks.length > 0) {
-          activeTask = { task_id: tasks[0].task_id, sop_name: tasks[0].sop_name };
-          this.showLongLoadingBubble();
+        const serverTasks = res.data.tasks || [];
+        // 清理本地不在服务端的 stale task
+        for (const taskId of activeTasks.keys()) {
+          if (!serverTasks.find(t => t.task_id === taskId)) {
+            activeTasks.delete(taskId);
+          }
         }
+        // 添加服务端有但本地没有的 task
+        serverTasks.forEach(t => {
+          if (!activeTasks.has(t.task_id)) {
+            const bubbleIdx = this.showLongLoadingBubble(t.sop_name, t.task_id);
+            activeTasks.set(t.task_id, {
+              sop_name: t.sop_name,
+              bubble_index: bubbleIdx,
+            });
+          }
+        });
+        this.persistActiveTasks();
       }
     });
   },
@@ -327,14 +370,28 @@ Page({
     return null;
   },
 
-  hasActiveTask(sopName) {
-    return !!wx.getStorageSync(`sop_active_task_${sopName}`);
+  persistActiveTasks() {
+    const arr = Array.from(activeTasks.entries()).map(([id, info]) => ({
+      task_id: id,
+      sop_name: info.sop_name,
+      enterprise_name: info.enterprise_name,
+    }));
+    wx.setStorageSync('sop_active_tasks', arr);
   },
 
-  clearActiveTask() {
-    if (activeTask) wx.removeStorageSync(`sop_active_task_${activeTask.sop_name}`);
-    activeTask = null;
-    this.setData({ loading: false });
+  showLongLoadingBubble(sopName, taskId, estimatedSeconds) {
+    const seconds = estimatedSeconds || SOP_ESTIMATED_SECONDS[sopName] || 300;
+    const text = `${SOP_LOADING_TEXT[sopName] || '正在处理'}(预计 ${Math.ceil(seconds / 60)} 分钟)`;
+    const msg = { role: 'assistant', text, loading: true, task_id: taskId };
+    const messages = this.data.messages.concat([msg]);
+    this.setData({ messages });
+    return messages.length - 1;
+  },
+
+  replaceBubble(index, newText) {
+    const messages = [...this.data.messages];
+    messages[index] = { ...messages[index], text: newText, loading: false };
+    this.setData({ messages });
   },
 
   displayResult(result) {
@@ -342,15 +399,13 @@ Page({
     // 链接拦截:用户点 result.deeplink → wx.navigateTo
   },
 
-  showLongLoadingBubble(estimatedSeconds = 540) {
-    this.appendMessage({
-      role: 'assistant',
-      text: `政策顾问正在为您匹配...(预计 ${Math.ceil(estimatedSeconds / 60)} 分钟)`,
-      loading: true,
-    });
+  appendMessage(msg) {
+    this.setData({ messages: this.data.messages.concat([msg]) });
   },
 });
 ```
+
+> **并发 UI 提示**: 多个 task 同时在跑时,聊天列表会显示**多个 loading bubble**(各带 sop_name 文案)。完成后**按 bubble_index 原地替换**为真实 result,不会乱序。
 
 ---
 
