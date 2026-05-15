@@ -290,8 +290,8 @@ pub async fn find_cached_done(
     let row: Option<SopTask> = match enterprise_name {
         Some(name) => sqlx::query_as(
             "SELECT * FROM sop_tasks WHERE openid = ? AND sop_name = ? \
-             AND enterprise_name = ? AND status = 'done' AND created_at > ? \
-             ORDER BY created_at DESC LIMIT 1",
+             AND enterprise_name = ? AND status = 'done' AND deeplink IS NOT NULL \
+             AND created_at > ? ORDER BY created_at DESC LIMIT 1",
         )
         .bind(openid)
         .bind(sop_name)
@@ -301,8 +301,8 @@ pub async fn find_cached_done(
         .await?,
         None => sqlx::query_as(
             "SELECT * FROM sop_tasks WHERE openid = ? AND sop_name = ? \
-             AND enterprise_name IS NULL AND status = 'done' AND created_at > ? \
-             ORDER BY created_at DESC LIMIT 1",
+             AND enterprise_name IS NULL AND status = 'done' AND deeplink IS NOT NULL \
+             AND created_at > ? ORDER BY created_at DESC LIMIT 1",
         )
         .bind(openid)
         .bind(sop_name)
