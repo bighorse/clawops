@@ -514,25 +514,36 @@ async fn chat(
     if sop_started {
         if let Some(ref sop_name) = sop_name_from_zc {
             let db_user = users::get(&st.pool, &user.openid).await.ok().flatten();
-            let enterprise_name: Option<String> = db_user
+            let linux_uid = db_user.as_ref().map(|u| u.linux_uid.as_str()).unwrap_or("").to_string();
+
+            // Three sources in priority order. Any one passing means we have a verified name.
+            let from_db: Option<String> = db_user
                 .as_ref()
                 .and_then(|u| u.enterprise_profile.as_ref())
                 .and_then(|s| serde_json::from_str::<JsonValue>(s).ok())
                 .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from))
                 .filter(|n| looks_like_full_company_name(n));
 
+            // brain.db memory — only trusted when it already looks like a full legal name.
+            let from_memory: Option<String> = if from_db.is_none() {
+                read_enterprise_name_from_memory(&st.cfg.zeroclaw.home_base, &linux_uid)
+                    .await
+                    .filter(|n| looks_like_full_company_name(n))
+            } else {
+                None
+            };
+
+            // Current message — user may have typed their full name in this very turn.
+            let from_message: Option<String> = if from_db.is_none() && from_memory.is_none() {
+                extract_company_name_from_text(&req.content)
+            } else {
+                None
+            };
+
+            let enterprise_name = from_db.or(from_memory).or(from_message);
+
             if enterprise_name.is_none() {
-                let linux_uid = db_user.as_ref().map(|u| u.linux_uid.as_str()).unwrap_or("");
-                let memory_hint =
-                    read_enterprise_name_from_memory(&st.cfg.zeroclaw.home_base, linux_uid).await;
-                let prompt = match memory_hint {
-                    Some(hint) => format!(
-                        "您好！我在记忆中找到企业名称「{}」，但政策匹配需要营业执照上的完整企业全称（通常以「有限公司」结尾）才能准确查询。\
-                         \n请提供完整的企业全称，我将立即为您发起匹配。",
-                        hint
-                    ),
-                    None => "请提供您企业的完整全称（营业执照上的名称，通常以「有限公司」结尾），我将为您发起政策匹配评测。".to_string(),
-                };
+                let prompt = "请提供您企业的完整全称（营业执照上的名称，通常以「有限公司」结尾），我将为您发起政策匹配评测。".to_string();
                 tracing::debug!(openid = %user.openid, sop_name = %sop_name,
                     "SOP started but no verified enterprise_name — overriding response");
                 if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &prompt).await {
@@ -1086,4 +1097,42 @@ fn looks_like_full_company_name(name: &str) -> bool {
     ];
     let ch_count = name.chars().count();
     ch_count >= 6 && SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// Scan free-form text for a substring that looks like a full company name.
+/// Returns the first match found, or None.
+fn extract_company_name_from_text(text: &str) -> Option<String> {
+    const SUFFIXES: &[&str] = &[
+        "有限公司", "有限责任公司", "股份有限公司", "股份合作公司",
+        "集团有限公司", "集团股份有限公司", "合伙企业", "研究院", "研究所",
+    ];
+    const DELIMITERS: &[char] = &[
+        ' ', '　', ',', '，', '。', '！', '？', '\n', '(', '（', ')', '）',
+        '"', '"', '「', '」', '【', '】', ':', '：',
+    ];
+    let chars: Vec<char> = text.chars().collect();
+    for suffix in SUFFIXES {
+        let suffix_chars: Vec<char> = suffix.chars().collect();
+        let slen = suffix_chars.len();
+        let n = chars.len();
+        if n < slen { continue; }
+        for i in 0..=(n - slen) {
+            if chars[i..i + slen] != suffix_chars[..] {
+                continue;
+            }
+            let end = i + slen;
+            // Walk backwards up to 20 chars to find the name start
+            let look_back = end.saturating_sub(20);
+            let name_start = (look_back..i)
+                .rev()
+                .find(|&j| DELIMITERS.contains(&chars[j]))
+                .map(|j| j + 1)
+                .unwrap_or(look_back);
+            let name: String = chars[name_start..end].iter().collect();
+            if looks_like_full_company_name(&name) {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
