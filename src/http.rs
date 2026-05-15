@@ -480,16 +480,44 @@ async fn chat(
     };
 
     if let Some((sop_name, sop_meta)) = sop_match {
-        // Best-effort enterprise_name extraction from user profile
-        // (the SOP itself will run its own resolution chain — this is
-        // just for cache lookup + task display).
-        let enterprise_name = users::get(&st.pool, &user.openid)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|u| u.enterprise_profile)
-            .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
-            .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from));
+        // Resolve enterprise_name (needed for cache key + task display).
+        // Priority: 1) enterprise_profile.company_name in users table
+        //           2) user_profile_company_name from zeroclaw brain.db
+        //           3) None → fall through to daemon (daemon asks user)
+        let db_user = users::get(&st.pool, &user.openid).await.ok().flatten();
+
+        let enterprise_name: Option<String> = {
+            // Priority 1: users.enterprise_profile
+            let from_profile = db_user
+                .as_ref()
+                .and_then(|u| u.enterprise_profile.as_ref())
+                .and_then(|s| serde_json::from_str::<JsonValue>(s).ok())
+                .and_then(|v| v.get("company_name").and_then(|x| x.as_str()).map(String::from));
+
+            if from_profile.is_some() {
+                from_profile
+            } else {
+                // Priority 2: zeroclaw memory brain.db
+                let linux_uid = db_user.as_ref().map(|u| u.linux_uid.as_str()).unwrap_or("");
+                read_enterprise_name_from_memory(&st.cfg.zeroclaw.home_base, linux_uid).await
+            }
+        };
+
+        // If no enterprise name found, reply asking the user to provide it.
+        // Once they tell the daemon their company name the memory will be
+        // stored in brain.db and the next trigger will find it here.
+        if enterprise_name.is_none() {
+            tracing::debug!(openid = %user.openid, "SOP triggered but no enterprise_name — asking user");
+            let prompt = "请问您的企业名称是什么？提供后我将为您启动政策匹配评测。".to_string();
+            if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &prompt).await {
+                tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
+            }
+            return Ok(Json(ChatResp {
+                response: prompt,
+                model: Some("clawops-router".to_string()),
+                openid: user.openid,
+            }));
+        } else {
 
         // Cache check (per-openid, sop_name + enterprise_name, within ttl)
         let cached = sop_tasks::find_cached_done(
@@ -577,7 +605,8 @@ async fn chat(
             model: Some("clawops-router".to_string()),
             openid: user.openid,
         }));
-    }
+        } // else enterprise_name.is_some()
+    } // if let Some(sop_match)
 
     // ── Normal chat path (no SOP triggered) ───────────────────────
     let (response_text, model) = if !st.provisioner.backend.launches_daemon() {
@@ -972,4 +1001,38 @@ async fn list_my_sop_tasks(
         total,
         has_more,
     }))
+}
+
+/// Read `user_profile_company_name` from the user's zeroclaw brain.db.
+/// Opens the DB read-only so we never contend with zeroclaw's writer.
+async fn read_enterprise_name_from_memory(
+    home_base: &std::path::Path,
+    linux_uid: &str,
+) -> Option<String> {
+    if linux_uid.is_empty() {
+        return None;
+    }
+    let db_path = home_base
+        .join(linux_uid)
+        .join(".zeroclaw/workspace/memory/brain.db");
+    if !db_path.exists() {
+        return None;
+    }
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .read_only(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .ok()?;
+    let result: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM memories WHERE key = 'user_profile_company_name' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten();
+    pool.close().await;
+    result
 }
