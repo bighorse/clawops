@@ -113,19 +113,20 @@ async fn run(ctx: &SopRunCtx) -> anyhow::Result<()> {
     // We accept both this format and bare-path / general /pages/.../?id=N.
     let (deeplink, qid) = extract_deeplink_and_qid(&response_text);
 
-    // Detect cases where the daemon returned a normal chat reply instead
-    // of executing the SOP workflow. Signs: no deeplink AND the response
-    // asks the user for more info ("告诉我你的企业名" / "请提供" / etc.)
-    // or is suspiciously short (< 100 chars, SOP results are always longer).
-    if deeplink.is_none() && looks_like_skipped_sop(&response_text) {
-        let msg = "SOP未执行,请稍后重试".to_string();
+    // Deeplink is the sole success indicator for policy-match: the SOP
+    // only produces one after save_match_result + step 6 complete.
+    // Any other outcome (SOP step failed, LLM answered normally without
+    // calling sop_execute, enterprise profile unavailable, etc.) yields
+    // no deeplink → mark failed with a user-visible message.
+    if deeplink.is_none() {
+        let error_msg = user_visible_from_response(&response_text);
         tracing::warn!(
-            task_id = %ctx.task_id,
-            openid  = %ctx.openid,
-            "sop_runner: daemon returned non-SOP response (len={}), marking failed",
-            response_text.len()
+            task_id  = %ctx.task_id,
+            openid   = %ctx.openid,
+            response = %&response_text[..response_text.len().min(120)],
+            "sop_runner: no deeplink in daemon response — marking failed"
         );
-        sop_tasks::mark_failed(&ctx.pool, &ctx.task_id, &msg).await?;
+        sop_tasks::mark_failed(&ctx.pool, &ctx.task_id, &error_msg).await?;
         emit(ctx, "failed");
         return Ok(());
     }
@@ -180,20 +181,27 @@ fn extract_deeplink_and_qid(text: &str) -> (Option<String>, Option<i64>) {
     }
 }
 
-/// Returns true if the daemon response looks like a plain chat reply
-/// rather than a completed SOP execution. Used to detect cases where
-/// the daemon's LLM answered conversationally without calling sop_execute.
-fn looks_like_skipped_sop(text: &str) -> bool {
-    if text.len() < 100 {
-        return true;
+/// Extract a user-visible error message from the daemon's response text
+/// when the SOP didn't produce a deeplink. Tries to surface what the
+/// LLM said (e.g. "企业画像服务暂时不可用"), falling back to generic.
+fn user_visible_from_response(text: &str) -> String {
+    // If response is very short or empty, use generic.
+    if text.trim().is_empty() || text.len() < 10 {
+        return "任务执行失败,请稍后重试".to_string();
     }
-    let lower = text.to_ascii_lowercase();
-    // LLM asking for enterprise info → sop_execute wasn't called
-    let asking_patterns = [
-        "告诉我你的企业", "请告诉我", "请提供企业", "你的企业名",
-        "请问您的企业", "请问贵公司", "帮我了解一下您的企业",
-    ];
-    asking_patterns.iter().any(|p| lower.contains(p))
+    // Extract the first meaningful sentence (up to first 。or \n, max 60 chars).
+    let sentence: String = text
+        .split(|c| c == '。' || c == '\n')
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or(text)
+        .chars()
+        .take(60)
+        .collect();
+    if sentence.trim().is_empty() {
+        "任务执行失败,请稍后重试".to_string()
+    } else {
+        sentence.trim().to_string()
+    }
 }
 
 fn emit(ctx: &SopRunCtx, event: &str) {
