@@ -44,9 +44,9 @@ pub fn spawn(ctx: SopRunCtx) {
 }
 
 async fn run(ctx: &SopRunCtx) -> anyhow::Result<()> {
-    // Step 1: mark running + emit created
+    // Step 1: mark running ("created" was already emitted by the chat
+    // handler immediately after insert_pending, so we don't re-emit here).
     sop_tasks::mark_running(&ctx.pool, &ctx.task_id).await?;
-    emit(ctx, "created");
 
     // Step 2: resolve daemon port for this user
     let user = ctx
@@ -113,6 +113,23 @@ async fn run(ctx: &SopRunCtx) -> anyhow::Result<()> {
     // We accept both this format and bare-path / general /pages/.../?id=N.
     let (deeplink, qid) = extract_deeplink_and_qid(&response_text);
 
+    // Detect cases where the daemon returned a normal chat reply instead
+    // of executing the SOP workflow. Signs: no deeplink AND the response
+    // asks the user for more info ("告诉我你的企业名" / "请提供" / etc.)
+    // or is suspiciously short (< 100 chars, SOP results are always longer).
+    if deeplink.is_none() && looks_like_skipped_sop(&response_text) {
+        let msg = "SOP未执行,请稍后重试".to_string();
+        tracing::warn!(
+            task_id = %ctx.task_id,
+            openid  = %ctx.openid,
+            "sop_runner: daemon returned non-SOP response (len={}), marking failed",
+            response_text.len()
+        );
+        sop_tasks::mark_failed(&ctx.pool, &ctx.task_id, &msg).await?;
+        emit(ctx, "failed");
+        return Ok(());
+    }
+
     // enterprise_id isn't parsed from response_text (it's not in the
     // final LLM message). It would require reading the daemon's
     // workspace file (case/policy-match/<safe>/profile.json) — we skip
@@ -161,6 +178,22 @@ fn extract_deeplink_and_qid(text: &str) -> (Option<String>, Option<i64>) {
     } else {
         (None, None)
     }
+}
+
+/// Returns true if the daemon response looks like a plain chat reply
+/// rather than a completed SOP execution. Used to detect cases where
+/// the daemon's LLM answered conversationally without calling sop_execute.
+fn looks_like_skipped_sop(text: &str) -> bool {
+    if text.len() < 100 {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    // LLM asking for enterprise info → sop_execute wasn't called
+    let asking_patterns = [
+        "告诉我你的企业", "请告诉我", "请提供企业", "你的企业名",
+        "请问您的企业", "请问贵公司", "帮我了解一下您的企业",
+    ];
+    asking_patterns.iter().any(|p| lower.contains(p))
 }
 
 fn emit(ctx: &SopRunCtx, event: &str) {

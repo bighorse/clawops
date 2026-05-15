@@ -539,6 +539,9 @@ async fn chat(
                 sop_meta.estimated_seconds,
             )
             .await?;
+            // Emit "created" now so the frontend can immediately show
+            // the task in the list (enterprise_name already stored above).
+            emit_sop_event(&st, &task_id, &user.openid, "created");
             sop_runner::spawn(sop_runner::SopRunCtx {
                 pool: st.pool.clone(),
                 http: st.http.clone(),
