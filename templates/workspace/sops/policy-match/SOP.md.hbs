@@ -66,30 +66,29 @@
      (6) **降级**: 接口 4xx/5xx → narrate "企业画像服务暂时不可用,请稍后再试",`sop_advance status=Failed`。
      (7) **数据空兜底**: 返回 `data` 为 `null` 或 `enterprise_id` 缺失 → 同上 Failed,**不要**自己捏造 enterprise_id。
 
-2. **取候选政策清单** — 一次性拉全量启用中的政策(库总量约 100 条,可全量塞入 LLM context)。
+2. **取候选政策清单** — 拉全量启用中的政策,仅取匹配判断所需的最小字段集,减少 context 占用。
    - tools: http_request, file_write
    - notes:
-     (1) 调用 — **必须带 `fields` 参数**裁剪响应,⚠️ **`application_condition` 不在这一步拉取**,否则响应体 >60 KB 撑爆 context(conditions 在 step 4 单独拉取):
+     (1) 调用 — **只取 5 个字段**,`application_condition` 和展示类字段(support_money/link 等)不在本步拉取:
         ```
         http_request GET {{{policy_match.api_base}}}{{{policy_match.policy_list_path}}}
           ?no_pagination=true
           &status=ONLINE
-          &fields=id,name,policy_direction,policy_belong,application_at,application_date_at,support_money,support_decimal_money,link,status
+          &fields=id,name,policy_direction,policy_belong,application_at
         ```
-        响应 `data.data[]` 每条政策含上述 10 个字段(响应体 ~28 KB)。
+        响应 `data.data[]` 每条政策含上述 5 个字段(响应体 ~6 KB)。
         ⚠️ **禁止**在 URL 里加 `order_by_fields` / `order_by_types` — 与 `no_pagination=true` 同用时后端返回 400。
-     (2) 落盘到 `case/policy-match/<enterprise_safe>/candidates.json` — **直接保存响应的 `data.data[]` 数组**,无需再裁剪字段(后端已按 fields 过滤好)。schema:
+     (2) 落盘到 `case/policy-match/<enterprise_safe>/candidates.json` — 保存响应的 `data.data[]` 数组:
         ```json
         {
           "policies": [
-            { "id": <int>, "name": "...", "policy_direction": "...", "policy_belong": "...", "application_at": "...", "application_date_at": "...", "support_money": "...", "support_decimal_money": <num>, "link": "...", "status": "ONLINE" }
+            { "id": <int>, "name": "...", "policy_direction": "...", "policy_belong": "...", "application_at": "..." }
           ]
         }
         ```
-        注意:此 schema **无 `application_condition`** — conditions 在 step 4 调接口获取。
-     (3) **size 自检**: 落盘后期望 `case/.../candidates.json` 15-40 KB(若 < 5 KB 说明 LLM 偷懒只写元信息没写 data 数组,**必须重写**;若 > 60 KB 说明 fields 参数没生效,检查调用 URL)。
+     (3) **size 自检**: 落盘后期望 `candidates.json` 3-10 KB。< 1 KB 说明数组未写入,必须重写;> 15 KB 说明 fields 参数未生效,检查 URL。
      (4) **降级**:
-        - 接口 4xx → **不要**修改 fields 参数重试；改为 narrate "政策库接口异常(4xx)",`sop_advance status=Failed`。
+        - 接口 4xx → **不要**修改 fields 参数重试;narrate "政策库接口异常(4xx)",`sop_advance status=Failed`。
         - 接口 5xx 或网络错误 → narrate "政策库暂时不可用,请稍后再试",`sop_advance status=Failed`。
 
 3. **LLM 匹配筛选(分 2 阶段,避免单次 LLM call 超 240s 红线)** — 读企业画像 + 政策清单,LLM 用粗筛 → 精筛分两次完成 Top 10 选择。
@@ -97,30 +96,40 @@
    - notes:
      **拆分理由**: 历史观察 qwen3.6-plus/deepseek-v4-pro 一次性"100 条 → Top 10 + 完整 match_reason"的 LLM call 在 70K context 下 > 240s,撞 zeroclaw `reliable.rs` 硬编码 outer timeout。拆成两次小 LLM call(各 ≤ 90s)既绕开 timeout,也让 LLM 注意力更集中。
 
-     ### 3a. 粗筛 — 100 条 → Top 20(只输出 id 列表,不写 reason)
-     - file_read `case/policy-match/<enterprise_safe>/profile.json` 和 `candidates.json`。
+     ### 3a. 粗筛 — N 条 → Top 20(只输出 id 列表,不写 reason)
+     - file_read `case/policy-match/<enterprise_safe>/profile.json`。**不要** file_read `candidates.json` — step 2 的 http_request 响应已在 LLM context 中,直接使用即可,重读只会浪费 context 配额。
      - 对每条候选政策,**快速**综合判断企业是否适用,判断维度:
         - **行业匹配**: 政策的 `policy_direction` / `policy_belong` 是否覆盖企业主营行业(`basic_info` 里的经营范围 / 行业分类关键词)
         - **规模匹配**: 政策若按企业规模分档(小微 / 中型 / 大型),与 `basic_info` 里的注册资本 / 参保人数对齐
         - **资质信号**: 从政策 `name` + `policy_direction` 判断是否需要"高新 / 专精特新 / 国家级资质",与 `qualification_info` 对照
         - **时效**: `application_at` 若过期(< 当前日期)且非长期有效,标记 `expired=true` 但**仍保留**(排序时排最后)
-     - 选 **TOP 20**(候选不够 20 条就有几条放几条),写入 `case/policy-match/<enterprise_safe>/match_coarse.json`,**schema 极简**(粗筛阶段不写 match_reason,节省 output tokens):
-        ```json
-        {
-          "enterprise_id": <从 step 1 拿>,
-          "enterprise_name": "<原始企业名>",
-          "coarse_ids": [
-            {"policy_summary_id": <候选 id>, "policy_summary_name": "<政策名>", "expired": false, "rank": 1}
-          ]
-        }
-        ```
-     - **【P0 反幻觉】**: `policy_summary_id` 必须来自 `candidates.json` 中真实出现的 `id`,**禁止**凭训练记忆生造。
-     - **size 自检**: `match_coarse.json` 期望 2-5 KB,`coarse_ids[]` 长度 ≤ 20;> 8 KB 说明 LLM 写了多余字段(例如把 reason 也写进来了),重写。
-     - **零匹配兜底**: 全量政策都不适用 → `coarse_ids` 写空数组,跳过 3b 直接进 step 4(step 4 会处理空列表)。
+     - 选 **TOP 20**(候选不够 20 条就有几条放几条),**同时写两个文件**:
+       1. `case/policy-match/<enterprise_safe>/match_coarse.json` — **schema 极简**(粗筛阶段不写 match_reason,节省 output tokens):
+          ```json
+          {
+            "enterprise_id": <从 step 1 拿>,
+            "enterprise_name": "<原始企业名>",
+            "coarse_ids": [
+              {"policy_summary_id": <候选 id>, "policy_summary_name": "<政策名>", "expired": false, "rank": 1}
+            ]
+          }
+          ```
+       2. `case/policy-match/<enterprise_safe>/candidates_shortlisted.json` — 从 context 中的 step 2 响应提取这 TOP 20 条的完整 5 字段数据,**schema 与 candidates.json 相同**:
+          ```json
+          {
+            "policies": [
+              { "id": <int>, "name": "...", "policy_direction": "...", "policy_belong": "...", "application_at": "..." }
+            ]
+          }
+          ```
+          **为什么写这个**: step 3b 精筛时只需这 20 条的详情,读这个文件比读全量 candidates.json 小得多,节省 context。
+     - **【P0 反幻觉】**: `policy_summary_id` 必须来自 step 2 http_request 响应中真实出现的 `id`,**禁止**凭训练记忆生造。
+     - **size 自检**: `match_coarse.json` 期望 2-5 KB,`coarse_ids[]` 长度 ≤ 20;> 8 KB 说明 LLM 写了多余字段(例如把 reason 也写进来了),重写。`candidates_shortlisted.json` 期望 ≤ 4 KB;> 8 KB 说明把全量写进去了,按 coarse_ids 重新截取。
+     - **零匹配兜底**: 全量政策都不适用 → `coarse_ids` 写空数组,`candidates_shortlisted.json` 写空 `policies[]`,跳过 3b 直接进 step 4(step 4 会处理空列表)。
 
      ### 3b. 精筛 — Top 20 → Top 10(带 match_reason)
-     - file_read `match_coarse.json` 和 `candidates.json`。
-     - 从 `coarse_ids[]` 的 20 个 id 中,基于 `candidates.json` 里这 20 条对应的详情,精选 **TOP 10**,为每条写 **15 字内** match_reason(精简,不要"该政策"等冗余开头)。
+     - file_read `match_coarse.json` 和 `candidates_shortlisted.json`。(**不要** file_read `candidates.json` — shortlisted 已含这 20 条的完整字段,全量文件只会带入多余 context。)
+     - 从 `coarse_ids[]` 的 20 个 id 中,基于 `candidates_shortlisted.json` 里这 20 条对应的详情,精选 **TOP 10**,为每条写 **15 字内** match_reason(精简,不要"该政策"等冗余开头)。
      - 输出写入 `case/policy-match/<enterprise_safe>/match.json`,schema:
         ```json
         {
