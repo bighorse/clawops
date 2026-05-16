@@ -572,10 +572,9 @@ async fn chat(
             let display_name = sop_meta
                 .map(|m| m.display_name_cn.as_str())
                 .unwrap_or(sop_name.as_str());
-            let minutes = sop_meta.map(|m| (m.estimated_seconds + 59) / 60).unwrap_or(9);
             let chat_response = format!(
-                "已为您发起「{}」，预计 {} 分钟，可在右上角任务列表查看进度。",
-                display_name, minutes
+                "已为您发起「{}」，可在右上角任务列表查看进度。",
+                display_name
             );
             if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &chat_response).await {
                 tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
