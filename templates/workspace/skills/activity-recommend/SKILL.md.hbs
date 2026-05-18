@@ -95,6 +95,7 @@
 ```
 http_request GET {{{activity.api_base}}}
   ?keyword=<速查表的值>
+  &status=ONLINE&audit_status=APPROVED
   &order_by_fields=start_time&order_by_types=DESC
   &page_size=20&page_index=1
 ```
@@ -103,7 +104,8 @@ http_request GET {{{activity.api_base}}}
 
 ```
 http_request GET {{{activity.api_base}}}
-  ?order_by_fields=start_time&order_by_types=DESC
+  ?status=ONLINE&audit_status=APPROVED
+  &order_by_fields=start_time&order_by_types=DESC
   &page_size=20&page_index=1
 ```
 
