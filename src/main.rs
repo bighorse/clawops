@@ -109,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve => {
             let _reaper = Reaper::new(pool.clone(), provisioner.clone(), cfg.reaper.clone()).spawn();
             http::spawn_reminder_sender(pool.clone(), wx_notifier.clone());
+            http::spawn_sop_task_watchdog(pool.clone());
 
             let state = AppState {
                 pool,

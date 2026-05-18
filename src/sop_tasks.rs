@@ -157,6 +157,24 @@ pub async fn mark_done(
     Ok(())
 }
 
+/// Timeout stale running tasks: if a task has been in running/pending status
+/// for more than `timeout_minutes`, mark it failed. Called by a background job.
+/// Returns the number of tasks timed out.
+pub async fn timeout_stale(pool: &SqlitePool, timeout_minutes: i64) -> Result<u64> {
+    let cutoff = Utc::now() - Duration::minutes(timeout_minutes);
+    let result = sqlx::query(
+        "UPDATE sop_tasks SET status='failed', error_message='timeout: no done event received', \
+         updated_at=?, completed_at=? \
+         WHERE status IN ('running','pending') AND updated_at < ?",
+    )
+    .bind(Utc::now())
+    .bind(Utc::now())
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn mark_failed(pool: &SqlitePool, task_id: &str, error: &str) -> Result<()> {
     let now = Utc::now();
     sqlx::query(

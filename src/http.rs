@@ -1216,6 +1216,23 @@ async fn list_my_reminders(
 
 /// Background task: scan due reminders every 60s and send WeChat messages.
 /// Spawn once from main.rs after AppState is built.
+/// Background task: timeout stale running/pending SOP tasks every 5 minutes.
+/// A task is considered stale if it has been in running/pending for > 30 min
+/// without a done event (zeroclaw webhook dropped or daemon crashed mid-SOP).
+pub fn spawn_sop_task_watchdog(pool: sqlx::SqlitePool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            match sop_tasks::timeout_stale(&pool, 30).await {
+                Ok(n) if n > 0 => tracing::warn!("sop watchdog: timed out {n} stale task(s)"),
+                Ok(_) => {}
+                Err(e) => tracing::error!("sop watchdog error: {e}"),
+            }
+        }
+    });
+}
+
 pub fn spawn_reminder_sender(
     pool: sqlx::SqlitePool,
     notifier: Arc<crate::wx_notify::WxNotifier>,
