@@ -323,6 +323,16 @@ pub async fn find_pending_by_sop(
     Ok(task_id)
 }
 
+/// Fetch a single task row by task_id.
+pub async fn get_by_id(pool: &SqlitePool, task_id: &str) -> Result<Option<SopTask>> {
+    let row: Option<SopTask> =
+        sqlx::query_as("SELECT * FROM sop_tasks WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row)
+}
+
 /// Extract the first mini-program deeplink and numeric id from response text.
 /// Pattern: `/pages/<path>?id=<digits>` (or `&id=<digits>`).
 pub fn extract_deeplink_and_qid(text: &str) -> (Option<String>, Option<i64>) {

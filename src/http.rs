@@ -954,6 +954,33 @@ async fn list_my_sop_tasks(
 // response_text, which may contain a deeplink we extract.
 // ────────────────────────────────────────────────────────────────────
 
+/// Fallback: when response_text doesn't contain a parseable deeplink, try to
+/// read `qualification_enterprise_id` from the workspace profile.json that the
+/// SOP wrote in step 1. Avoids depending on LLM to format the link correctly.
+async fn try_deeplink_from_workspace(
+    cfg: &crate::config::Config,
+    linux_uid: &str,
+    enterprise_name: &str,
+    sop_name: &str,
+) -> Option<String> {
+    if sop_name != "policy-match" {
+        return None;
+    }
+    let enterprise_safe: String = enterprise_name
+        .chars()
+        .map(|c| if " /\\:*?\"<>|".contains(c) { '_' } else { c })
+        .collect();
+    let profile_path = format!(
+        "/home/{}/.zeroclaw/workspace/case/policy-match/{}/profile.json",
+        linux_uid, enterprise_safe
+    );
+    let text = tokio::fs::read_to_string(&profile_path).await.ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let qid = v.get("qualification_enterprise_id")?.as_i64()?;
+    let tpl = &cfg.policy_match.mini_program_detail_path_template;
+    Some(tpl.replace("{qualification_enterprise_id}", &qid.to_string()))
+}
+
 #[derive(Deserialize)]
 struct SopEventPayload {
     event: String,
@@ -1027,7 +1054,26 @@ async fn internal_sop_event(
                 }
             };
 
-            let (deeplink, _qid) = sop_tasks::extract_deeplink_and_qid(response_text);
+            let (mut deeplink, _qid) = sop_tasks::extract_deeplink_and_qid(response_text);
+            if deeplink.is_none() {
+                // LLM didn't include a parseable link in response_text (e.g. gave a
+                // conversational wrap-up instead of the step-6 format). Fall back to
+                // reading qualification_enterprise_id directly from the workspace file.
+                if let Ok(Some(task)) = sop_tasks::get_by_id(&st.pool, &task_id).await {
+                    if let (Some(ename), Ok(Some(user))) = (
+                        task.enterprise_name.as_deref(),
+                        users::get(&st.pool, &openid).await,
+                    ) {
+                        deeplink = try_deeplink_from_workspace(
+                            &st.cfg,
+                            &user.linux_uid,
+                            ename,
+                            &payload.sop_name,
+                        )
+                        .await;
+                    }
+                }
+            }
             tracing::info!(
                 openid = %openid,
                 task_id = %task_id,
