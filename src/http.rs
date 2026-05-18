@@ -1025,13 +1025,15 @@ async fn internal_sop_event(
     match payload.event.as_str() {
         "starting" => {
             // Task creation is owned by /chat (after enterprise-name validation).
-            // Acting here would create orphan rows whenever /chat rejects the
-            // message for a missing company name.
-            tracing::debug!(
-                openid = %openid,
-                sop_name = %payload.sop_name,
-                "sop webhook: starting (acknowledged; task created by /chat)"
-            );
+            // Here we only transition pending → running so the UI shows "进行中".
+            if let Some(task_id) = sop_tasks::find_pending_by_sop(&st.pool, &openid, &payload.sop_name).await? {
+                sop_tasks::mark_running(&st.pool, &task_id).await?;
+                emit_sop_event(&st, &task_id, &openid, "running");
+                tracing::debug!(openid = %openid, task_id = %task_id, "sop webhook: starting → running");
+            } else {
+                tracing::debug!(openid = %openid, sop_name = %payload.sop_name,
+                    "sop webhook: starting — no pending task yet (race), will mark running on done");
+            }
             Ok(Json(serde_json::json!({"ok": true})))
         }
         "done" => {
