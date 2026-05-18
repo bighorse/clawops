@@ -5,6 +5,7 @@ use clawops::http::AppState;
 use clawops::limits::AppLimiters;
 use clawops::provisioner::Provisioner;
 use clawops::reaper::Reaper;
+use clawops::wx_notify::WxNotifier;
 use clawops::{db, http, process, users};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -100,12 +101,14 @@ async fn main() -> anyhow::Result<()> {
 
     let wx = Arc::new(WxClient::new(cfg.wx.clone(), http_client.clone()));
     let limiters = Arc::new(AppLimiters::new(&cfg.rate_limit));
+    let wx_notifier = Arc::new(WxNotifier::new(cfg.wx_notify.clone()));
 
     let (sop_event_tx, _) = broadcast::channel(256);
 
     match cli.cmd {
         Cmd::Serve => {
             let _reaper = Reaper::new(pool.clone(), provisioner.clone(), cfg.reaper.clone()).spawn();
+            http::spawn_reminder_sender(pool.clone(), wx_notifier.clone());
 
             let state = AppState {
                 pool,
@@ -115,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
                 wx,
                 limiters,
                 sop_event_tx,
+                wx_notifier: wx_notifier.clone(),
             };
             let app = http::router(state);
             let addr: std::net::SocketAddr =

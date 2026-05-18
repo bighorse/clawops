@@ -9,8 +9,10 @@ pub mod ports;
 pub mod process;
 pub mod provisioner;
 pub mod reaper;
+pub mod reminders;
 pub mod sessions;
 pub mod sop_tasks;
 pub mod users;
+pub mod wx_notify;
 
 pub use error::{Error, Result};

@@ -35,6 +35,35 @@ pub struct Config {
     /// Key is the sop_name (e.g. "policy-match").
     #[serde(default)]
     pub sop_metadata: HashMap<String, SopMetadata>,
+    /// WeChat mini-program subscription message (订阅消息) settings.
+    #[serde(default)]
+    pub wx_notify: WxNotifyConfig,
+}
+
+/// WeChat subscription message push. Used by the activity-remind cron path:
+/// bot registers a reminder via POST /notify/subscribe; clawops sends
+/// subscribeMessage.send at the scheduled time.
+///
+/// Leave `appid` empty to disable (reminders are stored but never sent).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WxNotifyConfig {
+    /// Mini-program appid (same as the one users log in with).
+    #[serde(default)]
+    pub appid: String,
+    /// Mini-program appsecret (keep out of git — use env or secrets manager).
+    #[serde(default)]
+    pub appsecret: String,
+    /// 订阅消息 template_id from MP backend (审核通过后填入).
+    #[serde(default)]
+    pub activity_remind_template_id: String,
+    /// Mini-program page to open when user taps the notification.
+    /// Default: activity detail page.
+    #[serde(default = "default_wx_notify_page")]
+    pub activity_remind_page: String,
+}
+
+fn default_wx_notify_page() -> String {
+    "/pages/activity/details/Index".into()
 }
 
 /// Metadata for one SOP. Drives:

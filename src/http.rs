@@ -3,7 +3,8 @@ use crate::config::Config;
 use crate::limits::{self, AppLimiters};
 use crate::provisioner::Provisioner;
 use crate::sop_tasks;
-use crate::{chat_history, sessions, users, Error, Result};
+use crate::wx_notify::WxNotifier;
+use crate::{chat_history, reminders, sessions, users, Error, Result};
 use axum::body::Body;
 use axum::extract::FromRequestParts;
 use axum::extract::{Path, Query, State};
@@ -31,6 +32,7 @@ pub struct AppState {
     /// SSE connection) filter by openid (stripped before forwarding).
     /// Capacity 256 is plenty given event frequency (a few/sec at peak).
     pub sop_event_tx: broadcast::Sender<JsonValue>,
+    pub wx_notifier: Arc<WxNotifier>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -46,6 +48,8 @@ pub fn router(state: AppState) -> Router {
         .route("/me/profile", get(get_my_profile))
         .route("/me/chat-history", get(get_my_chat_history))
         .route("/me/sop/tasks", get(list_my_sop_tasks))
+        .route("/notify/subscribe", post(notify_subscribe))
+        .route("/me/reminders", get(list_my_reminders))
         .route("/admin/users", get(list_users))
         .route("/admin/users/:openid", get(get_user))
         .route("/admin/provision", post(admin_provision))
@@ -1147,4 +1151,96 @@ fn extract_company_name_from_text(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── Activity reminder subscription ───────────────────────────────────────────
+// Flow:
+//   1. Bot detects interest → outputs <!--REMIND:...--> marker in response
+//   2. Mini-program frontend intercepts marker, calls wx.requestSubscribeMessage
+//   3. On user consent, frontend POSTs here with the reminder details
+//   4. Background job (spawn_reminder_sender) scans due reminders every minute
+
+/// POST /notify/subscribe — called by mini-program after user grants
+/// wx.requestSubscribeMessage consent. Stores a reminder row; background
+/// job sends the WeChat subscription message at remind_at.
+async fn notify_subscribe(
+    State(st): State<AppState>,
+    AuthOpenid(openid): AuthOpenid,
+    Json(req): Json<reminders::CreateReminderReq>,
+) -> std::result::Result<Json<serde_json::Value>, Error> {
+    // Ignore openid from body — trust the session token.
+    let mut req = req;
+    req.openid = openid.clone();
+
+    // Dedup: don't create a second pending reminder for same activity.
+    if reminders::exists(&st.pool, &openid, &req.activity_id).await? {
+        return Ok(Json(serde_json::json!({"ok": true, "duplicate": true})));
+    }
+    let id = reminders::insert(&st.pool, &req).await?;
+    tracing::info!(
+        openid = %openid,
+        activity_id = %req.activity_id,
+        remind_at = %req.remind_at,
+        reminder_id = id,
+        "activity reminder registered"
+    );
+    Ok(Json(serde_json::json!({"ok": true, "id": id})))
+}
+
+/// GET /me/reminders — list pending + recent reminders for the current user.
+async fn list_my_reminders(
+    State(st): State<AppState>,
+    AuthOpenid(openid): AuthOpenid,
+) -> std::result::Result<Json<serde_json::Value>, Error> {
+    let rows = reminders::list_for_user(&st.pool, &openid).await?;
+    Ok(Json(serde_json::json!({"reminders": rows})))
+}
+
+/// Background task: scan due reminders every 60s and send WeChat messages.
+/// Spawn once from main.rs after AppState is built.
+pub fn spawn_reminder_sender(
+    pool: sqlx::SqlitePool,
+    notifier: Arc<crate::wx_notify::WxNotifier>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match reminders::fetch_due(&pool).await {
+                Err(e) => tracing::error!("reminder scan error: {e}"),
+                Ok(due) => {
+                    for r in due {
+                        let result = notifier
+                            .send_activity_remind(
+                                &r.openid,
+                                &r.activity_name,
+                                &r.activity_time,
+                                &r.activity_venue,
+                                &r.activity_id,
+                            )
+                            .await;
+                        match result {
+                            Ok(()) => {
+                                let _ = reminders::mark_sent(&pool, r.id).await;
+                                tracing::info!(
+                                    reminder_id = r.id,
+                                    openid = %r.openid,
+                                    activity = %r.activity_name,
+                                    "reminder sent"
+                                );
+                            }
+                            Err(e) => {
+                                let _ = reminders::mark_failed(&pool, r.id, &e.to_string()).await;
+                                tracing::warn!(
+                                    reminder_id = r.id,
+                                    openid = %r.openid,
+                                    "reminder send failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
