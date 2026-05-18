@@ -537,7 +537,23 @@ async fn chat(
                 None
             };
 
-            let enterprise_name = from_db.or(from_message);
+            // 3rd source: recent chat history (same conversation, last 10 turns).
+            // Covers "重新跑一次" / "再来一次" where user gave the full name 1-2 turns ago.
+            // Intentionally checked AFTER current message so an explicit new name in this
+            // message always wins; only used when the first two sources both fail.
+            let from_history: Option<String> = if from_db.is_none() && from_message.is_none() {
+                match chat_history::fetch_page(&st.pool, &user.openid, None, 10).await {
+                    Ok(msgs) => msgs
+                        .iter()
+                        .filter(|m| m.role == "user")
+                        .find_map(|m| extract_company_name_from_text(&m.content)),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            let enterprise_name = from_db.or(from_message).or(from_history);
 
             if enterprise_name.is_none() {
                 let prompt = "请提供您企业的完整全称（营业执照上的名称，通常以「有限公司」结尾），我将为您发起政策匹配评测。".to_string();
