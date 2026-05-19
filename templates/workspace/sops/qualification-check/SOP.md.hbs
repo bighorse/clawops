@@ -1,0 +1,221 @@
+{{#if qualification.enabled}}
+# 资质检查 SOP (qualification-check)
+
+基于企业画像全面梳理当前持有资质状态、到期预警，并调用 FastGPT 资质顾问工作流给出新资质申报建议。完成后写入到期提醒、推送小程序卡片。
+
+> ⚠️ **后端依赖**
+> - `GET {{{qualification.api_base}}}{{{qualification.enterprise_profile_path}}}` — 取企业工商+资质完整画像
+> - `GET {{{qualification.api_base}}}{{{qualification.qualification_check_path}}}` — 从天眼查同步专利/商标/证书/荣誉明细（含到期日）
+> - `POST {{{qualification.api_base}}}{{{qualification.save_result_path}}}` — 写资质分析结果，触发小程序卡片推送
+> - `POST {{{sop_webhook.qualification_reminder_url}}}` — 向 clawops 注册到期提醒（cron 任务发短信/webhook）
+> - `POST {{{qualification.fastgpt_url}}}/api/v1/chat/completions` — FastGPT 资质顾问工作流（申报建议）
+
+---
+
+## Inputs
+
+`sop_execute('qualification-check', payload={...})` 期望的 payload:
+
+- `enterprise_name` (string, **优先级最高**): 用户消息中明确指定的企业名
+- `openid` (string, 必填): 当前用户 openid
+
+**enterprise_name 兜底链**（按优先级）:
+1. payload 里明确传入的 `enterprise_name`
+2. `memory_recall(query="user_profile_company_name")`
+3. IDENTITY.md 里渲染的企业全称
+4. 都没有 → narrate "请告诉我要查哪家企业的资质信息" 并 `sop_advance status=Failed` 终止
+
+## 工作目录
+
+所有产物落到 `case/qualification-check/<enterprise_safe>/`：
+
+- `enterprise_safe` 规范化：取企业全称，空格 / `/` / `:` / `*` / `?` / `"` / `<` / `>` / `|` → `_`，其余保留
+- step 1 开始时 narrate `enterprise_safe="..."` 并后续严格复用
+
+---
+
+## Steps
+
+### Step 1：取企业基础画像
+
+- tools: http_request, file_write, memory_recall
+- notes:
+  (1) 按兜底链确定 `enterprise_name`；失败则 `sop_advance status=Failed`。
+  (2) 计算 `enterprise_safe`，narrate 出来。
+  (3) 调用接口，**必须带 fields 参数**：
+      ```
+      http_request GET {{{qualification.api_base}}}{{{qualification.enterprise_profile_path}}}
+        ?enterprise_name=<enterprise_name>
+        &agent_user_info={{sop_webhook.owner_openid}}
+        &fields=enterprise_id,qualification_enterprise_id,enterprise_name,basic_info,qualification_info
+      ```
+      期望 `data` 含：`enterprise_id`、`qualification_enterprise_id`、`basic_info`（工商）、`qualification_info`（专利/商标/资质证书/荣誉摘要）。
+  (4) 落盘 `case/qualification-check/<enterprise_safe>/profile.json`（直接保存 `data` 对象）。
+  (5) 记下 `enterprise_id` 和 `qualification_enterprise_id`，narrate 出来，后续步骤复用。
+  (6) 降级：4xx/5xx → narrate "企业画像服务暂时不可用" + `sop_advance status=Failed`。
+
+### Step 2：从天眼查同步完整资质明细
+
+- tools: http_request, file_write
+- notes:
+  (1) 调用后端天眼查同步接口，拉取带到期日的全量资质数据：
+      ```
+      http_request GET {{{qualification.api_base}}}{{{qualification.qualification_check_path}}}
+        ?enterprise_id=<enterprise_id>
+        &agent_user_info={{sop_webhook.owner_openid}}
+      ```
+      期望响应 `data` 含 6 类字段：
+      - `patents[]`：专利列表，每条含 `title`, `reg_no`, `status`, `apply_date`, `valid_date`, `annual_fee_date`
+      - `trademarks[]`：商标，含 `title`, `reg_no`, `status`, `valid_end_date`
+      - `certifications[]`：资质证书，含 `title`, `reg_no`, `valid_end_date`
+      - `honors[]`：荣誉，含 `title`, `valid_end_date`（可为空）
+      - `copyrights[]`：软著/著作权，含 `title`, `reg_no`, `register_date`
+      - `copyworks[]`：作品著作权，含 `title`
+  (2) 落盘 `case/qualification-check/<enterprise_safe>/tyc_detail.json`（完整 `data` 对象）。
+  (3) **size 自检**：若 `data` 为空或 `patents`/`trademarks`/`certifications` 全为空数组，narrate "天眼查暂无该企业资质数据" 并继续（不中止，可能是新企业）。
+  (4) 降级：接口 4xx/5xx → narrate 原因 + 继续执行（step 3 基于 profile.json 的 qualification_info 文字摘要分析）。
+
+### Step 3：FastGPT 资质顾问分析（申报建议）
+
+- tools: http_request, file_read, file_write
+- notes:
+  (1) file_read `profile.json`，提取 `basic_info` + `qualification_info` 组织企业信息文本：
+      ```
+      企业名称：<enterprise_name>
+      工商信息：<basic_info>
+      当前资质摘要：<qualification_info>
+      ```
+  (2) 调用 FastGPT 资质顾问工作流：
+      ```
+      http_request POST {{{qualification.fastgpt_url}}}/api/v1/chat/completions
+        Authorization: Bearer {{{qualification.fastgpt_token}}}
+        Content-Type: application/json
+        {
+          "appId": "{{{qualification.fastgpt_app_id}}}",
+          "chatId": "qual_<enterprise_id>",
+          "messages": [
+            {
+              "role": "user",
+              "content": "<上述企业信息文本>"
+            }
+          ],
+          "stream": false,
+          "detail": false
+        }
+      ```
+  (3) 解析响应：`choices[0].message.content` 是 JSON 字符串，parse 后期望格式：
+      ```json
+      {
+        "existing_qualifications": [
+          {
+            "name": "高新技术企业",
+            "type": "CERT",
+            "reg_no": "GF2024XXXXXX",
+            "expiry_date": "2026-12-31",
+            "status": "valid",
+            "advice": "建议提前6个月准备复审材料"
+          }
+        ],
+        "recommended_qualifications": [
+          {
+            "name": "专精特新中小企业",
+            "type": "CERT",
+            "match_status": "YES",
+            "advice": "研发投入占比符合条件，建议今年申报"
+          }
+        ]
+      }
+      ```
+  (4) 落盘 `case/qualification-check/<enterprise_safe>/analysis.json`（FastGPT 返回的解析结果）。
+  (5) 降级：FastGPT 接口失败 / 返回非 JSON → 跳过分析，继续 step 4（只做到期提醒）。
+
+### Step 4：计算到期提醒日期并注册
+
+- tools: file_read, http_request
+- notes:
+  (1) file_read `tyc_detail.json`（step 2 落盘），结合 `analysis.json`（step 3 落盘）提取所有到期日。
+  (2) **提醒时间规则**：
+      | 类型 | 提醒节点 |
+      |------|---------|
+      | 专利年费 (`annual_fee_date`) | 费用日前 90 天 |
+      | 专利年报 (`annual_report_date`) | 报告期开始前 14 天 |
+      | 商标续展 (`valid_end_date`) | 到期前 180 天、90 天 |
+      | 资质证书续期 (`valid_end_date`) | 到期前 180 天、90 天 |
+      | 荣誉复审 (`valid_end_date`) | 到期前 90 天（若有日期） |
+      只设置 **今天之后** 的提醒（过期的跳过）；同一资质最多设 2 个提醒节点。
+  (3) 构造 reminders 数组后调用 clawops：
+      ```
+      http_request POST {{{sop_webhook.qualification_reminder_url}}}
+        Content-Type: application/json
+        {
+          "openid": "{{sop_webhook.owner_openid}}",
+          "enterprise_name": "<enterprise_name>",
+          "qualification_enterprise_id": <qualification_enterprise_id>,
+          "reminders": [
+            {
+              "reminder_type": "CERT_RENEWAL",
+              "qualification_title": "高新技术企业",
+              "reg_no": "GF2024XXXXXX",
+              "remind_at": "2026-06-30T09:00:00+08:00",
+              "event_date": "2026-12-31"
+            }
+          ]
+        }
+      ```
+      ⚠️ `remind_at` 使用 ISO-8601 含时区（+08:00）；若无到期日则不为该资质生成提醒。
+  (4) 降级：提醒注册 4xx/5xx → narrate 警告但继续执行（不中止 SOP）。
+
+### Step 5：保存分析结果到后端
+
+- tools: file_read, http_request
+- notes:
+  (1) file_read `analysis.json`。
+  (2) 调用后端写库接口，触发小程序卡片推送：
+      ```
+      http_request POST {{{qualification.api_base}}}{{{qualification.save_result_path}}}
+        Content-Type: application/json
+        {
+          "enterprise_id": <enterprise_id>,
+          "enterprise_name": "<enterprise_name>",
+          "agent_user_info": "{{sop_webhook.owner_openid}}",
+          "analysis": <analysis.json 完整对象>
+        }
+      ```
+      期望响应 `data.qualification_enterprise_id`（若有则覆盖 step 1 拿到的值）。
+  (3) 降级：写库失败不中止，narrate 警告 + 继续 step 6。
+
+### Step 6：汇总结果回复用户
+
+- tools: file_read
+- notes:
+  (1) file_read `tyc_detail.json` + `analysis.json`，组织最终回复。
+  (2) 回复格式：
+
+      **当前持有资质（共 N 项）**
+      - 高新技术企业 ✅（有效至 2026-12-31，⚠️ 建议提前复审）
+      - 发明专利：XX 技术 ✅（年费截止 2026-09-01）
+      - ...
+
+      **建议申请（共 M 项）**
+      1. **专精特新中小企业** — <一句话理由>
+      2. ...
+
+      已为您设置到期提醒，届时将通过短信/消息通知您。
+
+      [查看资质详情页]({{{qualification.mini_program_detail_path}}}|{qualification_enterprise_id替换})
+
+  (3) 深链拼装：把 `{{{qualification.mini_program_detail_path}}}` 中的 `{qualification_enterprise_id}` 替换为 step 1/5 读到的实际 id 数字。格式：`[查看资质详情](<path>)`，前端拦截 `wx.navigateTo`。
+  (4) `sop_advance status=Done`。
+
+---
+
+## 自检
+
+1. `enterprise_id` 和 `qualification_enterprise_id` 是否来自本次 API 响应（非编造）？
+2. `remind_at` 是否只包含今天之后的时间？
+3. 深链里 `{qualification_enterprise_id}` 是否已替换为真实数字？
+4. FastGPT 失败是否只 narrate 警告而不中止整个 SOP？
+
+任一项 No → 回去修正。
+
+{{/if}}

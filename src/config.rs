@@ -35,35 +35,66 @@ pub struct Config {
     /// Key is the sop_name (e.g. "policy-match").
     #[serde(default)]
     pub sop_metadata: HashMap<String, SopMetadata>,
-    /// WeChat mini-program subscription message (订阅消息) settings.
     #[serde(default)]
-    pub wx_notify: WxNotifyConfig,
+    pub qualification: QualificationConfig,
 }
 
-/// WeChat subscription message push. Used by the activity-remind cron path:
-/// bot registers a reminder via POST /notify/subscribe; clawops sends
-/// subscribeMessage.send at the scheduled time.
+/// Qualification-check SOP backend settings.
 ///
-/// Leave `appid` empty to disable (reminders are stored but never sent).
+/// `api_base` is the same ztagent-service-api used by policy_match.
+/// `fastgpt_*` configure the FastGPT qualification advisory workflow
+/// (called in step 2 of the SOP for qualification recommendations).
+/// `sms_*` configure outbound SMS for mini-program users.
+/// `wecom_webhook_url` is a Feishu/Lark bot webhook for wecom uin: users.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct WxNotifyConfig {
-    /// Mini-program appid (same as the one users log in with).
+pub struct QualificationConfig {
+    /// ztagent-service-api base, e.g. "https://bdhrapi.2048office.com/wecom"
     #[serde(default)]
-    pub appid: String,
-    /// Mini-program appsecret (keep out of git — use env or secrets manager).
+    pub api_base: String,
+    /// Path for enterprise profile sync (shared with policy-match)
+    #[serde(default = "default_qual_enterprise_profile_path")]
+    pub enterprise_profile_path: String,
+    /// Path to sync qualification data from 天眼查 via backend
+    #[serde(default = "default_qual_check_path")]
+    pub qualification_check_path: String,
+    /// Path to save qualification analysis results
+    #[serde(default = "default_qual_save_result_path")]
+    pub save_result_path: String,
+    /// Mini-program qualification detail page path.
+    /// {qualification_enterprise_id} is replaced at runtime.
+    #[serde(default = "default_qual_mp_detail_path")]
+    pub mini_program_detail_path: String,
+    /// FastGPT server URL, e.g. "https://fastgpt.example.com"
     #[serde(default)]
-    pub appsecret: String,
-    /// 订阅消息 template_id from MP backend (审核通过后填入).
+    pub fastgpt_url: String,
+    /// Bearer token for FastGPT API
     #[serde(default)]
-    pub activity_remind_template_id: String,
-    /// Mini-program page to open when user taps the notification.
-    /// Default: activity detail page.
-    #[serde(default = "default_wx_notify_page")]
-    pub activity_remind_page: String,
+    pub fastgpt_token: String,
+    /// FastGPT app_id for the qualification advisory workflow
+    #[serde(default)]
+    pub fastgpt_app_id: String,
+    /// Generic SMS send endpoint. POST {"to": "<phone>", "content": "<text>"}
+    #[serde(default)]
+    pub sms_send_url: String,
+    /// Bearer token for SMS endpoint
+    #[serde(default)]
+    pub sms_api_key: String,
+    /// Feishu/Lark bot webhook for wecom uin: users
+    #[serde(default)]
+    pub wecom_webhook_url: String,
 }
 
-fn default_wx_notify_page() -> String {
-    "/pages/activity/details/Index".into()
+fn default_qual_enterprise_profile_path() -> String {
+    "/agent/enterprise_profile_sync".into()
+}
+fn default_qual_check_path() -> String {
+    "/agent/qualification_check".into()
+}
+fn default_qual_save_result_path() -> String {
+    "/agent/save_qualification_result".into()
+}
+fn default_qual_mp_detail_path() -> String {
+    "pages/qualification/index.html?id={qualification_enterprise_id}".into()
 }
 
 /// Metadata for one SOP. Drives:
