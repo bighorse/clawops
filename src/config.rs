@@ -42,8 +42,8 @@ pub struct Config {
 /// Qualification-check SOP backend settings.
 ///
 /// `api_base` is the same ztagent-service-api used by policy_match.
-/// `fastgpt_*` configure the FastGPT qualification advisory workflow
-/// (called in step 2 of the SOP for qualification recommendations).
+/// All AI analysis (existing qualification status + new recommendations)
+/// is performed directly by the local zeroclaw LLM — no external AI call.
 /// `sms_*` configure outbound SMS for mini-program users.
 /// `wecom_webhook_url` is a Feishu/Lark bot webhook for wecom uin: users.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -64,15 +64,6 @@ pub struct QualificationConfig {
     /// {qualification_enterprise_id} is replaced at runtime.
     #[serde(default = "default_qual_mp_detail_path")]
     pub mini_program_detail_path: String,
-    /// FastGPT server URL, e.g. "https://fastgpt.example.com"
-    #[serde(default)]
-    pub fastgpt_url: String,
-    /// Bearer token for FastGPT API
-    #[serde(default)]
-    pub fastgpt_token: String,
-    /// FastGPT app_id for the qualification advisory workflow
-    #[serde(default)]
-    pub fastgpt_app_id: String,
     /// Generic SMS send endpoint. POST {"to": "<phone>", "content": "<text>"}
     #[serde(default)]
     pub sms_send_url: String,

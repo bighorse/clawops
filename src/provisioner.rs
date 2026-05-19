@@ -59,11 +59,6 @@ fn http_allowed_domains_toml(cfg: &Config) -> String {
             push_unique(&mut hosts, h);
         }
     }
-    if !cfg.qualification.fastgpt_url.is_empty() {
-        if let Some(h) = extract_host(&cfg.qualification.fastgpt_url) {
-            push_unique(&mut hosts, h);
-        }
-    }
     let quoted: Vec<String> = hosts.iter().map(|h| format!("\"{h}\"")).collect();
     format!("[{}]", quoted.join(", "))
 }
@@ -275,9 +270,6 @@ impl Provisioner {
                 "qualification_check_path": self.cfg.qualification.qualification_check_path,
                 "save_result_path": self.cfg.qualification.save_result_path,
                 "mini_program_detail_path": self.cfg.qualification.mini_program_detail_path,
-                "fastgpt_url": self.cfg.qualification.fastgpt_url,
-                "fastgpt_token": self.cfg.qualification.fastgpt_token,
-                "fastgpt_app_id": self.cfg.qualification.fastgpt_app_id,
                 "enabled": !self.cfg.qualification.api_base.is_empty(),
             },
             "sop_webhook": {
@@ -490,9 +482,6 @@ impl Provisioner {
                 "qualification_check_path": self.cfg.qualification.qualification_check_path,
                 "save_result_path": self.cfg.qualification.save_result_path,
                 "mini_program_detail_path": self.cfg.qualification.mini_program_detail_path,
-                "fastgpt_url": self.cfg.qualification.fastgpt_url,
-                "fastgpt_token": self.cfg.qualification.fastgpt_token,
-                "fastgpt_app_id": self.cfg.qualification.fastgpt_app_id,
                 "enabled": !self.cfg.qualification.api_base.is_empty(),
             },
             "sop_webhook": {
