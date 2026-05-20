@@ -187,36 +187,48 @@
         }
         ```
      (5) **`requirement` 字段不要漏写**:写库时后端按这个字段建 `EnterprisePolicySummaryCondition` 行,空字符串会污染前端展示。
-
-5. **写库 + 触发小程序卡片推送** — 把匹配结果 + 条件分析一次性原子写入后端,后端触发小程序政策匹配页卡片推送。
-   - tools: file_read, http_request
-   - notes:
-     (1) file_read `match.json` 和 `condition.json`,合并组装为请求 body。
-     (2) 调用:
-        ```
-        http_request POST {{{policy_match.api_base}}}{{{policy_match.save_match_result_path}}}
-          Content-Type: application/json
-          body: {
-            "enterprise_id": <step 1 拿到的>,
+     (6) **【P0 合并输出 — 在本步完成,不要留到 step 5】** 在 `condition.json` 落盘之后,立刻写入 `case/policy-match/<enterprise_safe>/request_body.json`。构造方式:
+        - 遍历 `match.json` 里的每个 `matched_policies` 元素(共 N 条);
+        - 对每条,在 `condition.json` 的 `conditions_by_policy[]` 里找 `policy_summary_id` 相同的那条,取出它的 `conditions[]`;
+        - 把 `conditions[]` 注入到该 `matched_policies` 元素中,组成完整条目;
+        - 最终 schema:
+          ```json
+          {
+            "enterprise_id": <从 match.json>,
             "agent_user_info": "{{openid}}",
             "matched_policies": [
               {
                 "policy_summary_id": <id>,
-                "match_reason": "...",
-                "rank": 1,
+                "policy_summary_name": "<政策名>",
+                "match_reason": "<≤15字>",
+                "rank": <int>,
                 "expired": false,
                 "conditions": [
-                  {"requirement": "...", "enterprise_profile": "...", "match_status": "yes"}
+                  {"requirement": "...", "enterprise_profile": "...", "match_status": "yes|no|partial|unknown"}
                 ]
               }
             ]
           }
+          ```
+        - **size 自检**: `request_body.json` 期望 5-40 KB;`matched_policies[]` 长度必须等于 `match.json` 里 `matched_policies[]` 长度(0 或 N 条),**不能变成空数组**。若发现 `matched_policies` 变成 `[]` 说明 join 失败,必须重试合并。
+        - **`agent_user_info` 字段**: 直接把 `{{openid}}` 字面量写入文件即可(字符串)。
+
+5. **写库 + 触发小程序卡片推送** — 读 step 4 已合并好的请求体,一次性原子写入后端,后端触发小程序政策匹配页卡片推送。
+   - tools: file_read, http_request
+   - notes:
+     (1) file_read `request_body.json`(step 4 已完成 match.json + condition.json 的合并,本步**只读这一个文件**,不要再次 file_read match.json / condition.json)。
+     (2) 调用(body 直接用 `request_body.json` 的完整内容,不要手动重构字段):
         ```
+        http_request POST {{{policy_match.api_base}}}{{{policy_match.save_match_result_path}}}
+          Content-Type: application/json
+          body: <request_body.json 的完整内容>
+        ```
+        ⚠️ **禁止**在本步重新构造 `matched_policies` 数组 — step 4 已经做好了合并,直接发送即可。重新构造极易变成空数组。
      (3) 期望后端语义(本 SOP 假定后端契约):**原子替换** — 先按 `enterprise_id` 清空旧 `EnterprisePolicySummary` + `EnterprisePolicySummaryCondition`,再写入新数据,**同时触发** Redis weapp 推送通道(小程序政策匹配页卡片由前端订阅 SSE/轮询拿到刷新)。
      (4) **降级**:
         - 接口 4xx → 大概率是 schema 不匹配或 enterprise_id 不存在,narrate 错误内容,**仍继续 step 6** 把已算出的结果在对话里展示给用户(不至于让用户白等),但提醒"小程序政策匹配页可能未同步"
         - 接口 5xx → narrate "结果保存暂时失败",继续 step 6 展示对话回复,但提醒"请稍后到小程序政策匹配页刷新"
-     (5) **空匹配跳过**: `matched_policies` 为空数组时,**不调** POST(避免清空用户已有匹配数据),直接推进到 step 6。
+     (5) **空匹配跳过**: `request_body.json` 里 `matched_policies` 为空数组时,**不调** POST(避免清空用户已有匹配数据),直接推进到 step 6。
 
 6. **对话回复概要 + 引导留资** — 在飞书/小程序对话内输出可读的概要,引导用户到小程序看详情 + 主动建议留资。
    - tools: file_read
