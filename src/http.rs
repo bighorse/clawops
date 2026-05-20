@@ -594,10 +594,15 @@ async fn chat(
             let display_name = sop_meta
                 .map(|m| m.display_name_cn.as_str())
                 .unwrap_or(sop_name.as_str());
-            let chat_response = format!(
-                "已为您发起「{}」，可在右上角任务列表查看进度。",
-                display_name
-            );
+            // WeChat/WeCom users (uin: prefix) have no task-list UI; give a
+            // simple wait message. The SOP itself delivers the final reply via
+            // the backend messaging channel. Mini-program users get the full
+            // task-list prompt.
+            let chat_response = if user.openid.starts_with("uin:") {
+                format!("正在为您处理「{}」，请稍候，完成后会主动通知您。", display_name)
+            } else {
+                format!("已为您发起「{}」，可在右上角任务列表查看进度。", display_name)
+            };
             if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &chat_response).await {
                 tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
             }
