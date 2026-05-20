@@ -536,14 +536,13 @@ async fn chat(
                 None
             };
 
-            // 3rd source: recent chat history — ONLY for explicit re-run commands.
-            // Guard: current message must look like a retry (short, no partial company name),
-            // not a new-company query like "X公司适合的政策". Without this guard,
-            // from_history incorrectly returns the PREVIOUS company when the user asks
-            // about a different one, causing SOP to run for the wrong enterprise.
-            let from_history: Option<String> = if from_db.is_none() && from_message.is_none()
-                && is_rerun_command(&req.content)
-            {
+            // 3rd source: recent chat history — used whenever the current message
+            // contains no company name. If from_message already extracted a name (user
+            // specified a new company inline), from_history is skipped. If the user
+            // says a bare SOP trigger ("政策匹配") without naming a company, we look in
+            // history rather than prompting again — this matches user expectation and
+            // avoids the "amnesia" loop where every re-trigger re-asks for the name.
+            let from_history: Option<String> = if from_db.is_none() && from_message.is_none() {
                 match chat_history::fetch_page(&st.pool, &user.openid, None, 10).await {
                     Ok(msgs) => msgs
                         .iter()
@@ -1132,23 +1131,6 @@ async fn internal_sop_event(
 
 /// Return true if `name` looks like a full Chinese company legal name.
 /// True if the message is a short re-run command with no new company context.
-/// Used to gate the chat-history fallback: only look up a previous company name
-/// when the user says "重新跑" / "再来一次" etc., NOT when they mention a new firm.
-fn is_rerun_command(text: &str) -> bool {
-    let t = text.trim();
-    // Must be short (≤ 20 chars) — a real company query is longer.
-    if t.chars().count() > 20 {
-        return false;
-    }
-    // Must not contain any partial company-name suffix that could indicate a NEW company.
-    let company_signals = ["公司", "企业", "集团", "中心", "研究院", "合伙", "事务所"];
-    if company_signals.iter().any(|s| t.contains(s)) {
-        return false;
-    }
-    let rerun_keywords = ["重新跑", "再跑", "重跑", "再来一次", "重新来", "重试", "再试", "重新匹配", "再匹配一次"];
-    rerun_keywords.iter().any(|k| t.contains(k))
-}
-
 fn looks_like_full_company_name(name: &str) -> bool {
     const SUFFIXES: &[&str] = &[
         "有限公司", "有限责任公司", "股份有限公司", "股份合作公司",
@@ -1165,8 +1147,11 @@ fn extract_company_name_from_text(text: &str) -> Option<String> {
         "有限公司", "有限责任公司", "股份有限公司", "股份合作公司",
         "集团有限公司", "集团股份有限公司", "合伙企业", "研究院", "研究所",
     ];
+    // Full-width parentheses （） are intentionally excluded: Chinese company
+    // names frequently embed region info as "中拓产业云（北京）科技服务有限公司".
+    // Treating them as delimiters would truncate the name to "科技服务有限公司".
     const DELIMITERS: &[char] = &[
-        ' ', '　', ',', '，', '。', '！', '？', '\n', '(', '（', ')', '）',
+        ' ', '　', ',', '，', '。', '！', '？', '\n', '(', ')',
         '"', '"', '「', '」', '【', '】', ':', '：',
     ];
     let chars: Vec<char> = text.chars().collect();
