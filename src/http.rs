@@ -1031,14 +1031,38 @@ async fn internal_sop_event(
     match payload.event.as_str() {
         "starting" => {
             // Task creation is owned by /chat (after enterprise-name validation).
-            // Here we only transition pending → running so the UI shows "进行中".
-            if let Some(task_id) = sop_tasks::find_pending_by_sop(&st.pool, &openid, &payload.sop_name).await? {
+            // Here we transition pending → running so the UI shows "进行中".
+            // Race: zeroclaw fires this webhook before /chat finishes inserting the
+            // pending row. Retry once after a short delay before falling back to
+            // creating a running task directly.
+            let task_id = sop_tasks::find_pending_by_sop(&st.pool, &openid, &payload.sop_name).await?;
+            let task_id = if task_id.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                sop_tasks::find_pending_by_sop(&st.pool, &openid, &payload.sop_name).await?
+            } else {
+                task_id
+            };
+            if let Some(task_id) = task_id {
                 sop_tasks::mark_running(&st.pool, &task_id).await?;
                 emit_sop_event(&st, &task_id, &openid, "running");
                 tracing::debug!(openid = %openid, task_id = %task_id, "sop webhook: starting → running");
             } else {
-                tracing::debug!(openid = %openid, sop_name = %payload.sop_name,
-                    "sop webhook: starting — no pending task yet (race), will mark running on done");
+                // Still no pending task — create a running row directly so the UI
+                // can show "进行中". /chat may create a duplicate later; the done
+                // handler will find whichever row was created first.
+                let task_id = sop_tasks::new_task_id();
+                let sop_meta = st.cfg.sop_metadata.get(payload.sop_name.as_str());
+                let estimated_seconds = sop_meta.map(|m| m.estimated_seconds).unwrap_or(540);
+                if let Err(e) = sop_tasks::insert_pending(
+                    &st.pool, &task_id, &openid, &payload.sop_name, None, estimated_seconds,
+                ).await {
+                    tracing::warn!(openid = %openid, task_id = %task_id, "failed to insert fallback running task: {e}");
+                } else {
+                    sop_tasks::mark_running(&st.pool, &task_id).await?;
+                    emit_sop_event(&st, &task_id, &openid, "running");
+                    tracing::debug!(openid = %openid, task_id = %task_id, sop_name = %payload.sop_name,
+                        "sop webhook: starting — created fallback running task");
+                }
             }
             Ok(Json(serde_json::json!({"ok": true})))
         }
