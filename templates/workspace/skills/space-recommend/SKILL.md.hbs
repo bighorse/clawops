@@ -131,9 +131,11 @@ http_request POST {{{space.api_base}}}/parks/query_list
 | `name` | 名称 |
 | `area` | 总面积(㎡) |
 | `address` | 地址 |
-| `investment_direction` | 招商方向(逗号分隔字符串) |
+| `investment_direction` | 招商方向(逗号分隔字符串，**或枚举 ID 数组**) |
 | `investment_fund` | 投资基金:1 行政;2 财政;3 无 |
-| `service_matching` | 服务配套(逗号分隔字符串) |
+| `service_matching` | 服务配套(逗号分隔字符串，**或枚举 ID 数组**) |
+
+> ⚠️ **`investment_direction` / `service_matching` ID 处理规则**：这两个字段有时返回纯数字/ID（如 `"314,315,322"` 或 `[1,3,4,5,239]`），而不是可读中文。**判断方法**：如果所有分隔值都是纯数字，说明是未解析的枚举 ID。此时**不要把原始数字展示给用户**（显示 ID 对用户毫无意义）。处理方式：整行省略（不要写 "招商方向:314,315,322"），末尾引导用户点详情页查看完整信息即可。
 | `space_images` | 图片列表 |
 | `profile` | 详细介绍(**可能含 HTML,剥标签**) |
 | `investment_policy` | 招商政策(同上,剥标签) |
@@ -238,11 +240,13 @@ API 列表端点**不支持** `status` 查询参数,所以 LLM **必须端侧过
 **N. <name>** — <enterprise_name>
 - 地址:<address>
 - 总面积:<area> ㎡
-- 招商方向:<investment_direction 转中文,原样列>
-- 服务配套:<service_matching 转中文,挑 3-5 个>
+- 招商方向:<investment_direction 转中文,原样列；若全是数字 ID 则整行省略>
+- 服务配套:<service_matching 转中文,挑 3-5 个；若全是数字 ID 则整行省略>
 - 简介:<profile 剥 HTML 截 60 字>
 - [查看众创空间详情](众创空间详情路径模板里的 `{id}` 替换成本条 id)
 ```
+
+⚠️ **禁止展示 ID 数字**：若 `investment_direction` 或 `service_matching` 拆分后所有元素均为纯数字，**整行不输出**。没有就省略，不要写 "招商方向:1,3,4,5" 这类对用户无意义的内容。
 
 **厂房 / 办公室 / 工位 / 产业用地**:这些资源**没有独立详情页**,在简介后给出**所属园区或众创空间**的链接(从 `park_id` 或 `maker_space_id` 反推),例如:
 
@@ -320,6 +324,7 @@ http_request GET {{{space.api_base}}}/space_show/maker_space/item?maker_space_id
 |------|------|
 | API 401/403 | 告诉用户"空间库暂时不可用",**不**编造空间 |
 | 搜无结果(`data_count=0`) | 换 keyword/筛选条件重试 1 次(用更宽的词或减条件);仍无 → 告诉用户"暂无符合条件的空间,可以告诉我具体面积区间 / 行业方向 / 心理价位再试" |
+| **用户明确说"X 有空间"但搜不到** | **必须二次搜索再下结论**：(1) 用更短的关键词重试（如"长城海纳硬科技加速器"→"长城海纳"）；(2) 不带 keyword 拉全量推荐/列表，端侧模糊匹配名称；(3) 分别查 parks 和 maker_space 两个模块。三步后仍无 → 告知"系统目前未录入该空间的公开信息，建议直接联系运营方了解"。**禁止直接说"数据库/DB 没有"** — 你查的是公开 API，平台后台可能有数据只是未上线展示，说"DB 没有"是错误断言。 |
 | POST 422 / 400 | body 里枚举值或区间字符串可能错了 — 把可疑参数去掉重试一次;仍错 → 改走 GET `/parks/front/recommend/list` |
 | 网络超时(`http_request` 失败) | 告诉用户"空间平台暂时取不到,稍后再试",**不**编造 |
 | 用户问"帮我预订/锁定/谈价" | "我这里只做推荐和信息对比,锁定/谈价请到详情页留联系方式或直接联系运营方:[联系电话]" — **不调** POST |
