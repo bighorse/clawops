@@ -91,12 +91,6 @@ Content-Type: application/json
 
 ⚠️ **链接构造是内部操作，绝对不要把处理过程输出给用户**：在你脑子里完成，直接写入最终回复，不要 narrate"第1步去掉html、第2步加斜杠"。规则：把 `data.wechat_page_url`（如 `pages/qualification/index.html?id=44`）去掉 `.html`、补 `/` 前缀，得到 `/pages/qualification/index?id=44`，直接用这个值替换 `[查看企业资质详情](...)` 括号里的内容。
 
-末尾**固定加**：
-
-```
-详情页包含企业资质现状、到期提醒和可申报资质建议。如需深度资质分析（天眼查数据同步 + 专业申报路径规划），告诉我即可启动完整流程。
-```
-
 **HTTP 非 200 — 失败**：
 
 直接告知用户：
