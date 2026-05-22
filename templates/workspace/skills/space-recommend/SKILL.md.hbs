@@ -211,7 +211,7 @@ http_request GET {{{space.api_base}}}/data/base/list?data_type=1
 - 价格：<average_price 元/㎡/月，0/null 时写"面议">
 - 招商方向：<investment_direction 数组中每个 .name，逗号分隔；空则省略此行>
 - 简介：<description 剥 HTML 截 60 字内，带省略号；为空则省略>
-- [查看园区详情]({{{space.park_detail_path_template}}} 把 {id} 换成 park_id)
+- 详情页路径：{{{space.park_detail_path_template}}}（把 `{id}` 替换为 park_id）
 ```
 
 **众创空间**模板：
@@ -223,7 +223,7 @@ http_request GET {{{space.api_base}}}/data/base/list?data_type=1
 - 工位价格：<station_min_unit_price 元/工位/月；null 时省略>
 - 办公室价格：<office_min_unit_price 元/间/月；null 时省略>
 - 服务配套：<用 data/base/list?data_type=1 字典解析后的中文名列表，挑前 3–5 个；若解析结果为空或全是数字则整行省略>
-- [查看众创空间详情]({{{space.maker_space_detail_path_template}}} 把 {id} 换成 maker_space id)
+- 详情页路径：{{{space.maker_space_detail_path_template}}}（把 `{id}` 替换为 maker_space_id）
 ```
 
 ⚠️ **服务配套 / 招商方向严禁展示原始数字 ID**：
