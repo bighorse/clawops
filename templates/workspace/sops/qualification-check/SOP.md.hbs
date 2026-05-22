@@ -231,9 +231,9 @@
       ---
       已设置 K 个到期提醒，届时将通过短信/消息提醒您。
 
-      [查看资质详情](<mini_program_detail_path，{qualification_enterprise_id} 替换为真实数字>)
+      [查看资质详情](/pages/qualification/index?id=<qualification_enterprise_id 真实数字>)
 
-  (3) 深链拼装：`{{{qualification.mini_program_detail_path}}}` 中的 `{qualification_enterprise_id}` 替换为 Step 1/5 实际的 id 数字（Markdown 链接格式，前端拦截 `wx.navigateTo`）。
+  (3) 深链拼装：格式固定为 `/pages/qualification/index?id=<qualification_enterprise_id>`，把 `<qualification_enterprise_id>` 替换为 Step 1/5 拿到的实际数字。**注意**：不带 `.html`，路径开头有 `/`，例如 id=44 → `/pages/qualification/index?id=44`。
   (4) `sop_advance status=Done`。
 
 ---

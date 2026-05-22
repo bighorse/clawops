@@ -89,7 +89,11 @@ Content-Type: application/json
 [查看企业资质详情](把 wechat_page_url 代入路径模板)
 ```
 
-资质详情路径模板：`{{{qualification.mini_program_detail_path}}}` —— 响应里 `wechat_page_url` 已经是完整路径（如 `pages/qualification/index.html?id=44`），**直接用**，不需要替换占位符。
+链接构造规则：响应里 `data.wechat_page_url` 格式为 `pages/qualification/index.html?id=N`，**必须做两步处理**后再用：
+1. 去掉 `.html` 后缀 → `pages/qualification/index?id=N`
+2. 在开头加 `/` → `/pages/qualification/index?id=N`
+
+例如 `pages/qualification/index.html?id=44` → 链接目标 `/pages/qualification/index?id=44`。
 
 末尾**固定加**：
 
