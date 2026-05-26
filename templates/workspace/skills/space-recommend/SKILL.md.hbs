@@ -218,10 +218,12 @@ http_request GET {{{space.api_base}}}/data/base/list?data_type=1
 - 建筑面积：<floor_area> ㎡（使用面积：<usable_area> ㎡）
 - 价格：<office_price 元/月；0/null 时写"面议">
 - 可容纳：<max_capacity> 人（0/null 时省略此行）
-- [查看所在众创空间](把 maker_space_id 代入众创空间详情路径模板)
+- [查看所在空间详情](把 maker_space_id 代入众创空间详情路径模板)（进入后点击「联系预约」，注明房间号 <office_name>）
 ```
 
 众创空间详情路径模板：`{{{space.maker_space_detail_path_template}}}` —— 把 `{id}` 换成 `maker_space_id`。
+
+⚠️ **独立办公室没有独立详情页**——小程序的众创空间详情页只展示部分房间，用户可能看不到具体房间号。因此每条办公室回复里**必须把房间号（`office_name`）在正文中写清楚**，引导用户在详情页联系时主动说明房间号。
 
 **园区**模板：
 
