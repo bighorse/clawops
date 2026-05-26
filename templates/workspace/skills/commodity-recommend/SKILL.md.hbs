@@ -69,9 +69,24 @@
 
 ## 执行流程:5 步自主售前
 
-### Step 1:理解需求,确定关键词
+### Step 1:理解需求,确定搜索策略
 
-用关键词速查表把用户诉求转成 API 参数:
+**优先级:能确定分类 ID → 用 category_ids 参数;不能确定 → 用 keyword 参数。**
+
+#### A. 分类 ID 速查表(精确,优先用)
+
+| 用户诉求 | category_ids 参数 |
+|---------|-----------------|
+| 大科学装置 / 大科学设施 / 同步辐射 / 散裂中子 | `260` |
+| 交叉研究平台 / 多学科平台 / 协同研究平台 | `261` |
+| 科教基础设施 / 科学教育设施 | `262` |
+| 科技资源（泛指/未细化） | `207` |
+| 科技金融 / 融资 / 贷款 / 担保 | `205` |
+| 成果转化 / 技术转让 / 专利运营 | `208` |
+| 供需对接 / 技术外包 / 创意设计 | `311` |
+| 政策服务 / 资质代办 / 补贴申报 | `206` |
+
+#### B. 关键词速查表(分类不明确时用)
 
 | 用户诉求 | keyword 参数 |
 |---------|-------------|
@@ -91,9 +106,22 @@
 
 ⚠️ **/services/products 端点必须带这两个状态过滤** —— `status=ONLINE&shop_status=ONLINE`。前者剔除产品自身下架/审核中的;后者剔除产品挂在已下线商家名下的"幽灵产品"。**没带这两个参数的查询都是错的**,会推荐出已经摘下来的、用户点进去看不到的产品。
 
+**路径 A(有分类 ID)——优先走此路径:**
+
 ```
 http_request GET {{commodity.api_base}}/services/products
-  ?keyword=<速查表的值>
+  ?category_ids=<速查表 A 的值>
+  &status=ONLINE
+  &shop_status=ONLINE
+  &page_size=10
+  &page_index=1
+```
+
+**路径 B(无分类 ID,用关键词):**
+
+```
+http_request GET {{commodity.api_base}}/services/products
+  ?keyword=<速查表 B 的值>
   &status=ONLINE
   &shop_status=ONLINE
   &page_size=10
@@ -133,10 +161,10 @@ http_request GET {{commodity.api_base}}/categories?tree=true&page_size=50
 **N. <service_name>** — <shop_name>
 - 价格:¥<min_price>–<max_price>/件 (price 全为 0 时写"面议")
 - 简介:<description 截到 60 字内,带省略号>
-- [查看详情](该产品 id 替换到路径模板里的链接)
+- [查看详情](<路径>)
 ```
 
-链接路径模板: `{{commodity.detail_path_template}}` —— 把 `{id}` 换成 API 返回的实际 `id` 数字。比如 id=370 → 链接目标 `/pages/products/detail?id=370`。
+**链接构造规则(内部操作,不要 narrate 给用户)**:路径模板是 `{{commodity.detail_path_template}}`，把其中的 `{id}` 替换为 API 返回的实际 `id` 数字，直接填入括号。例如 API 返回 `id=370` → 链接为 `[查看详情](/pages/products/detail?id=370)`。**每条产品都必须有这个链接**,漏掉就是错的。
 
 末尾固定加:
 
@@ -191,7 +219,7 @@ http_request GET {{commodity.api_base}}/services/products/<obj_id>
 
 1. **我列的产品 id**,是不是来自这一轮 `http_request` 响应的 `data[].id`?如果不是,**不要回答** —— 必须先调 API。
 2. **我列的价格**,是不是 API 响应的 `min_price`/`max_price`?如果是 0/null,我有没有写"面议"?
-3. **我的链接** `[查看详情](path)` 里,`path` 是不是把 `{id}` 换成了**真 id 数字**?
+3. **我的每条产品**,都有 `[查看详情](/pages/products/detail?id=<真实数字>)` 链接吗?漏掉任何一条 → 回去补。
 4. **数量类回答**:我报的总数字,是不是对应**正确的端点**?(产品 vs 商家 vs 分类是三个不同的 API,数字不能混用)
 5. **数量类回答**:我报的数字,跟我同时列出来的清单条数**对得上**吗?对不上(比如说"20 个分类"但只列出 9 个)→ **回去重数**,数据有重复要去重。
 
