@@ -99,13 +99,20 @@
 
 ⚠️ **/services/products 端点必须带这两个状态过滤** —— `status=ONLINE&shop_status=ONLINE`。前者剔除产品自身下架/审核中的;后者剔除产品挂在已下线商家名下的"幽灵产品"。**没带这两个参数的查询都是错的**,会推荐出已经摘下来的、用户点进去看不到的产品。
 
+URL 必须写在**一行**,查询参数通过 `?key=value&key2=value2` 拼接,**不要换行**:
+
 ```
-http_request GET {{commodity.api_base}}/services/products
-  ?<Step 1 确定的查询参数字符串>
-  &status=ONLINE
-  &shop_status=ONLINE
-  &page_size=10
-  &page_index=1
+http_request GET {{commodity.api_base}}/services/products?<Step1查询参数字符串>&status=ONLINE&shop_status=ONLINE&page_size=10&page_index=1
+```
+
+示例 — 大科学装置:
+```
+http_request GET {{commodity.api_base}}/services/products?category_ids=260&status=ONLINE&shop_status=ONLINE&page_size=10&page_index=1
+```
+
+示例 — 商务服务关键词:
+```
+http_request GET {{commodity.api_base}}/services/products?keyword=工商&status=ONLINE&shop_status=ONLINE&page_size=10&page_index=1
 ```
 
 如果 `data_count < 3`,补一把运营推荐:
