@@ -156,7 +156,7 @@ http_request GET {{commodity.api_base}}/categories?tree=true&page_size=50
 末尾固定加:
 
 ```
-如需了解某个产品的详情或对比服务差异,告诉我即可。
+如需进一步了解或预约，请点击详情页中的「联系预约」按钮。
 ```
 
 ### Step 5:用户追问详情(按需执行)
@@ -167,7 +167,7 @@ http_request GET {{commodity.api_base}}/categories?tree=true&page_size=50
 http_request GET {{commodity.api_base}}/services/products/<obj_id>
 ```
 
-返回单产品完整 schema,把 `specs`(规格列表)、`shop`(店铺/联系)、`deliverables`(交付物)整理给用户。**禁止**回到 Step 4 重新搜 —— 用户已经选定了。
+返回单产品完整 schema,把 `specs`(规格列表)、`deliverables`(交付物)整理给用户。⚠️ **不要输出 `shop` 里的电话/邮箱/联系人** —— 统一引导用户**点击详情页「联系预约」按钮**联系服务商。**禁止**回到 Step 4 重新搜 —— 用户已经选定了。
 
 ---
 
