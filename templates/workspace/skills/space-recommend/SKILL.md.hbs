@@ -39,6 +39,8 @@
 | **园区详情** | `{{{space.api_base}}}/parks/item?id={park_id}` | GET |
 | **众创空间列表** | `{{{space.api_base}}}/space_show/maker_space/list?status=2&page_index=1&page_size=10` | GET |
 | **众创空间详情** | `{{{space.api_base}}}/space_show/maker_space/item?maker_space_id={id}` | GET |
+| **独立办公室列表** | `{{{space.api_base}}}/space_show/office/list?status=2&page_index=1&page_size=30` | GET |
+| **独立办公室详情** | `{{{space.api_base}}}/space_show/office/item?office_id={id}` | GET |
 | **基础字典（解析 ID）** | `{{{space.api_base}}}/data/base/list?data_type={N}` | GET |
 | 厂房列表 | `{{{space.api_base}}}/space_show/workshop/list?status=2&page_index=1` | GET |
 | 厂房详情 | `{{{space.api_base}}}/space_show/workshop/item?workshop_id={id}` | GET |
@@ -145,8 +147,9 @@
 
 | 用户诉求 | 资源类型 | 主入口 |
 |---------|---------|--------|
-| 办公室 / 园区 / 楼宇 / 选址 / 落地 / 具体园区名 | **园区** | `POST /parks/new_query_list` |
-| 众创空间 / 联合办公 / 孵化器 / 加速器 / 工位 / 独立办公室 | **众创空间** | `GET /space_show/maker_space/list?status=2` |
+| **独立办公室 / 办公间 / 租房间 / 指定面积（如 100–1000㎡）** | **独立办公室** | `GET /space_show/office/list?status=2&page_size=30` — 拉全量后**端侧按 `floor_area` 过滤**面积范围 |
+| 众创空间 / 联合办公 / 孵化器 / 加速器 / 工位 / 共享工位 | **众创空间** | `GET /space_show/maker_space/list?status=2` |
+| 园区 / 楼宇 / 选址 / 落地 / 具体园区名 | **园区** | `POST /parks/new_query_list` |
 | 厂房 / 研发用房 | 厂房 | `GET /space_show/workshop/list?status=2` |
 | 产业用地 | 产业用地 | `GET /space_show/industrial_land/list?status=2` |
 | 不确定（"找个地方落地"等泛问题）| 同时查园区 + 众创空间 | 两个 API 都调 |
@@ -189,6 +192,11 @@ http_request GET {{{space.api_base}}}/data/base/list?data_type=1
 
 ### Step 3：可行性校验（过滤候选）
 
+**独立办公室**：API 不支持服务端面积过滤，必须**端侧过滤**：
+1. 对返回的 `.data.data[]`，保留 `floor_area >= 用户下限` 且 `floor_area <= 用户上限` 的房间
+2. 若无精确匹配，放宽到"最接近的 5 间"，告知用户"当前平台面积最大的办公室是 XXX ㎡"
+3. `direction` 字段格式为 `,4,5,`（头尾有逗号），需去除空字符串后按逗号分隔为 ID 数组，用 `data_type=4` 字典解析
+
 **园区**：`new_query_list` 后端已过滤状态，无需端侧 status 过滤。过滤条件：
 1. `park_name` 与用户诉求真实相关
 2. 无价格信息（`average_price=0` 或 null）写"面议"，不编造数字
@@ -203,12 +211,24 @@ http_request GET {{{space.api_base}}}/data/base/list?data_type=1
 
 ⚠️ **铁律**：列出的每一个字段、数字、词，都必须来自 API 响应原文。不补全名字、不编造地标、不合并字段做语义包装、不猜招商方向。
 
+**独立办公室**模板：
+
+```
+**N. <office_name>** — <maker_space_name>
+- 建筑面积：<floor_area> ㎡（使用面积：<usable_area> ㎡）
+- 价格：<office_price 元/月；0/null 时写"面议">
+- 可容纳：<max_capacity> 人（0/null 时省略此行）
+- [查看所在众创空间](把 maker_space_id 代入众创空间详情路径模板)
+```
+
+众创空间详情路径模板：`{{{space.maker_space_detail_path_template}}}` —— 把 `{id}` 换成 `maker_space_id`。
+
 **园区**模板：
 
 ```
 **N. <park_name>** — <provider_name>
 - 地址：<park_address>
-- 面积：<gross_floor_area 或 area>（0/null 时省略此行）
+- 占地面积：<area> 亩（0/null 时省略此行）
 - 价格：<average_price 元/㎡/月，0/null 时写"面议">
 - 招商方向：<investment_direction 数组中每个 .name，逗号分隔；空则省略此行>
 - 简介：<description 剥 HTML 截 60 字内，带省略号；为空则省略>
