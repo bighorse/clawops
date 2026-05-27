@@ -90,7 +90,7 @@ max_concurrent = 2
 
 # ── Agent ──────────────────────────────────────────────────
 [agent]
-compact_context = false
+compact_context = true
 max_tool_iterations = 80
 max_history_messages = 30
 parallel_tools = false
@@ -99,6 +99,7 @@ tool_dispatcher = "auto"
 # ── Skills ─────────────────────────────────────────────────
 [skills]
 open_skills_enabled = false
+prompt_injection_mode = "compact"
 
 # Heartbeat is intentionally omitted — ClawOps drives any reminders.
 # Empty section would still require interval_minutes; falling back to
@@ -174,7 +175,7 @@ timeout_secs = 15
 enabled = true
 allowed_domains = ["*"]
 blocked_domains = []
-max_response_size = 524288
+max_response_size = 50000
 timeout_secs = 30
 
 [http_request]
@@ -182,7 +183,7 @@ enabled = true
 # Whitelist (provisioner injects host names extracted from commodity.api_base
 # and lead.webhook_url; empty = all hosts blocked, which prevents tools).
 allowed_domains = {{{http_allowed_domains_toml}}}
-max_response_size = 1048576
+max_response_size = 50000
 timeout_secs = 30
 
 # ── Cost tracking ──────────────────────────────────────────
