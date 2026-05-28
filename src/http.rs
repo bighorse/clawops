@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::SqlitePool;
@@ -640,6 +641,8 @@ async fn chat(
         }
     }
 
+    let response_text = sanitize_assistant_response(&response_text);
+
     if let Err(e) =
         chat_history::record_turn(&st.pool, &user.openid, &req.content, &response_text).await
     {
@@ -1239,6 +1242,99 @@ fn extract_company_name_from_text(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn sanitize_assistant_response(text: &str) -> String {
+    sanitize_qualification_success_response(text).unwrap_or_else(|| text.to_string())
+}
+
+fn sanitize_qualification_success_response(text: &str) -> Option<String> {
+    let deeplink = extract_qualification_deeplink(text)?;
+    let has_internal_marker = [
+        "HTTP 200",
+        "data.wechat_page_url",
+        "wechat_page_url",
+        "按照 skill",
+        "Step 3",
+        "按格式回复",
+        "链接构造",
+        "SOUL 契约",
+        "字段",
+        "响应",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let has_uncanonical_link = text.contains("pages/qualification/index.html?id=");
+
+    if !has_internal_marker && !has_uncanonical_link {
+        return None;
+    }
+
+    let subject = extract_qualification_company(text)
+        .map(|name| format!("**{name}**"))
+        .unwrap_or_else(|| "该企业".to_string());
+    Some(format!(
+        "已为 {subject} 触发资质数据处理，点击查看详情：\n\n\
+         [查看企业资质详情]({deeplink})\n\n\
+         详情页包含企业资质现状、到期提醒和可申报资质建议。如需深度资质分析（天眼查数据同步 + 专业申报路径规划），告诉我即可启动完整流程。"
+    ))
+}
+
+fn extract_qualification_deeplink(text: &str) -> Option<String> {
+    let re = Regex::new(r"/?pages/qualification/index(?:\.html)?\?id=(\d+)").ok()?;
+    let caps = re.captures(text)?;
+    let id = caps.get(1)?.as_str();
+    Some(format!("/pages/qualification/index?id={id}"))
+}
+
+fn extract_qualification_company(text: &str) -> Option<String> {
+    let re = Regex::new(r"已为\s+\*\*([^*\n]+)\*\*\s*触发资质").ok()?;
+    if let Some(caps) = re.captures(text) {
+        return caps.get(1).map(|m| m.as_str().trim().to_string());
+    }
+    extract_company_name_from_text(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_internal_qualification_success_output() {
+        let raw = "HTTP 200 成功。按照 skill 的 Step 3 处理响应：\n\n\
+            从 `data.wechat_page_url` 取详情页路径：`pages/qualification/index.html?id=127`\n\
+            去掉 `.html`、补 `/` 前缀 → `/pages/qualification/index?id=127`\n\n\
+            按格式回复：\n\
+            已为 **中拓产业云（北京）科技服务有限公司** 触发资质数据处理，点击查看详情：\n\n\
+            [查看企业资质详情](/pages/qualification/index?id=127)\n\n\
+            检查 SOUL 契约：没有裸露内部主键。";
+
+        let clean = sanitize_assistant_response(raw);
+
+        assert!(clean.starts_with("已为 **中拓产业云（北京）科技服务有限公司** 触发资质数据处理"));
+        assert!(clean.contains("[查看企业资质详情](/pages/qualification/index?id=127)"));
+        assert!(!clean.contains("HTTP 200"));
+        assert!(!clean.contains("wechat_page_url"));
+        assert!(!clean.contains("Step 3"));
+        assert!(!clean.contains("SOUL"));
+    }
+
+    #[test]
+    fn normalizes_html_qualification_link_without_rewriting_clean_links() {
+        let raw = "已为 **中拓产业云（北京）科技服务有限公司** 触发资质数据处理，点击查看详情：\n\n\
+            [查看企业资质详情](pages/qualification/index.html?id=127)\n\n\
+            详情页包含企业资质现状、到期提醒和可申报资质建议。";
+
+        let clean = sanitize_assistant_response(raw);
+
+        assert!(clean.contains("[查看企业资质详情](/pages/qualification/index?id=127)"));
+        assert!(!clean.contains(".html?id=127"));
+
+        let already_clean = "已为 **中拓产业云（北京）科技服务有限公司** 触发资质数据处理，点击查看详情：\n\n\
+            [查看企业资质详情](/pages/qualification/index?id=127)\n\n\
+            详情页包含企业资质现状、到期提醒和可申报资质建议。";
+        assert_eq!(sanitize_assistant_response(already_clean), already_clean);
+    }
 }
 
 // ── Qualification reminder endpoints ─────────────────────────────────────────
