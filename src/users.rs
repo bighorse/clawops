@@ -18,6 +18,7 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     pub last_active_at: DateTime<Utc>,
     pub last_error: Option<String>,
+    pub pending_sop_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +240,24 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for User {
             created_at: row.try_get("created_at")?,
             last_active_at: row.try_get("last_active_at")?,
             last_error: row.try_get("last_error")?,
+            pending_sop_name: row.try_get("pending_sop_name")?,
         })
     }
+}
+
+pub async fn set_pending_sop(pool: &SqlitePool, openid: &str, sop_name: &str) -> Result<()> {
+    sqlx::query("UPDATE users SET pending_sop_name = ? WHERE openid = ?")
+        .bind(sop_name)
+        .bind(openid)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn clear_pending_sop(pool: &SqlitePool, openid: &str) -> Result<()> {
+    sqlx::query("UPDATE users SET pending_sop_name = NULL WHERE openid = ?")
+        .bind(openid)
+        .execute(pool)
+        .await?;
+    Ok(())
 }

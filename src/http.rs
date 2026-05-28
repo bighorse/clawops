@@ -463,6 +463,30 @@ async fn chat(
     let user = st.provisioner.ensure_running(&openid).await?;
     users::touch_active(&st.pool, &user.openid).await?;
 
+    // If a previous turn asked the user for their company name (gateway-level
+    // intercept), automatically re-trigger the SOP once a valid name arrives.
+    // We synthesize "{company}，{trigger}" so zeroclaw calls sop_execute again
+    // and from_message finds the company name in the same turn.
+    let message_to_zeroclaw: String = {
+        let db_user = users::get(&st.pool, &user.openid).await.ok().flatten();
+        if let Some(pending) = db_user.and_then(|u| u.pending_sop_name.clone()) {
+            if let Some(company) = extract_company_name_from_text(&req.content) {
+                if let Err(e) = users::clear_pending_sop(&st.pool, &user.openid).await {
+                    tracing::warn!(openid = %user.openid, "failed to clear pending_sop_name: {e}");
+                }
+                let trigger = sop_trigger_phrase(&pending);
+                tracing::debug!(openid = %user.openid, company = %company, pending_sop = %pending,
+                    "pending SOP: company name received, synthesizing re-trigger");
+                format!("{company}，{trigger}")
+            } else {
+                let _ = users::clear_pending_sop(&st.pool, &user.openid).await;
+                req.content.clone()
+            }
+        } else {
+            req.content.clone()
+        }
+    };
+
     // sop_started / sop_name extracted from zeroclaw response when a SOP was triggered.
     let mut sop_started = false;
     let mut sop_name_from_zc: Option<String> = None;
@@ -479,7 +503,7 @@ async fn chat(
             .http
             .post(&url)
             .timeout(std::time::Duration::from_secs(900))
-            .json(&serde_json::json!({"message": req.content}));
+            .json(&serde_json::json!({"message": message_to_zeroclaw}));
         if let Some(token) = &user.paired_token_enc {
             builder = builder.header("Authorization", format!("Bearer {token}"));
         }
@@ -562,6 +586,9 @@ async fn chat(
                     "SOP started but no verified enterprise_name — overriding response");
                 if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &prompt).await {
                     tracing::warn!(openid = %user.openid, "failed to persist chat turn: {e}");
+                }
+                if let Err(e) = users::set_pending_sop(&st.pool, &user.openid, sop_name).await {
+                    tracing::warn!(openid = %user.openid, "failed to set pending_sop_name: {e}");
                 }
                 return Ok(Json(ChatResp {
                     response: prompt,
@@ -1152,6 +1179,15 @@ async fn internal_sop_event(
     }
 }
 
+
+/// Map an internal SOP name to a short Chinese trigger phrase the LLM recognises.
+fn sop_trigger_phrase(sop_name: &str) -> &'static str {
+    match sop_name {
+        "policy-match" => "帮我匹配政策",
+        "qualification-check" => "帮我查资质",
+        _ => "帮我执行",
+    }
+}
 
 /// Return true if `name` looks like a full Chinese company legal name.
 /// True if the message is a short re-run command with no new company context.
