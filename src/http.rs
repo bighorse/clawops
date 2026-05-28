@@ -567,7 +567,11 @@ async fn chat(
             // says a bare SOP trigger ("政策匹配") without naming a company, we look in
             // history rather than prompting again — this matches user expectation and
             // avoids the "amnesia" loop where every re-trigger re-asks for the name.
-            let from_history: Option<String> = if from_db.is_none() && from_message.is_none() {
+            //
+            // Exception: if the current message asserts a NEW company identity ("我是X",
+            // "换成X"), skip from_history entirely — returning a stale old company name
+            // would silently trigger the SOP for the wrong entity.
+            let from_history: Option<String> = if from_db.is_none() && from_message.is_none() && !message_asserts_new_company(&req.content) {
                 match chat_history::fetch_page(&st.pool, &user.openid, None, 10).await {
                     Ok(msgs) => msgs
                         .iter()
@@ -1190,6 +1194,17 @@ fn sop_trigger_phrase(sop_name: &str) -> &'static str {
         "qualification-check" => "帮我查资质",
         _ => "帮我执行",
     }
+}
+
+/// Return true when the message explicitly declares a (possibly new) company,
+/// e.g. "我是拓尔思" / "换成华为" / "公司叫字节跳动".
+/// Used to prevent stale memory company names from bleeding into fresh SOP triggers.
+fn message_asserts_new_company(text: &str) -> bool {
+    const ASSERTION_PATTERNS: &[&str] = &[
+        "我是", "我们是", "我的公司是", "公司名是", "公司叫", "公司是",
+        "换成", "换为", "改成", "改为",
+    ];
+    ASSERTION_PATTERNS.iter().any(|p| text.contains(p))
 }
 
 /// Return true if `name` looks like a full Chinese company legal name.

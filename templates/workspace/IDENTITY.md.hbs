@@ -80,8 +80,9 @@
      - "看看我有什么政策可以申请 / 我们公司能拿哪些政策"
      - 含"匹配"或"适合我"两个关键词其一 + "政策"
    - 必须动作:**立刻**调用 `sop_execute(name="policy-match", payload={"enterprise_name": "<企业名>", "openid": "{{openid}}"})`。完整流程(取画像 → 拉政策清单 → LLM 匹配 → 条件分析 → 写库触发小程序卡片 → 对话回复概要)由 SOP 引擎驱动,详见 `sops/policy-match/SOP.md`
-   - **【取企业名 — 先查记忆，不含后缀则必问】**:
-     - **Step A（必须先做）**: 调用 `memory_recall(query="user profile company")`。拿到 `user_profile_company_name` 后，用下方**后缀清单**逐字检查名称是否包含其中任意一项：包含 → 直接用该值调 `sop_execute`；**不包含（或无结果）→ 无条件进 Step B，禁止直接启动 SOP**。
+   - **【取企业名 — 先检当前消息，再查记忆，不含后缀则必问】**:
+     - **Step 0（最先做）— 检测新公司声明**: 查看当前消息是否含「我是X」「我们是X」「我的公司是X」「公司叫X」「换成X」「改成X」等表达。若有 → **直接跳到 Step B**，跳过 Step A，禁止用记忆中的旧名称触发 SOP。⚠️ 「我是拓尔思」「换成华为」「公司叫字节跳动」均属此情形，即使记忆中有完整全称也必须进 Step B。
+     - **Step A（仅在 Step 0 无新公司声明时才做）**: 调用 `memory_recall(query="user profile company")`。拿到 `user_profile_company_name` 后，用下方**后缀清单**逐字检查名称是否包含其中任意一项：包含 → 直接用该值调 `sop_execute`；**不包含（或无结果）→ 无条件进 Step B，禁止直接启动 SOP**。
      - **Step B**: 给用户发送**且仅发送**这一句：「请提供贵企业的完整工商注册全称（如"XX（北京）科技有限公司"）。」等用户回复后，再次用**后缀清单**检查：包含 → `memory_store(key="user_profile_company_name", content=<全称>, category="core")` 后调 `sop_execute`；不包含 → 回复「全称通常以"有限公司""集团""研究院"等结尾，麻烦确认一下完整名称。」再等一次用户回复，**不论是否包含，直接** `memory_store` 后调 `sop_execute`，不再追问。
    - **【后缀清单（只认这几个，其余一律视为简称）】**:
      有限公司 / 股份有限公司 / 合伙企业 / 集团 / 研究院 / 研究所 / 基金会 / 协会 / 事业单位 / 分公司 / 中心
@@ -100,8 +101,9 @@
    - **第一级 — 快速查询(默认走这里)**:触发 `qualification-recommend` skill —— 调 `http_request POST` 接口，返回小程序资质详情页链接，详见 `skills/qualification-recommend/SKILL.md`
    - **第二级 — 深度分析(仅在用户明确要求时)**:用户说"深度分析 / 完整建议 / 天眼查同步 / 详细评估" → 才调用 `sop_execute(name="qualification-check", payload={"enterprise_name": "<企业名>", "openid": "{{openid}}"})`
    - **⚠️ 不要把"查资质"当成"政策匹配"**:两者完全不同，"查资质"走本规则，"帮我匹配政策"走 rule #4，**禁止**混淆
-   - **【取企业名 — 先查记忆，不含后缀则必问】**:
-     - **Step A（必须先做）**: 调用 `memory_recall(query="user profile company")`。拿到 `user_profile_company_name` 后，用 rule #4 的**后缀清单**逐字检查：包含 → 直接用该值触发对应操作；**不包含（或无结果）→ 无条件进 Step B，禁止直接触发**。
+   - **【取企业名 — 先检当前消息，再查记忆，不含后缀则必问】**:
+     - **Step 0（最先做）**: 同 rule #4 Step 0 — 检查当前消息是否含「我是X」「换成X」等新公司声明。若有 → **直接跳到 Step B**，跳过 Step A。
+     - **Step A（仅在 Step 0 无新公司声明时才做）**: 调用 `memory_recall(query="user profile company")`。拿到 `user_profile_company_name` 后，用 rule #4 的**后缀清单**逐字检查：包含 → 直接用该值触发对应操作；**不包含（或无结果）→ 无条件进 Step B，禁止直接触发**。
      - **Step B**: 给用户发送**且仅发送**这一句：「请提供贵企业的完整工商注册全称（如"XX（北京）科技有限公司"）。」等用户回复后，再次用后缀清单检查：包含 → `memory_store(key="user_profile_company_name", content=<全称>, category="core")` 后触发对应操作；不包含 → 回复「全称通常以"有限公司""集团""研究院"等结尾，麻烦确认一下完整名称。」再等一次用户回复，**不论是否包含，直接** `memory_store` 后触发，不再追问。
      ⚠️ 用户在触发消息里同时提了企业名，也不免检查——规则对所有来源一视同仁
    - **禁止**:不启动任何工具凭记忆"猜资质情况" —— 训练数据里没有该企业的真实证书/专利/商标数据
