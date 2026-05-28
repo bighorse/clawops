@@ -40,9 +40,9 @@
 |------|------|------|
 | **园区搜索（主路径）** | `{{{space.api_base}}}/parks/new_query_list` | POST，body JSON |
 | **园区详情** | `{{{space.api_base}}}/parks/item?id={park_id}` | GET |
-| **众创空间列表** | `{{{space.api_base}}}/space_show/maker_space/list?status=2&page_index=1&page_size=10` | GET |
+| **众创空间列表** | `{{{space.api_base}}}/space_show/maker_space/list?status=2&page_index=1&page_size=5` | GET |
 | **众创空间详情** | `{{{space.api_base}}}/space_show/maker_space/item?maker_space_id={id}` | GET |
-| **独立办公室列表** | `{{{space.api_base}}}/space_show/office/list?status=2&page_index=1&page_size=30` | GET |
+| **独立办公室列表** | `{{{space.api_base}}}/space_show/office/list?status=2&page_index=1&page_size=15` | GET |
 | **独立办公室详情** | `{{{space.api_base}}}/space_show/office/item?office_id={id}` | GET |
 | **基础字典（解析 ID）** | `{{{space.api_base}}}/data/base/list?data_type={N}` | GET |
 | 厂房列表 | `{{{space.api_base}}}/space_show/workshop/list?status=2&page_index=1` | GET |
@@ -85,7 +85,7 @@
 {
   "keyword": "<关键词，可空>",
   "page_index": 1,
-  "page_size": 10
+  "page_size": 5
 }
 ```
 
@@ -120,7 +120,7 @@
 
 ## 众创空间字段说明
 
-**列表** `GET /space_show/maker_space/list?status=2&page_index=1&page_size=10`（名称搜索加 `&name=<keyword>`）：
+**列表** `GET /space_show/maker_space/list?status=2&page_index=1&page_size=5`（名称搜索加 `&name=<keyword>`）：
 
 | 字段 | 含义 |
 |------|------|
@@ -150,7 +150,7 @@
 
 | 用户诉求 | 资源类型 | 主入口 |
 |---------|---------|--------|
-| **独立办公室 / 办公间 / 租房间 / 指定面积（如 100–1000㎡）** | **独立办公室** | `GET /space_show/office/list?status=2&page_size=30` — 拉全量后**端侧按 `floor_area` 过滤**面积范围 |
+| **独立办公室 / 办公间 / 租房间 / 指定面积（如 100–1000㎡）** | **独立办公室** | `GET /space_show/office/list?status=2&page_size=15` — 拉全量后**端侧按 `floor_area` 过滤**面积范围 |
 | 众创空间 / 联合办公 / 孵化器 / 加速器 / 工位 / 共享工位 | **众创空间** | `GET /space_show/maker_space/list?status=2` |
 | 园区 / 楼宇 / 选址 / 落地 / 具体园区名 | **园区** | `POST /parks/new_query_list` |
 | 厂房 / 研发用房 | 厂房 | `GET /space_show/workshop/list?status=2` |
@@ -166,7 +166,7 @@
 ```
 http_request POST {{{space.api_base}}}/parks/new_query_list
 Content-Type: application/json
-body: {"keyword": "<用户关键词，无则空字符串>", "page_index": 1, "page_size": 10}
+body: {"keyword": "<用户关键词，无则空字符串>", "page_index": 1, "page_size": 5}
 ```
 
 如用户说的是某特定园区名但 `data_count=0`，**必须宽搜**：
@@ -177,7 +177,7 @@ body: {"keyword": "<用户关键词，无则空字符串>", "page_index": 1, "pa
 #### 2b 众创空间搜索
 
 ```
-http_request GET {{{space.api_base}}}/space_show/maker_space/list?status=2&page_index=1&page_size=10
+http_request GET {{{space.api_base}}}/space_show/maker_space/list?status=2&page_index=1&page_size=5
 （有关键词加 &name=<keyword>）
 ```
 

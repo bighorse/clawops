@@ -99,7 +99,7 @@ http_request GET {{{activity.api_base}}}
   ?keyword=<速查表的值>
   &status=ONLINE&audit_status=APPROVED
   &order_by_fields=start_time&order_by_types=DESC
-  &page_size=20&page_index=1
+  &page_size=5&page_index=1
 ```
 
 #### 2b 用户只问"最近有什么活动"没具体方向
@@ -108,10 +108,10 @@ http_request GET {{{activity.api_base}}}
 http_request GET {{{activity.api_base}}}
   ?status=ONLINE&audit_status=APPROVED
   &order_by_fields=start_time&order_by_types=DESC
-  &page_size=20&page_index=1
+  &page_size=5&page_index=1
 ```
 
-20 条足够 — 未过期 + ONLINE + APPROVED 的活动通常远小于 20 条,Step 3 过滤后剩 5 条以上稳稳的。如果**真**不到 5 条,直接告诉用户"近期符合条件的活动较少",**不要**再翻页或换 keyword 硬凑。
+5 条足够 — 展示给用户 TOP 5 即可。如果**真**不到 5 条,直接告诉用户"近期符合条件的活动较少",**不要**再翻页或换 keyword 硬凑。
 
 ### Step 3:可行性校验(过滤候选)
 

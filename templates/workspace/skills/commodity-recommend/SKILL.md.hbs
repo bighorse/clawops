@@ -104,17 +104,17 @@
 URL 必须写在**一行**,查询参数通过 `?key=value&key2=value2` 拼接,**不要换行**:
 
 ```
-http_request GET {{commodity.api_base}}/services/products?<Step1查询参数字符串>&status=ONLINE&shop_status=ONLINE&page_size=10&page_index=1
+http_request GET {{commodity.api_base}}/services/products?<Step1查询参数字符串>&status=ONLINE&shop_status=ONLINE&page_size=5&page_index=1
 ```
 
 示例 — 大科学装置:
 ```
-http_request GET {{commodity.api_base}}/services/products?category_ids=260&status=ONLINE&shop_status=ONLINE&page_size=10&page_index=1
+http_request GET {{commodity.api_base}}/services/products?category_ids=260&status=ONLINE&shop_status=ONLINE&page_size=5&page_index=1
 ```
 
 示例 — 商务服务关键词:
 ```
-http_request GET {{commodity.api_base}}/services/products?keyword=工商&status=ONLINE&shop_status=ONLINE&page_size=10&page_index=1
+http_request GET {{commodity.api_base}}/services/products?keyword=工商&status=ONLINE&shop_status=ONLINE&page_size=5&page_index=1
 ```
 
 如果 `data_count < 3`,补一把运营推荐:
