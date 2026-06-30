@@ -645,7 +645,7 @@ async fn chat(
         }
     }
 
-    let response_text = sanitize_assistant_response(&response_text);
+    let response_text = sanitize_assistant_response(&response_text, sop_started);
 
     if let Err(e) =
         chat_history::record_turn(&st.pool, &user.openid, &req.content, &response_text).await
@@ -1259,8 +1259,105 @@ fn extract_company_name_from_text(text: &str) -> Option<String> {
     None
 }
 
-fn sanitize_assistant_response(text: &str) -> String {
-    sanitize_qualification_success_response(text).unwrap_or_else(|| text.to_string())
+/// Out-of-tier gatekeeper for the chat passthrough path. The model behind each
+/// tenant is a weak (non-Claude) model and clawops is otherwise a raw
+/// passthrough, so whatever the model emits reaches the end user verbatim. This
+/// is the single choke point where we can enforce — deterministically, not by
+/// asking the model nicely — that what the user sees matches what actually
+/// happened.
+///
+/// `sop_started` is the gateway's ground truth: when false, NO async job was
+/// created in this turn, so the model must not be allowed to promise it will
+/// "proactively send a report later".
+fn sanitize_assistant_response(text: &str, sop_started: bool) -> String {
+    // 1) Existing narrow rewrite: collapse leaked qualification-success
+    //    internals into the canonical user-facing card.
+    let text = sanitize_qualification_success_response(text).unwrap_or_else(|| text.to_string());
+    // 2) Strip leaked zeroclaw "stuck self-reflection" blocks that weak models
+    //    sometimes echo as if they were the answer.
+    let text = strip_internal_reflection_block(&text);
+    // 3) When no SOP actually started, a "I'll proactively send you the report"
+    //    promise is a lie (nothing is running). Replace it with an honest nudge.
+    if sop_started {
+        text
+    } else {
+        rewrite_false_async_promise(&text)
+    }
+}
+
+/// English keys that uniquely identify a zeroclaw runtime "you seem stuck —
+/// reflect before retrying" block. These never legitimately appear in a Chinese
+/// customer reply. Require >= 2 distinct keys to fire so a stray single mention
+/// (e.g. someone literally discussing the word) is not nuked.
+fn strip_internal_reflection_block(text: &str) -> String {
+    const KEYS: &[&str] = &[
+        "failure_type",
+        "what_was_already_tried",
+        "why_repeating_wont_help",
+        "alternative_approach",
+    ];
+    // A line "leads with" a key if, after trimming, it is `key` followed by a
+    // `:` / full-width `：` / `=`.
+    let line_has_key = |line: &str, key: &str| -> bool {
+        let t = line.trim_start();
+        match t.strip_prefix(key) {
+            Some(rest) => {
+                let rest = rest.trim_start();
+                rest.starts_with(':') || rest.starts_with('：') || rest.starts_with('=')
+            }
+            None => false,
+        }
+    };
+    let distinct = KEYS
+        .iter()
+        .filter(|k| text.lines().any(|l| line_has_key(l, k)))
+        .count();
+    if distinct < 2 {
+        return text.to_string();
+    }
+    let remainder = text
+        .lines()
+        .filter(|l| !KEYS.iter().any(|k| line_has_key(l, k)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let remainder = remainder.trim();
+    if remainder.is_empty() {
+        "抱歉，刚才没能顺利处理你的问题。可以再说一次你的需求吗？我来重新帮你。".to_string()
+    } else {
+        remainder.to_string()
+    }
+}
+
+/// When the gateway did NOT start a SOP this turn, any "I'll proactively notify
+/// / send you later" wording from the model is false — nothing is running, so
+/// the user would wait forever. Replace the whole reply with an honest,
+/// actionable nudge that also teaches the phrasing that actually triggers the
+/// SOP. Markers are restricted to the unambiguous "主动 + 通知/发送" family so a
+/// normal answer (which never volunteers to proactively push something) is not
+/// touched. The legitimate "完成后会主动通知您" wait-message is emitted only on
+/// the `sop_started == true` path, which never reaches this function.
+fn rewrite_false_async_promise(text: &str) -> String {
+    const PROMISE_MARKERS: &[&str] = &[
+        "主动通知您",
+        "主动通知你",
+        "主动发送给你",
+        "主动发送给您",
+        "主动发给你",
+        "主动发给您",
+        "主动发您",
+        "完成后会主动",
+        "完成后主动",
+        "完成后会通知您",
+        "完成后会通知你",
+    ];
+    if PROMISE_MARKERS.iter().any(|m| text.contains(m)) {
+        "抱歉，我还没有真正帮你把这件事办起来。\n\n\
+         如果你想做政策匹配，直接对我说「做一下〔公司全称〕的政策匹配」；想查资质就说\
+         「帮我查〔公司全称〕的资质」。我会立刻为你发起，处理好后第一时间发你。"
+            .to_string()
+    } else {
+        text.to_string()
+    }
 }
 
 fn sanitize_qualification_success_response(text: &str) -> Option<String> {
@@ -1324,7 +1421,7 @@ mod tests {
             [查看企业资质详情](/pages/qualification/index?id=127)\n\n\
             检查 SOUL 契约：没有裸露内部主键。";
 
-        let clean = sanitize_assistant_response(raw);
+        let clean = sanitize_assistant_response(raw, false);
 
         assert!(clean.starts_with("已为 **中拓产业云（北京）科技服务有限公司** 触发资质数据处理"));
         assert!(clean.contains("[查看企业资质详情](/pages/qualification/index?id=127)"));
@@ -1340,7 +1437,7 @@ mod tests {
             [查看企业资质详情](pages/qualification/index.html?id=127)\n\n\
             详情页包含企业资质现状、到期提醒和可申报资质建议。";
 
-        let clean = sanitize_assistant_response(raw);
+        let clean = sanitize_assistant_response(raw, false);
 
         assert!(clean.contains("[查看企业资质详情](/pages/qualification/index?id=127)"));
         assert!(!clean.contains(".html?id=127"));
@@ -1348,7 +1445,77 @@ mod tests {
         let already_clean = "已为 **中拓产业云（北京）科技服务有限公司** 触发资质数据处理，点击查看详情：\n\n\
             [查看企业资质详情](/pages/qualification/index?id=127)\n\n\
             详情页包含企业资质现状、到期提醒和可申报资质建议。";
-        assert_eq!(sanitize_assistant_response(already_clean), already_clean);
+        assert_eq!(sanitize_assistant_response(already_clean, false), already_clean);
+    }
+
+    #[test]
+    fn strips_leaked_internal_reflection_block() {
+        // The exact zeroclaw "stuck self-reflection" block from the 国高新 leak.
+        let raw = "failure_type: blocked\n\
+            what_was_already_tried: 多次调用 web_search 查询国高新条件，但该工具不可用（返回 Unknown tool）。\n\
+            why_repeating_wont_help: web_search 不在可用工具列表中，重复调用无法获取数据。\n\
+            alternative_approach: 基于通用政策知识直接回答用户问题，同时建议通过平台政策代办产品获取实时申报指导。";
+
+        let clean = sanitize_assistant_response(raw, false);
+
+        assert!(!clean.contains("failure_type"));
+        assert!(!clean.contains("what_was_already_tried"));
+        assert!(!clean.contains("alternative_approach"));
+        assert!(!clean.contains("Unknown tool"));
+        // Whole reply was the block → falls back to a human re-ask.
+        assert!(clean.contains("可以再说一次你的需求吗"));
+    }
+
+    #[test]
+    fn keeps_valid_text_around_reflection_block() {
+        let raw = "高新技术企业认定的核心条件包括知识产权、研发费用占比等。\n\
+            failure_type: blocked\n\
+            alternative_approach: 用通用知识回答。";
+        let clean = sanitize_assistant_response(raw, false);
+        assert!(clean.starts_with("高新技术企业认定的核心条件"));
+        assert!(!clean.contains("failure_type"));
+        assert!(!clean.contains("alternative_approach"));
+    }
+
+    #[test]
+    fn does_not_strip_single_stray_key_mention() {
+        // Only one key present — must not be treated as a leaked block.
+        let raw = "这个字段叫 alternative_approach: 仅供你参考，不是错误。";
+        let clean = sanitize_assistant_response(raw, false);
+        assert_eq!(clean, raw);
+    }
+
+    #[test]
+    fn rewrites_false_async_promise_when_no_sop_started() {
+        // The 百维互联 screenshot: model promised a report it never started.
+        let raw = "您好，已收到您的查询需求。正在为「百维互联科技发展（北京）有限公司」\
+            检索并整理相关企业信息，报告生成大约需要1-3分钟，生成好后我会主动发送给你。";
+        let clean = sanitize_assistant_response(raw, false);
+        assert!(!clean.contains("主动发送给你"));
+        assert!(clean.contains("做一下"));
+        assert!(clean.contains("政策匹配"));
+    }
+
+    #[test]
+    fn keeps_legit_wait_message_when_sop_actually_started() {
+        // Same proactive-notify wording is legitimate when a SOP really started;
+        // that path passes sop_started = true and must be left untouched.
+        let raw = "正在为您处理「政策匹配」，请稍候，完成后会主动通知您。";
+        assert_eq!(sanitize_assistant_response(raw, true), raw);
+    }
+
+    #[test]
+    fn does_not_rewrite_normal_answer_mentioning_minutes() {
+        // "分钟" alone (no proactive-delivery promise) must not trigger a rewrite.
+        let raw = "从怀柔科学城城市客厅到首都机场约45分钟车程，公交化运营的怀密线很方便。";
+        assert_eq!(sanitize_assistant_response(raw, false), raw);
+    }
+
+    #[test]
+    fn does_not_rewrite_lead_followup_contacting_user() {
+        // 留资场景说"顾问会联系你"，不含 主动通知/主动发送 family，必须放行。
+        let raw = "好的，已经登记，资质顾问会在 1 个工作日内联系你。";
+        assert_eq!(sanitize_assistant_response(raw, false), raw);
     }
 }
 
