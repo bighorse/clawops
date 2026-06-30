@@ -324,7 +324,9 @@ pub async fn find_cached_done(
 }
 
 /// Find the most recent pending task for (openid, sop_name).
-/// Used by the webhook handler to resolve which task to mark done.
+/// Used by the "starting" webhook to grab the row /chat just created and move
+/// it to running. Intentionally pending-only: matching running could grab a
+/// stale row from a prior run instead of the fresh pending one.
 pub async fn find_pending_by_sop(
     pool: &SqlitePool,
     openid: &str,
@@ -333,6 +335,28 @@ pub async fn find_pending_by_sop(
     let task_id: Option<String> = sqlx::query_scalar(
         "SELECT task_id FROM sop_tasks WHERE openid = ? AND sop_name = ? \
          AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(openid)
+    .bind(sop_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(task_id)
+}
+
+/// Find the most recent *active* (pending OR running) task for (openid, sop_name).
+/// Used by the "done" webhook: by the time "done" fires, the "starting" event has
+/// already moved the task to 'running', so matching only 'pending' misses it —
+/// the result then gets orphaned into a fresh enterprise-less done row while the
+/// real task lingers until timeout_stale marks it failed. Matching running too
+/// lets the real task be marked done with its enterprise_name + deeplink intact.
+pub async fn find_active_by_sop(
+    pool: &SqlitePool,
+    openid: &str,
+    sop_name: &str,
+) -> Result<Option<String>> {
+    let task_id: Option<String> = sqlx::query_scalar(
+        "SELECT task_id FROM sop_tasks WHERE openid = ? AND sop_name = ? \
+         AND status IN ('pending', 'running') ORDER BY created_at DESC LIMIT 1",
     )
     .bind(openid)
     .bind(sop_name)

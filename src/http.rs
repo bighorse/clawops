@@ -1102,7 +1102,9 @@ async fn internal_sop_event(
         }
         "done" => {
             let response_text = payload.response_text.as_deref().unwrap_or("");
-            let task_id = sop_tasks::find_pending_by_sop(
+            // Match pending OR running: by now the "starting" event moved the
+            // task to running, so a pending-only lookup would orphan the result.
+            let task_id = sop_tasks::find_active_by_sop(
                 &st.pool,
                 &openid,
                 &payload.sop_name,
