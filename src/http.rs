@@ -685,6 +685,58 @@ fn emit_sop_event(st: &AppState, task_id: &str, openid: &str, event: &str) {
     }));
 }
 
+/// Heuristic: does this SOP response read as a user-facing failure (enterprise
+/// not found / API error) rather than a completed match? Success replies mention
+/// 已同步 / 匹配结果 / a /pages deeplink; failures say 未收录 / 暂时不可用 / 等.
+fn is_sop_failure_text(text: &str) -> bool {
+    const FAILURE: &[&str] = &[
+        "未收录", "没找到", "查不到", "暂时不可用", "服务不可用",
+        "接口异常", "无法完成", "未能完成", "失败",
+    ];
+    const SUCCESS: &[&str] = &["已同步", "匹配结果", "已全部完成", "政策匹配页", "/pages/"];
+    FAILURE.iter().any(|m| text.contains(m)) && !SUCCESS.iter().any(|m| text.contains(m))
+}
+
+/// When a SOP finishes in a failure state for a WeCom (`uin:`) user, push the
+/// reason to their chat via the backend `push_message` endpoint. Otherwise the
+/// user only ever saw the "正在处理…稍候" line and would wait forever. Success
+/// is left alone (the backend already pushes the result card via
+/// save_match_result), so we never double-notify.
+async fn maybe_push_sop_failure(
+    st: &AppState,
+    openid: &str,
+    has_deeplink: bool,
+    response_text: &str,
+) {
+    if !openid.starts_with("uin:") || has_deeplink || !is_sop_failure_text(response_text) {
+        return;
+    }
+    let base = st.cfg.policy_match.api_base.trim_end_matches('/');
+    if base.is_empty() {
+        return;
+    }
+    let url = format!("{base}/agent/push_message");
+    let text = if response_text.trim().is_empty() {
+        "抱歉，这次处理没成功，请稍后重试。".to_string()
+    } else {
+        response_text.to_string()
+    };
+    let body = serde_json::json!({ "agent_user_info": openid, "text": text });
+    match st
+        .http
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            tracing::info!(openid = %openid, status = %resp.status(), "pushed SOP failure to WeCom user")
+        }
+        Err(e) => tracing::warn!(openid = %openid, "failed to push SOP failure: {e}"),
+    }
+}
+
 #[derive(Deserialize)]
 struct ChatHistoryQuery {
     /// Cursor: returns messages with `id < before_id`. Omit on first page.
@@ -1161,6 +1213,7 @@ async fn internal_sop_event(
                         0,
                     )
                     .await?;
+                    maybe_push_sop_failure(&st, &openid, deeplink.is_some(), response_text).await;
                     emit_sop_event(&st, &id, &openid, "created");
                     emit_sop_event(&st, &id, &openid, "done");
                     return Ok(Json(serde_json::json!({"ok": true, "task_id": id})));
@@ -1204,6 +1257,7 @@ async fn internal_sop_event(
             )
             .await?;
             emit_sop_event(&st, &task_id, &openid, "done");
+            maybe_push_sop_failure(&st, &openid, deeplink.is_some(), response_text).await;
             Ok(Json(serde_json::json!({"ok": true, "task_id": task_id})))
         }
         other => {
@@ -1586,6 +1640,22 @@ mod tests {
                 .as_deref(),
             Some("百维互联科技发展(北京)有限公司")
         );
+    }
+
+    #[test]
+    fn classifies_sop_failure_vs_success_text() {
+        // 失败要识别为失败（会推给用户）。
+        assert!(is_sop_failure_text(
+            "抱歉，系统暂未收录“拓尔思信息技术有限公司”的企业档案（HTTP 404）。"
+        ));
+        assert!(is_sop_failure_text("政策库暂时不可用，请稍后再试。"));
+        // 成功不能误判为失败（否则与后端卡片重复推送）。
+        assert!(!is_sop_failure_text(
+            "SOP 已全部完成。匹配结果摘要：… 已同步至小程序政策匹配页。"
+        ));
+        assert!(!is_sop_failure_text(
+            "已为 **X** 匹配 10 条适用政策（完整条件分析已同步到小程序）"
+        ));
     }
 }
 
