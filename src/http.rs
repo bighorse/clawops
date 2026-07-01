@@ -701,7 +701,12 @@ fn is_sop_failure_text(text: &str) -> bool {
 /// leaks HTTP codes / wrong guesses ("...HTTP 404...非怀柔区..."), so we map to a
 /// fixed phrasing instead of forwarding the raw text.
 fn sop_failure_user_message(response_text: &str) -> &'static str {
-    const NOT_FOUND: &[&str] = &["未收录", "没找到", "查不到", "档案", "404"];
+    // Step 1 = enterprise profile lookup; its failure is almost always an
+    // exact-name miss (404), so guide the user to check the name. Also catch the
+    // explicit not-found wordings.
+    const NOT_FOUND: &[&str] = &[
+        "未收录", "没找到", "查不到", "档案", "404", "企业画像", "Step 1", "step 1",
+    ];
     if NOT_FOUND.iter().any(|m| response_text.contains(m)) {
         "查不到该企业，请确认名称是否准确后重试。"
     } else {
@@ -1672,6 +1677,11 @@ mod tests {
         assert_eq!(
             sop_failure_user_message("政策库暂时不可用，请稍后再试。"),
             "政策匹配这次没跑成功，请稍后重试。"
+        );
+        // SOP 引擎框架原话（Step 1 企业画像失败=查不到企业）也要归到"查不到"。
+        assert_eq!(
+            sop_failure_user_message("SOP 'policy-match' run ... 已正式标记为 Failed（Step 1 企业画像获取失败）。流程已结束。"),
+            "查不到该企业，请确认名称是否准确后重试。"
         );
     }
 }
