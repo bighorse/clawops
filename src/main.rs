@@ -106,7 +106,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Serve => {
             let _reaper = Reaper::new(pool.clone(), provisioner.clone(), cfg.reaper.clone()).spawn();
-            http::spawn_sop_task_watchdog(pool.clone());
+            http::spawn_sop_task_watchdog(
+                pool.clone(),
+                http_client.clone(),
+                cfg.policy_match.api_base.clone(),
+            );
             http::spawn_qualification_reminder_cron(pool.clone(), cfg.clone(), http_client.clone());
 
             let state = AppState {

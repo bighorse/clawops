@@ -177,10 +177,22 @@ pub async fn mark_done(
 
 /// Timeout stale running tasks: if a task has been in running/pending status
 /// for more than `timeout_minutes`, mark it failed. Called by a background job.
-/// Returns the number of tasks timed out.
-pub async fn timeout_stale(pool: &SqlitePool, timeout_minutes: i64) -> Result<u64> {
+/// Returns the (openid, sop_name) of the tasks that were timed out, so the
+/// caller can notify those users (the SOP hung with no done event).
+pub async fn timeout_stale(
+    pool: &SqlitePool,
+    timeout_minutes: i64,
+) -> Result<Vec<(String, String)>> {
     let cutoff = Utc::now() - Duration::minutes(timeout_minutes);
-    let result = sqlx::query(
+    // Capture who is about to be timed out before flipping the status.
+    let stale: Vec<(String, String)> = sqlx::query_as(
+        "SELECT openid, sop_name FROM sop_tasks \
+         WHERE status IN ('running','pending') AND updated_at < ?",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+    sqlx::query(
         "UPDATE sop_tasks SET status='failed', error_message='timeout: no done event received', \
          updated_at=?, completed_at=? \
          WHERE status IN ('running','pending') AND updated_at < ?",
@@ -190,7 +202,7 @@ pub async fn timeout_stale(pool: &SqlitePool, timeout_minutes: i64) -> Result<u6
     .bind(cutoff)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected())
+    Ok(stale)
 }
 
 pub async fn mark_failed(pool: &SqlitePool, task_id: &str, error: &str) -> Result<()> {

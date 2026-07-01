@@ -697,6 +697,18 @@ fn is_sop_failure_text(text: &str) -> bool {
     FAILURE.iter().any(|m| text.contains(m)) && !SUCCESS.iter().any(|m| text.contains(m))
 }
 
+/// Clean, user-facing failure message. The model's raw narration sometimes
+/// leaks HTTP codes / wrong guesses ("...HTTP 404...非怀柔区..."), so we map to a
+/// fixed phrasing instead of forwarding the raw text.
+fn sop_failure_user_message(response_text: &str) -> &'static str {
+    const NOT_FOUND: &[&str] = &["未收录", "没找到", "查不到", "档案", "404"];
+    if NOT_FOUND.iter().any(|m| response_text.contains(m)) {
+        "查不到该企业，请确认名称是否准确后重试。"
+    } else {
+        "政策匹配这次没跑成功，请稍后重试。"
+    }
+}
+
 /// When a SOP finishes in a failure state for a WeCom (`uin:`) user, push the
 /// reason to their chat via the backend `push_message` endpoint. Otherwise the
 /// user only ever saw the "正在处理…稍候" line and would wait forever. Success
@@ -716,11 +728,7 @@ async fn maybe_push_sop_failure(
         return;
     }
     let url = format!("{base}/agent/push_message");
-    let text = if response_text.trim().is_empty() {
-        "抱歉，这次处理没成功，请稍后重试。".to_string()
-    } else {
-        response_text.to_string()
-    };
+    let text = sop_failure_user_message(response_text);
     let body = serde_json::json!({ "agent_user_info": openid, "text": text });
     match st
         .http
@@ -1656,6 +1664,15 @@ mod tests {
         assert!(!is_sop_failure_text(
             "已为 **X** 匹配 10 条适用政策（完整条件分析已同步到小程序）"
         ));
+        // 失败文案映射为干净话术，不泄露 HTTP 404 / 内部猜测。
+        assert_eq!(
+            sop_failure_user_message("抱歉，系统暂未收录“X”的企业档案（HTTP 404），通常是因为该企业非怀柔区"),
+            "查不到该企业，请确认名称是否准确后重试。"
+        );
+        assert_eq!(
+            sop_failure_user_message("政策库暂时不可用，请稍后再试。"),
+            "政策匹配这次没跑成功，请稍后重试。"
+        );
     }
 }
 
@@ -1735,13 +1752,40 @@ pub fn spawn_qualification_reminder_cron(
 /// Background task: timeout stale running/pending SOP tasks every 5 minutes.
 /// A task is considered stale if it has been in running/pending for > 30 min
 /// without a done event (zeroclaw webhook dropped or daemon crashed mid-SOP).
-pub fn spawn_sop_task_watchdog(pool: sqlx::SqlitePool) {
+pub fn spawn_sop_task_watchdog(pool: sqlx::SqlitePool, http: reqwest::Client, push_base: String) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             interval.tick().await;
             match sop_tasks::timeout_stale(&pool, 30).await {
-                Ok(n) if n > 0 => tracing::warn!("sop watchdog: timed out {n} stale task(s)"),
+                Ok(stale) if !stale.is_empty() => {
+                    tracing::warn!("sop watchdog: timed out {} stale task(s)", stale.len());
+                    // The SOP hung with no done event → those users only saw the
+                    // "正在处理…稍候" line. Push a timeout notice so they stop waiting.
+                    let base = push_base.trim_end_matches('/');
+                    if !base.is_empty() {
+                        let url = format!("{base}/agent/push_message");
+                        for (openid, _sop) in &stale {
+                            if !openid.starts_with("uin:") {
+                                continue;
+                            }
+                            let body = serde_json::json!({
+                                "agent_user_info": openid,
+                                "text": "政策匹配处理超时了，请稍后重试。",
+                            });
+                            match http
+                                .post(&url)
+                                .timeout(std::time::Duration::from_secs(10))
+                                .json(&body)
+                                .send()
+                                .await
+                            {
+                                Ok(r) => tracing::info!(openid = %openid, status = %r.status(), "pushed SOP timeout to WeCom user"),
+                                Err(e) => tracing::warn!(openid = %openid, "failed to push SOP timeout: {e}"),
+                            }
+                        }
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => tracing::error!("sop watchdog error: {e}"),
             }
