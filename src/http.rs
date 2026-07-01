@@ -1448,6 +1448,11 @@ fn strip_internal_reflection_block(text: &str) -> String {
 /// touched. The legitimate "完成后会主动通知您" wait-message is emitted only on
 /// the `sop_started == true` path, which never reaches this function.
 fn rewrite_false_async_promise(text: &str) -> String {
+    // A reply that already carries a real result link (qualification / policy
+    // 小程序 deeplink) is genuine work — never rewrite it.
+    if text.contains("/pages/") {
+        return text.to_string();
+    }
     const PROMISE_MARKERS: &[&str] = &[
         "主动通知您",
         "主动通知你",
@@ -1460,6 +1465,14 @@ fn rewrite_false_async_promise(text: &str) -> String {
         "完成后主动",
         "完成后会通知您",
         "完成后会通知你",
+        // 资质/报告类假异步承诺（模型谎称已触发、结果稍后在小程序更新，实际没调工具）
+        "将在小程序",
+        "在小程序中更新",
+        "小程序中查看结果",
+        "正在生成详细",
+        "报告生成大约",
+        "正在检索并整理",
+        "数据匹配处理",
     ];
     if PROMISE_MARKERS.iter().any(|m| text.contains(m)) {
         "抱歉，我还没有真正帮你把这件事办起来。\n\n\
@@ -1605,6 +1618,24 @@ mod tests {
         assert!(!clean.contains("主动发送给你"));
         assert!(clean.contains("做一下"));
         assert!(clean.contains("政策匹配"));
+    }
+
+    #[test]
+    fn rewrites_qualification_fake_async_promise() {
+        // 资质流程的假承诺（模型没调工具、结果永不来）也要拦。
+        let raw = "已为您触发**中孵高科产业孵化（北京）有限公司**的资质数据匹配处理。\
+            目前系统正在生成详细的资质现状与申报建议报告，具体结果将在小程序中更新。";
+        let clean = sanitize_assistant_response(raw, false);
+        assert!(!clean.contains("将在小程序中更新"));
+        assert!(clean.contains("资质"));
+    }
+
+    #[test]
+    fn keeps_reply_with_real_deeplink() {
+        // 带真实 /pages 深链的回复=真干了活，不能被改写。
+        let raw = "已为 **X公司** 触发资质数据处理，点击查看详情：\n\n\
+            [查看企业资质详情](/pages/qualification/index?id=5)";
+        assert_eq!(sanitize_assistant_response(raw, false), raw);
     }
 
     #[test]
