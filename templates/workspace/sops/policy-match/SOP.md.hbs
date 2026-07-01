@@ -78,6 +78,7 @@
         ```
         响应 `data.data[]` 每条政策含上述 5 个字段(响应体 ~6 KB)。
         ⚠️ **禁止**在 URL 里加 `order_by_fields` / `order_by_types` — 与 `no_pagination=true` 同用时后端返回 400。
+        ⚠️ **URL 必须逐字照抄上面这行**：政策清单端点是 `{{{policy_match.policy_list_path}}}`（挂在 `{{{policy_match.api_base}}}` 根下），**不是** `/agent/policies`，也**不要**用 `limit=` 分页。自己按上一步 `/agent/...` 的样式类推、拼成别的路径 → 404。
      (2) 落盘到 `case/policy-match/<enterprise_safe>/candidates.json` — 保存响应的 `data.data[]` 数组:
         ```json
         {
@@ -87,8 +88,9 @@
         }
         ```
      (3) **size 自检**: 落盘后期望 `candidates.json` 3-10 KB。< 1 KB 说明数组未写入,必须重写;> 15 KB 说明 fields 参数未生效,检查 URL。
-     (4) **降级**:
-        - 接口 4xx → **不要**修改 fields 参数重试;narrate "政策库接口异常(4xx)",`sop_advance status=Failed`。
+     (4) **降级 / 纠错**:
+        - **404** → 你几乎肯定把 URL 写错了（最常见：误用 `/agent/policies`，或加了 `limit=`）。政策清单**唯一正确地址**就是上面 (1) 那行 `{{{policy_match.api_base}}}{{{policy_match.policy_list_path}}}?no_pagination=true&status=ONLINE&fields=id,name,policy_direction,policy_belong,application_at`。**用这个确切地址重试一次，不要判 Failed、不要说"服务不可用"**。仅当**用对了地址仍返回 4xx** 时，才按下一条处理。
+        - 接口 4xx（非 404，且已确认地址正确） → **不要**修改 fields 参数重试;narrate "政策库接口异常",`sop_advance status=Failed`。
         - 接口 5xx 或网络错误 → narrate "政策库暂时不可用,请稍后再试",`sop_advance status=Failed`。
 
 3. **LLM 匹配筛选(分 2 阶段,避免单次 LLM call 超 240s 红线)** — 读企业画像 + 政策清单,LLM 用粗筛 → 精筛分两次完成 Top 10 选择。

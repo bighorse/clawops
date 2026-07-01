@@ -130,6 +130,24 @@ pub async fn mark_running(pool: &SqlitePool, task_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Set/overwrite the enterprise_name on an existing task. Used when /chat adopts
+/// a fallback task that the "starting" webhook created without a name (dedup),
+/// so the task record and workspace-deeplink fallback carry the right company.
+pub async fn update_enterprise_name(
+    pool: &SqlitePool,
+    task_id: &str,
+    enterprise_name: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query("UPDATE sop_tasks SET enterprise_name = ?, updated_at = ? WHERE task_id = ?")
+        .bind(enterprise_name)
+        .bind(now)
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn mark_done(
     pool: &SqlitePool,

@@ -602,24 +602,40 @@ async fn chat(
                 }));
             }
 
-            // Enterprise name valid — create the pending task here (not in the webhook,
-            // to avoid orphan rows when validation blocks the request).
+            // Enterprise name valid — create (or adopt) the pending task. If the
+            // "starting" webhook already created a fallback task for this SOP
+            // (model called sop_execute before /chat returned), adopt it and set
+            // the name instead of creating a duplicate.
             let sop_meta = st.cfg.sop_metadata.get(sop_name.as_str());
             let estimated_seconds = sop_meta.map(|m| m.estimated_seconds).unwrap_or(540);
-            let task_id = sop_tasks::new_task_id();
-            if let Err(e) = sop_tasks::insert_pending(
-                &st.pool,
-                &task_id,
-                &user.openid,
-                sop_name,
-                enterprise_name.as_deref(),
-                estimated_seconds,
-            )
-            .await
-            {
-                tracing::warn!(openid = %user.openid, task_id = %task_id, "failed to insert pending sop task: {e}");
-            } else {
-                emit_sop_event(&st, &task_id, &user.openid, "created");
+            match sop_tasks::find_active_by_sop(&st.pool, &user.openid, sop_name).await {
+                Ok(Some(existing)) => {
+                    if let Some(name) = enterprise_name.as_deref() {
+                        if let Err(e) =
+                            sop_tasks::update_enterprise_name(&st.pool, &existing, name).await
+                        {
+                            tracing::warn!(openid = %user.openid, task_id = %existing, "failed to set enterprise_name on adopted task: {e}");
+                        }
+                    }
+                    tracing::debug!(openid = %user.openid, task_id = %existing, "adopted existing active sop task (dedup)");
+                }
+                _ => {
+                    let task_id = sop_tasks::new_task_id();
+                    if let Err(e) = sop_tasks::insert_pending(
+                        &st.pool,
+                        &task_id,
+                        &user.openid,
+                        sop_name,
+                        enterprise_name.as_deref(),
+                        estimated_seconds,
+                    )
+                    .await
+                    {
+                        tracing::warn!(openid = %user.openid, task_id = %task_id, "failed to insert pending sop task: {e}");
+                    } else {
+                        emit_sop_event(&st, &task_id, &user.openid, "created");
+                    }
+                }
             }
 
             let display_name = sop_meta
@@ -1080,10 +1096,19 @@ async fn internal_sop_event(
                 sop_tasks::mark_running(&st.pool, &task_id).await?;
                 emit_sop_event(&st, &task_id, &openid, "running");
                 tracing::debug!(openid = %openid, task_id = %task_id, "sop webhook: starting → running");
+            } else if let Some(existing) =
+                sop_tasks::find_active_by_sop(&st.pool, &openid, &payload.sop_name).await?
+            {
+                // An active (running) task already exists — a prior "starting"
+                // event created one (model called sop_execute again before the run
+                // finished). Reuse it instead of creating a duplicate.
+                sop_tasks::mark_running(&st.pool, &existing).await?;
+                emit_sop_event(&st, &existing, &openid, "running");
+                tracing::debug!(openid = %openid, task_id = %existing,
+                    "sop webhook: starting — reused existing active task (dedup)");
             } else {
-                // Still no pending task — create a running row directly so the UI
-                // can show "进行中". /chat may create a duplicate later; the done
-                // handler will find whichever row was created first.
+                // No active task at all — create a running row directly so the UI
+                // can show "进行中". /chat may adopt this row later via dedup.
                 let task_id = sop_tasks::new_task_id();
                 let sop_meta = st.cfg.sop_metadata.get(payload.sop_name.as_str());
                 let estimated_seconds = sop_meta.map(|m| m.estimated_seconds).unwrap_or(540);
@@ -1227,11 +1252,13 @@ fn extract_company_name_from_text(text: &str) -> Option<String> {
         "有限公司", "有限责任公司", "股份有限公司", "股份合作公司",
         "集团有限公司", "集团股份有限公司", "合伙企业", "研究院", "研究所",
     ];
-    // Full-width parentheses （） are intentionally excluded: Chinese company
-    // names frequently embed region info as "中拓产业云（北京）科技服务有限公司".
-    // Treating them as delimiters would truncate the name to "科技服务有限公司".
+    // Both full-width （） and half-width () parentheses are intentionally
+    // excluded: Chinese company names embed region info as
+    // "百维互联科技发展(北京)有限公司" / "中拓产业云（北京）科技服务有限公司".
+    // Treating parens as delimiters truncates the name to "有限公司" (which then
+    // fails the length check and falls back to a stale company from history).
     const DELIMITERS: &[char] = &[
-        ' ', '　', ',', '，', '。', '！', '？', '\n', '(', ')',
+        ' ', '　', ',', '，', '。', '！', '？', '\n',
         '"', '"', '「', '」', '【', '】', ':', '：',
     ];
     let chars: Vec<char> = text.chars().collect();
@@ -1518,6 +1545,21 @@ mod tests {
         // 留资场景说"顾问会联系你"，不含 主动通知/主动发送 family，必须放行。
         let raw = "好的，已经登记，资质顾问会在 1 个工作日内联系你。";
         assert_eq!(sanitize_assistant_response(raw, false), raw);
+    }
+
+    #[test]
+    fn extracts_company_name_with_region_parens() {
+        // 半角 () 地域标记不能把名字截断成 "有限公司"（原 bug：截断后回退到旧公司）。
+        assert_eq!(
+            extract_company_name_from_text("百维互联科技发展(北京)有限公司可以做哪些政策?")
+                .as_deref(),
+            Some("百维互联科技发展(北京)有限公司")
+        );
+        // 全角 （） 仍正常。
+        assert_eq!(
+            extract_company_name_from_text("中拓产业云（北京）科技服务有限公司").as_deref(),
+            Some("中拓产业云（北京）科技服务有限公司")
+        );
     }
 }
 
