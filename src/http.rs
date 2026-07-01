@@ -1279,7 +1279,22 @@ fn extract_company_name_from_text(text: &str) -> Option<String> {
                 .find(|&j| DELIMITERS.contains(&chars[j]))
                 .map(|j| j + 1)
                 .unwrap_or(look_back);
-            let name: String = chars[name_start..end].iter().collect();
+            let mut name: String = chars[name_start..end].iter().collect();
+            // Parens are no longer delimiters, and the message often starts with a
+            // verb ("做一下百维互联…有限公司"), so the walk-back can sweep in a
+            // leading verb/prefix. Strip known leading words (longest-first) so the
+            // recorded name is the clean company (keeps the workspace-deeplink
+            // fallback path correct).
+            const LEADING: &[&str] = &[
+                "做一下", "做个", "帮我给", "帮我", "帮忙", "帮", "给",
+                "为", "请", "查一下", "查查", "查", "看看", "看", "咨询",
+            ];
+            loop {
+                match LEADING.iter().find_map(|p| name.strip_prefix(p)) {
+                    Some(rest) => name = rest.to_string(),
+                    None => break,
+                }
+            }
             if looks_like_full_company_name(&name) {
                 return Some(name);
             }
@@ -1559,6 +1574,17 @@ mod tests {
         assert_eq!(
             extract_company_name_from_text("中拓产业云（北京）科技服务有限公司").as_deref(),
             Some("中拓产业云（北京）科技服务有限公司")
+        );
+        // 开头动词前缀要剥掉，不能吞进企业名（否则 workspace 深链兜底找不到 case 目录）。
+        assert_eq!(
+            extract_company_name_from_text("做一下百维互联科技发展(北京)有限公司的政策匹配")
+                .as_deref(),
+            Some("百维互联科技发展(北京)有限公司")
+        );
+        assert_eq!(
+            extract_company_name_from_text("为百维互联科技发展(北京)有限公司做个政策匹配")
+                .as_deref(),
+            Some("百维互联科技发展(北京)有限公司")
         );
     }
 }
