@@ -342,6 +342,9 @@ impl Provisioner {
             }
         }
 
+        // Copy helper scripts verbatim (SOPs shell out to these).
+        copy_scripts(tpl_dir, &layout.workspace_dir)?;
+
         Ok(())
     }
 
@@ -569,6 +572,9 @@ impl Provisioner {
             }
         }
 
+        // Copy helper scripts verbatim (SOPs shell out to these).
+        copy_scripts(tpl_dir, &layout.workspace_dir)?;
+
         // chown best-effort (only matters in systemd backend)
         self.backend
             .chown_workspace(&user.linux_uid, &layout)
@@ -688,5 +694,40 @@ fn render_one(
     let tpl = std::fs::read_to_string(&tpl_path)?;
     let out = hb.render_template(&tpl, ctx)?;
     std::fs::write(out_path, out)?;
+    Ok(())
+}
+
+/// Copy `templates/workspace/scripts/` verbatim into `<workspace>/scripts/`.
+///
+/// Unlike skills and SOPs these are **not** handlebars-rendered: the tree
+/// holds binary assets (fonts) and Python source full of braces, both of
+/// which templating would corrupt. Anything a script needs at runtime comes
+/// from the environment (see `EnvironmentFile` in `systemd/zeroclaw@.service`),
+/// not from the template context.
+///
+/// Stale files are cleared first, mirroring the skills/SOPs logic, so a
+/// script deleted from the template disappears from existing workspaces on
+/// the next refresh.
+fn copy_scripts(tpl_dir: &std::path::Path, workspace_dir: &std::path::Path) -> Result<()> {
+    let src = tpl_dir.join("scripts");
+    if !src.is_dir() {
+        return Ok(());
+    }
+    let dest = workspace_dir.join("scripts");
+    let _ = std::fs::remove_dir_all(&dest);
+    copy_dir_recursive(&src, &dest)
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
     Ok(())
 }

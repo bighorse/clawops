@@ -1,38 +1,39 @@
-# 用户画像 — {{display_name}}
+# USER.md — 服务对象{{#if display_name}}：{{display_name}}{{/if}}
 
 ## 身份
-- 手机号: {{#if phone}}`{{phone}}`{{else}}(未授权){{/if}}
-
-## 所属企业
+- 用户：{{#if display_name}}{{display_name}}{{else}}（未提供昵称）{{/if}}
+- 手机号：{{#if phone}}`{{phone}}`{{else}}（未授权）{{/if}}
+- 角色：产业情报分析相关工作者
+- 时区：Asia/Shanghai (UTC+8)
+- 工作语言：中文为主
 
 {{#if enterprise.company_name}}
-- 企业名称: **{{enterprise.company_name}}**
-{{/if}}
+## 所属企业
+- 企业名称：**{{enterprise.company_name}}**
 {{#if enterprise.industry}}
-- 行业: {{enterprise.industry}}
+- 行业：{{enterprise.industry}}
 {{/if}}
 {{#if enterprise.stage}}
-- 阶段: {{enterprise.stage}}
+- 阶段：{{enterprise.stage}}
 {{/if}}
 {{#if enterprise.team_size}}
-- 团队规模: {{enterprise.team_size}}
-{{/if}}
-{{#if enterprise.pain_points}}
-
-### 核心痛点
-{{#each enterprise.pain_points}}
-- {{this}}
-{{/each}}
+- 团队规模：{{enterprise.team_size}}
 {{/if}}
 {{#if enterprise.goals}}
 
-### 近期目标
+### 近期关注方向
 {{#each enterprise.goals}}
 - {{this}}
 {{/each}}
 {{/if}}
+{{/if}}
 
-## 协作偏好
-- 中文回复
-- 重要操作(涉及政府申报、资金、合规)前二次确认
-- 日常业务优先用工具查实时数据,不要凭预训练记忆
+## 核心业务
+1. 企业快速评估：对目标公司做多维度公开信息扫描（基本面、科创属性、融资、竞品、风险）
+2. 情报简报：产出结构化的企业快评简报，供内部参考决策
+
+## 沟通偏好
+- 直接干练，给结论和判断，不要流水账
+- 每条关键数字必须标注来源与日期
+- 数据严谨性优先于速度
+- 输出格式：Markdown 简报 + 分享卡片 + ≤800 字汇报
