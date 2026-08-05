@@ -150,6 +150,117 @@ POST /clawops/chat ──► ClawOps ──► 该用户专属的 zeroclaw 守�
 
 ---
 
+### 3.6 执行过程实时滚动显示（重点）
+
+对话往往要跑几分钟，期间必须让用户看见"它在干什么"，否则体感就是卡死。做法是订阅 `GET /clawops/events` 事件流，把每一步工具调用滚动渲染出来。
+
+#### 3.6.1 事件类型（实测抓包，非推测）
+
+事件以标准 SSE 帧下发，每帧一行 `data: {json}`，帧间空行分隔：
+
+```
+data: {"type":"llm_request","provider":"custom:https://api.deepseek.com","model":"deepseek-v4-pro","timestamp":"..."}
+
+data: {"type":"tool_call_start","tool":"shell","arguments":"{\"command\":\"date\"}","timestamp":"..."}
+
+data: {"type":"tool_call","tool":"shell","duration_ms":2,"success":true,"timestamp":"..."}
+```
+
+完整事件类型：
+
+| `type` | 关键字段 | 含义 | 建议展示 |
+|---|---|---|---|
+| `llm_request` | `provider`、`model` | 开始请求模型 | "思考中…" |
+| `agent_start` | `provider`、`model` | 智能体开始 | — |
+| `agent_end` | `duration_ms`、`tokens_used?`、`cost_usd?` | 智能体结束 | — |
+| `tool_call_start` | `tool`、`arguments?` | **开始执行工具** | "▶ 正在执行 `<tool>`" + 参数摘要 |
+| `tool_call` | `tool`、`duration_ms`、`success` | **工具执行完毕** | 把上面那条改成 "✓ / ✗ `<tool>` (Nms)" |
+| `error` | `component?`、`message` | 出错 | 红字提示 |
+| `sop_result` | `id?`、`run_id?`、`sop_name?`、`response` | 长任务最终汇报 | 作为一条完整助手消息上屏 |
+| `sop_task` | `task_id`、`event` | 任务状态变化（`created`/`running`/`done`） | 更新任务列表 |
+
+**`arguments` 是一个 JSON 字符串**（不是对象），需二次 `JSON.parse` 才能取到如 `{"command":"date"}`。展示时建议截断，不要整段糊到屏幕上。
+
+#### 3.6.2 小程序怎么连（与 Web 不同，关键差异）
+
+Web 端用 `fetch` + `ReadableStream` 手动解析——因为 `EventSource` **加不了 `Authorization` 头**。
+
+**小程序既没有 `EventSource` 也没有 `fetch` 流式**，只能用 `wx.request` 的分块模式：
+
+```js
+const task = wx.request({
+  url: 'https://ai.infocts.cn/clawops/events',
+  header: { Authorization: `Bearer ${token}` },
+  enableChunked: true,          // 必须：开启分块接收
+  timeout: 0,                   // 长连接不设超时
+  success() {}, fail() {},
+})
+
+let buf = ''
+const decoder = (ab) => {
+  // 小程序无 TextDecoder，需自行把 ArrayBuffer 转 UTF-8 字符串
+  return decodeUTF8(new Uint8Array(ab))
+}
+
+task.onChunkReceived((res) => {
+  buf += decoder(res.data)
+  let idx
+  while ((idx = buf.indexOf('\n\n')) >= 0) {   // SSE 帧以空行分隔
+    const frame = buf.slice(0, idx)
+    buf = buf.slice(idx + 2)
+    for (const line of frame.split('\n')) {
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (!payload) continue
+      try { handleEvent(JSON.parse(payload)) } catch (_) { /* 非 JSON 帧忽略 */ }
+    }
+  }
+})
+```
+
+三个必须注意的点：
+1. **`enableChunked: true` 不能少**，否则收不到流。
+2. **小程序没有 `TextDecoder`**，`res.data` 是 `ArrayBuffer`，要自己实现 UTF-8 解码。中文被切在两个 chunk 之间时会乱码，解码器必须能处理**半个字符**（按字节缓冲，不足一个完整字符就留到下一块）。
+3. **`/events` 若鉴权失败返回的是 500**，不是 401，重连逻辑不要只判 401。
+
+#### 3.6.3 滚动渲染的正确姿势（避免刷屏）
+
+维护一个 `liveSteps` 数组，**原地更新而不是不断追加新消息**：
+
+```js
+function handleEvent(e) {
+  if (!this.data.busy) return          // 只在等待回复期间处理
+
+  if (e.type === 'tool_call_start') {
+    // 推入一条"执行中"
+    liveSteps.push({ tool: e.tool, detail: e.arguments, running: true })
+
+  } else if (e.type === 'tool_call') {
+    // 从后往前找到同名且仍在 running 的那条，回填结果
+    for (let i = liveSteps.length - 1; i >= 0; i--) {
+      if (liveSteps[i].running && liveSteps[i].tool === e.tool) {
+        liveSteps[i] = { ...liveSteps[i], running: false,
+                         durationMs: e.duration_ms, success: e.success }
+        break
+      }
+    }
+  }
+  this.setData({ liveSteps })
+}
+```
+
+**为什么要"从后往前找同名 running 的那条"**：同一个工具可能被连续调用多次，先进先出会把结果配错行。
+
+**长任务进度**：`sop_task` 状态变化时，**用同一条消息原地刷新**（记住它的消息 id 后 patch 内容），不要每次状态变化都追加一行，否则用户会看到满屏重复的进度条。
+
+**收到 `response` 后清空 `liveSteps`**：`POST /chat` 返回最终回复时，把执行过程折叠或清掉，只留最终答案（可保留一个"查看执行过程"的折叠入口）。
+
+#### 3.6.4 去重（否则结果会重复上屏）
+
+`sop_result` 事件带一个 `id` 字段（形如 `{run_id}:{timestamp}`）。**服务端在每次 SSE 重连时会补发最近的汇报**——如果不按 `id` 去重，用户每断线重连一次就会看到同一份结果重复一次。请维护一个已展示 id 的集合。
+
+---
+
 ## 四、小程序后端必须实现的接口
 
 这是 **唯一** 需要中伯伦后端开发的接口。ClawOps **不持有小程序的 appid/secret**，也不直接调用微信的 `jscode2session`，而是把 code 转发给你们的后端去换。
@@ -230,16 +341,20 @@ ClawOps 会把后端的失败包装成 HTTP 400 + 结构化错误：
 
 ## 六、能力说明：熵玑参谋能做什么
 
-每个租户的工作区包含：
+对外只有**两项能力**：
 
 | 类型 | 名称 | 说明 |
 |---|---|---|
-| SOP | `enterprise-quick-review` | **企业快评**：公司名消歧 → 缓存检查 → 查内部企业库 → 五板块多源检索 → 简报 + 分享卡片 + ≤800 字汇报 |
-| Skill | `enterprise-search` | 企业检索：按行业/地域/融资阶段筛选企业 |
+| SOP | `enterprise-quick-review` | **企业快评**：公司名消歧 → 缓存检查 → 五板块多源检索 → 简报 + 分享卡片 + ≤800 字汇报 |
+| Skill | `enterprise-search` | **企业检索**：按行业 / 地域 / 融资阶段等条件筛选企业 |
 
-**触发方式**：用户自然语言即可，如"查一下 XX 公司""XX 这家公司怎么样""帮我看看 XX"。SOP 会自动启动，属于长任务，进度通过 `/me/sop/tasks` 或 `/events` 感知。
+**触发方式**：用户自然语言即可。
+- 企业快评："查一下 XX 公司""XX 这家公司怎么样""帮我看看 XX""评估 XX"
+- 企业检索："搜索企业""帮我找""按行业筛选""有哪些…的公司"
 
-**产物路径**（在该用户工作区内）：
+企业快评是**长任务**（通常数分钟），进度通过 §3.6 的事件流或 `/me/sop/tasks` 感知。
+
+**产物路径**（在该用户的独立工作区内）：
 - 简报：`briefs/<company_slug>/brief_<YYYY-MM-DD>.md`
 - 分享卡片：`briefs/cards/<company_slug>_<YYYY-MM-DD>.png`（750×1000 竖版）
 
@@ -267,7 +382,7 @@ ClawOps 会把后端的失败包装成 HTTP 400 + 结构化错误：
 curl -X POST http://127.0.0.1:8088/admin/refresh-all-workspaces -H "X-Admin-Token: <token>"
 ```
 
-**⚠️ 分支纪律**：本实例走 `tenant/zhongbolun`。老服务器（2048）的 deploy.sh 拉的是 `main`，**切勿把熵玑参谋的模板合进 main**，否则会冲掉 2048 的租户模板。
+**⚠️ 分支纪律**：本实例固定在 `tenant/zhongbolun` 分支。部署与升级都以该分支为准，**不要切到 main 或把本分支的模板合并出去**——模板是本实例专属的。
 
 **⚠️ 密钥不可跨实例复制**：zeroclaw 的 `api_key` 若以 `enc2:` 开头即为密文，只能被生成它的那份 `.secret_key` 解开。给 ClawOps 配置时**必须填明文**，否则租户守护进程启动即失败，且报错会误导为 `zeroclaw not reachable ... after 20000ms`。
 
@@ -278,7 +393,7 @@ curl -X POST http://127.0.0.1:8088/admin/refresh-all-workspaces -H "X-Admin-Toke
 | 项 | 状态 |
 |---|---|
 | ClawOps 网关 | ✅ 运行中（`127.0.0.1:8088`） |
-| 熵玑参谋模板 | ✅ 已上线，零怀柔/2048 残留 |
+| 熵玑参谋模板 | ✅ 已上线 |
 | DeepSeek 模型 | ✅ `deepseek-v4-pro` 已验证可用 |
 | 企业快评 SOP + 检索 skill | ✅ 已下发 |
 | 内部企业库（MySQL） | ✅ 凭据已注入租户 |
