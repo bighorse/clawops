@@ -55,6 +55,12 @@ pub enum Error {
     #[error("rate limit exceeded; retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
 
+    /// Requested resource isn't there — or the caller isn't allowed to know
+    /// whether it is. Artifact lookups deliberately answer 404 for traversal
+    /// attempts too, so probing can't distinguish "blocked" from "absent".
+    #[error("{0}")]
+    NotFound(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -98,6 +104,7 @@ impl axum::response::IntoResponse for Error {
         }
         let (status, msg) = match &self {
             Error::UserNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            Error::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Error::UserAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
             Error::NoFreePort => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::DevFieldInProd(_) => (StatusCode::BAD_REQUEST, self.to_string()),

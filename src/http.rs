@@ -48,6 +48,8 @@ pub fn router(state: AppState) -> Router {
         .route("/me/profile", get(get_my_profile))
         .route("/me/chat-history", get(get_my_chat_history))
         .route("/me/sop/tasks", get(list_my_sop_tasks))
+        .route("/me/artifacts", get(list_my_artifacts))
+        .route("/me/artifacts/*path", get(get_my_artifact))
         .route("/me/qualification-reminders", get(list_my_qualification_reminders))
         .route("/internal/qualification-reminders", post(internal_qualification_reminders))
         .route("/admin/users", get(list_users))
@@ -863,6 +865,203 @@ async fn update_my_profile(
     // zeroclaw reads the file on every new message, no daemon restart.
     st.provisioner.refresh_user_md(&openid).await?;
     get_my_profile(State(st), AuthOpenid(openid)).await
+}
+
+// ── Artifacts: read SOP output straight off the tenant's workspace ──────
+//
+// SOPs write their deliverables (markdown briefs) into the tenant workspace.
+// The mini-program renders them in a dedicated page, so it needs the raw
+// text. We read the file here rather than relying on the agent calling
+// zeroclaw's `publish_file` tool: a weak model skipping that call would
+// silently leave the user with no way to reach the deliverable. Reading from
+// disk depends on nothing the model does.
+//
+// Every path is confined to `<workspace>/briefs/` and must resolve (after
+// symlink resolution) back inside it — see `resolve_artifact_path`.
+
+/// Deliverables live here, relative to the workspace root.
+const ARTIFACT_SUBDIR: &str = "briefs";
+
+#[derive(Serialize)]
+struct ArtifactEntry {
+    /// Workspace-relative path, e.g. `briefs/cambricon/brief_2026-08-05.md`.
+    /// Feed this back to `GET /me/artifacts/{path}` verbatim.
+    path: String,
+    name: String,
+    size: u64,
+    /// RFC3339, or null when the filesystem doesn't report mtime.
+    modified_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Serialize)]
+struct ArtifactsResp {
+    artifacts: Vec<ArtifactEntry>,
+}
+
+#[derive(Serialize)]
+struct ArtifactResp {
+    path: String,
+    name: String,
+    /// Raw markdown. The mini-program renders it; we do no transformation.
+    content: String,
+    size: u64,
+    modified_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Locate a tenant's workspace directory from their openid.
+async fn workspace_dir_for(st: &AppState, openid: &str) -> Result<std::path::PathBuf> {
+    let user = users::get_required(&st.pool, openid).await?;
+    let layout = crate::process::UserHomeLayout::new(
+        &st.cfg.zeroclaw.home_base,
+        &user.linux_uid,
+    );
+    Ok(layout.workspace_dir)
+}
+
+/// Resolve a client-supplied relative path to an absolute one, refusing
+/// anything that escapes `<workspace>/briefs`.
+///
+/// Canonicalizing both sides is what makes this safe: `..` segments and
+/// symlinks are resolved *before* the prefix check, so a symlink pointing at
+/// /etc/passwd fails the check rather than being followed.
+fn resolve_artifact_path(
+    workspace_dir: &std::path::Path,
+    rel: &str,
+) -> Result<std::path::PathBuf> {
+    // Reject absolute paths and Windows-style drive prefixes outright; the
+    // join below would otherwise discard the base directory entirely.
+    if rel.starts_with('/') || rel.contains(':') {
+        return Err(Error::NotFound("artifact not found".into()));
+    }
+    if !rel.ends_with(".md") {
+        return Err(Error::NotFound("artifact not found".into()));
+    }
+
+    let base = workspace_dir.join(ARTIFACT_SUBDIR);
+    let base_real = base
+        .canonicalize()
+        .map_err(|_| Error::NotFound("artifact not found".into()))?;
+
+    // Strip a leading "briefs/" so callers may pass either the path we
+    // handed them (`briefs/x/y.md`) or one relative to briefs/ (`x/y.md`).
+    let inner = rel.strip_prefix(ARTIFACT_SUBDIR).unwrap_or(rel);
+    let inner = inner.trim_start_matches('/');
+
+    let candidate = base_real.join(inner);
+    let real = candidate
+        .canonicalize()
+        .map_err(|_| Error::NotFound(format!("artifact not found: {rel}")))?;
+
+    if !real.starts_with(&base_real) {
+        return Err(Error::NotFound("artifact not found".into()));
+    }
+    if !real.is_file() {
+        return Err(Error::NotFound(format!("artifact not found: {rel}")));
+    }
+    Ok(real)
+}
+
+fn mtime_of(meta: &std::fs::Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
+    meta.modified().ok().map(chrono::DateTime::<chrono::Utc>::from)
+}
+
+/// GET /me/artifacts — list this tenant's markdown deliverables, newest first.
+///
+/// Returns an empty list (not an error) when the tenant has produced nothing
+/// yet, so the client can render "no reports" without special-casing.
+async fn list_my_artifacts(
+    State(st): State<AppState>,
+    AuthOpenid(openid): AuthOpenid,
+) -> std::result::Result<Json<ArtifactsResp>, Error> {
+    let workspace = workspace_dir_for(&st, &openid).await?;
+    let base = workspace.join(ARTIFACT_SUBDIR);
+
+    let mut out: Vec<ArtifactEntry> = Vec::new();
+    collect_markdown(&base, &base, &mut out);
+    out.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    Ok(Json(ArtifactsResp { artifacts: out }))
+}
+
+/// Walk `dir` collecting `.md` files. Errors are swallowed on purpose: a
+/// listing that skips an unreadable subdirectory beats failing the whole
+/// request.
+fn collect_markdown(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<ArtifactEntry>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // symlink_metadata, not metadata: the latter follows the link, which
+        // would let a tenant surface arbitrary host files (name and size) in
+        // their listing by symlinking to them. Reads are already blocked by
+        // resolve_artifact_path; this closes the matching disclosure in the
+        // listing. Symlinks are skipped outright — deliverables are always
+        // real files written by the SOP.
+        let Ok(meta) = entry.metadata() else { continue };
+        if entry
+            .path()
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_markdown(base, &path, out);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        // Intermediate SOP scratch files (_disambiguation.md, _search_log.md…)
+        // are working notes, not deliverables.
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.starts_with('_') {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(base)
+            .map(|p| format!("{ARTIFACT_SUBDIR}/{}", p.display()))
+            .unwrap_or_else(|_| name.clone());
+        out.push(ArtifactEntry {
+            path: rel,
+            name,
+            size: meta.len(),
+            modified_at: mtime_of(&meta),
+        });
+    }
+}
+
+/// GET /me/artifacts/{path} — return one markdown deliverable as raw text.
+async fn get_my_artifact(
+    State(st): State<AppState>,
+    AuthOpenid(openid): AuthOpenid,
+    Path(rel): Path<String>,
+) -> std::result::Result<Json<ArtifactResp>, Error> {
+    let workspace = workspace_dir_for(&st, &openid).await?;
+    let real = resolve_artifact_path(&workspace, &rel)?;
+    let content = std::fs::read_to_string(&real)?;
+    let meta = std::fs::metadata(&real)?;
+    let name = real
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(Json(ArtifactResp {
+        path: rel,
+        name,
+        size: meta.len(),
+        modified_at: mtime_of(&meta),
+        content,
+    }))
 }
 
 async fn list_users(
