@@ -168,18 +168,22 @@ data: {"type":"tool_call","tool":"shell","duration_ms":2,"success":true,"timesta
 
 完整事件类型：
 
-| `type` | 关键字段 | 含义 | 建议展示 |
-|---|---|---|---|
-| `llm_request` | `provider`、`model` | 开始请求模型 | "思考中…" |
-| `agent_start` | `provider`、`model` | 智能体开始 | — |
-| `agent_end` | `duration_ms`、`tokens_used?`、`cost_usd?` | 智能体结束 | — |
-| `tool_call_start` | `tool`、`arguments?` | **开始执行工具** | "▶ 正在执行 `<tool>`" + 参数摘要 |
-| `tool_call` | `tool`、`duration_ms`、`success` | **工具执行完毕** | 把上面那条改成 "✓ / ✗ `<tool>` (Nms)" |
-| `error` | `component?`、`message` | 出错 | 红字提示 |
-| `sop_result` | `id?`、`run_id?`、`sop_name?`、`response` | 长任务最终汇报 | 作为一条完整助手消息上屏 |
-| `sop_task` | `task_id`、`event` | 任务状态变化（`created`/`running`/`done`） | 更新任务列表 |
+| `type` | 关键字段 | 含义 | 建议展示 | 实测 |
+|---|---|---|---|---|
+| `llm_request` | `provider`、`model` | 开始请求模型 | "思考中…" | ✅ 22 次 |
+| `tool_call_start` | `tool`、`arguments?` | **开始执行工具** | "▶ 正在执行 `<tool>`" + 参数摘要 | ✅ 28 次 |
+| `tool_call` | `tool`、`duration_ms`、`success` | **工具执行完毕** | 把上面那条改成 "✓ / ✗ `<tool>` (Nms)" | ✅ 28 次 |
+| `sop_task` | `task_id`、`event` | 长任务状态：`created` → `running` → `done` | 更新任务列表 / 进度条 | ✅ 3 次 |
+| `agent_start` / `agent_end` | `provider`、`model`、`duration_ms` | 智能体起止 | — | 未出现 |
+| `error` | `component?`、`message` | 出错 | 红字提示 | 未出现 |
+
+以上"实测"列来自一次完整的企业快评（28 次工具调用、耗时约 5 分钟）的真实抓包。
+
+**⚠️ 不要依赖 `sop_result`**：客户端类型定义里存在该事件，但**实测整轮长任务中一次都没有出现**。长任务的完成信号请以 **`sop_task` 的 `event: "done"`** 为准，收到后再调 `/me/sop/tasks` 取任务详情。
 
 **`arguments` 是一个 JSON 字符串**（不是对象），需二次 `JSON.parse` 才能取到如 `{"command":"date"}`。展示时建议截断，不要整段糊到屏幕上。
+
+**实测会出现的工具名**（用于做中文映射）：`web_search_tool`、`web_fetch`、`file_read`、`file_write`、`glob_search`、`shell`、`sop_execute`、`sop_advance`、`publish_file`。
 
 #### 3.6.2 小程序怎么连（与 Web 不同，关键差异）
 
@@ -255,9 +259,36 @@ function handleEvent(e) {
 
 **收到 `response` 后清空 `liveSteps`**：`POST /chat` 返回最终回复时，把执行过程折叠或清掉，只留最终答案（可保留一个"查看执行过程"的折叠入口）。
 
-#### 3.6.4 去重（否则结果会重复上屏）
+#### 3.6.4 长任务完成后怎么拿结果
 
-`sop_result` 事件带一个 `id` 字段（形如 `{run_id}:{timestamp}`）。**服务端在每次 SSE 重连时会补发最近的汇报**——如果不按 `id` 去重，用户每断线重连一次就会看到同一份结果重复一次。请维护一个已展示 id 的集合。
+`sop_task` 的 `event: "done"` 到达后，调 `GET /clawops/me/sop/tasks` 取任务详情。**注意该接口只返回元数据**（`task_id` / `status` / `enterprise_name` / `created_at` / `completed_at` 等），**不含正文，也不含产物链接**。
+
+**产物交付（当前状态：链路未打通，见 §3.7）**
+
+企业快评会在该用户工作区里生成两个产物：
+- 简报：`briefs/<company_slug>/brief_<YYYY-MM-DD>.md`
+- 分享卡片：`briefs/cards/<company_slug>_<YYYY-MM-DD>.png`
+
+它们是**服务器上的文件**，小程序不能直接访问。
+
+---
+
+### 3.7 产物下载（待打通的一环）
+
+**设计路径**：SOP 用 `publish_file` 工具为产物生成**带签名的下载链接**，形如
+
+```
+/download/briefs%2Fcambricon%2Fbrief_2026-08-05.md?expires=<unix秒>&sig=<64位hex>
+```
+
+实测该链接**可用**（返回 200 + 文件内容），路径分隔符用 `%2F` 编码或原样 `/` 均可，`expires` 为绝对过期时间戳。
+
+**当前有两个断点**：
+
+1. **网关不透传下载路径。** ClawOps 只代理 `/chat`、`/events`、`/me/*` 等接口，**没有 `/download` 路由**，该路径经网关访问返回 404。小程序目前拿不到产物。
+2. **模型不一定会调 `publish_file`。** 实测一整轮企业快评中，模型**没有调用**它，最终汇报里给的是服务器文件路径而非可下载 URL——尽管 SOP 的质量门禁（P0-4）明确要求必须是真实签名链接。手工要求它补调时可以正常生成。
+
+**打通所需**：网关侧增加 `/download` 透传（改动不大），SOP 侧加强对 `publish_file` 的强制。在此之前，小程序端可先按"任务完成但产物暂不可下载"处理，只展示对话里的文字汇报。
 
 ---
 
