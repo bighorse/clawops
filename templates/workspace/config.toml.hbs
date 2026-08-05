@@ -48,7 +48,19 @@ max_actions_per_hour = 120
 max_cost_per_day_cents = {{llm.max_cost_per_day_cents}}
 require_approval_for_medium_risk = true
 block_high_risk_commands = true
-shell_env_passthrough = ["PATH", "HOME", "VIRTUAL_ENV"]
+# MYSQL_* 必须在此白名单里：守护进程的环境变量不会自动传给 shell 子进程，
+# 而 scripts/query_enterprise_db.py 与 scripts/search_enterprise.py 都靠它们连库。
+# 漏掉会静默降级为「数据库连接参数不完整」，SOP 照跑但查不到内部数据。
+shell_env_passthrough = [
+    "PATH",
+    "HOME",
+    "VIRTUAL_ENV",
+    "MYSQL_HOST",
+    "MYSQL_PORT",
+    "MYSQL_USER",
+    "MYSQL_PASSWORD",
+    "MYSQL_DATABASE",
+]
 auto_approve = ["file_read", "memory_recall", "web_fetch", "web_search_tool"]
 always_ask = ["shell", "file_write"]
 
