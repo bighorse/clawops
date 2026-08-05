@@ -139,6 +139,8 @@ POST /clawops/chat ──► ClawOps ──► 该用户专属的 zeroclaw 守�
 | `/clawops/me/profile` | GET / PUT | Bearer | 读取/更新用户画像。PUT 的字段全部可选，不传=不修改，**无法置空** |
 | `/clawops/me/chat-history` | GET | Bearer | 历史消息。参数 `before_id`、`limit`（默认 20，上限 100）。返回按 **id 倒序**（新的在前），带 `has_more` / `next_cursor` |
 | `/clawops/me/sop/tasks` | GET | Bearer | 长任务列表。参数 `status`、`sop_name`、`limit`（默认 50，上限 200）。**只返回最近 30 天，无分页游标** |
+| `/clawops/me/artifacts` | GET | Bearer | 简报列表（详见 §3.7） |
+| `/clawops/me/artifacts/{path}` | GET | Bearer | 取简报 Markdown 正文（详见 §3.7） |
 | `/clawops/events` | GET | Bearer 或 `?token=` | SSE 事件流，推送任务状态变化 |
 | `/clawops/auth/logout` | POST | 手工读 Bearer | 注销当前 token，**永远返回 200** |
 | `/clawops/auth/logout-all` | POST | Bearer | 注销该用户全部 token |
@@ -261,34 +263,60 @@ function handleEvent(e) {
 
 #### 3.6.4 长任务完成后怎么拿结果
 
-`sop_task` 的 `event: "done"` 到达后，调 `GET /clawops/me/sop/tasks` 取任务详情。**注意该接口只返回元数据**（`task_id` / `status` / `enterprise_name` / `created_at` / `completed_at` 等），**不含正文，也不含产物链接**。
+`sop_task` 的 `event: "done"` 到达后：
 
-**产物交付（当前状态：链路未打通，见 §3.7）**
+1. 调 `GET /clawops/me/artifacts` 拿简报列表（**已按修改时间倒序，第一条就是刚生成的**）
+2. 用其中的 `path` 调 `GET /clawops/me/artifacts/{path}` 取 Markdown 正文
+3. 在简报页渲染
 
-企业快评会在该用户工作区里生成两个产物：
-- 简报：`briefs/<company_slug>/brief_<YYYY-MM-DD>.md`
-- 分享卡片：`briefs/cards/<company_slug>_<YYYY-MM-DD>.png`
-
-它们是**服务器上的文件**，小程序不能直接访问。
+`GET /clawops/me/sop/tasks` 只返回任务元数据（状态、企业名、耗时），**不含正文**——正文走 artifacts 接口。
 
 ---
 
-### 3.7 产物下载（待打通的一环）
+### 3.7 简报接口（产物交付）
 
-**设计路径**：SOP 用 `publish_file` 工具为产物生成**带签名的下载链接**，形如
+**产物只有一份：Markdown 简报。** 没有图片、没有下载链接、没有附件——小程序用专门的页面渲染这份 Markdown。
 
+#### `GET /clawops/me/artifacts`
+
+鉴权 Bearer。列出当前用户的全部简报，**按修改时间倒序**：
+
+```json
+{
+  "artifacts": [
+    {
+      "path": "briefs/cambricon/brief_2026-08-05.md",
+      "name": "brief_2026-08-05.md",
+      "size": 7431,
+      "modified_at": "2026-08-05T09:09:46.778208740Z"
+    }
+  ]
+}
 ```
-/download/briefs%2Fcambricon%2Fbrief_2026-08-05.md?expires=<unix秒>&sig=<64位hex>
+
+没有任何简报时返回 `{"artifacts": []}`（**不是错误**），前端可直接渲染空态。
+
+`path` 字段**原样**回传给下面的接口即可。
+
+#### `GET /clawops/me/artifacts/{path}`
+
+鉴权 Bearer。返回单份简报的 Markdown 正文：
+
+```json
+{
+  "path": "briefs/cambricon/brief_2026-08-05.md",
+  "name": "brief_2026-08-05.md",
+  "content": "# 中科寒武纪科技股份有限公司 — 企业快评\n\n**简报日期**：...",
+  "size": 7431,
+  "modified_at": "2026-08-05T09:09:46.778208740Z"
+}
 ```
 
-实测该链接**可用**（返回 200 + 文件内容），路径分隔符用 `%2F` 编码或原样 `/` 均可，`expires` 为绝对过期时间戳。
+`content` 是**原始 Markdown**，网关不做任何转换。简报的固定结构是：一级标题（`<公司全称> — 企业快评`）、元信息行、一句话画像、五个板块（基本面 / 科创属性 / 融资历史 / 竞品对比 / 风险点）、快速总结、末尾免责声明。含 Markdown 表格，渲染组件需支持 GFM 表格。
 
-**当前有两个断点**：
+**错误处理**：文件不存在、路径非法、越界访问**一律返回 404**（响应体 `{"error":"artifact not found: ..."}`）——刻意不区分，避免探测。只接受 `.md`。
 
-1. **网关不透传下载路径。** ClawOps 只代理 `/chat`、`/events`、`/me/*` 等接口，**没有 `/download` 路由**，该路径经网关访问返回 404。小程序目前拿不到产物。
-2. **模型不一定会调 `publish_file`。** 实测一整轮企业快评中，模型**没有调用**它，最终汇报里给的是服务器文件路径而非可下载 URL——尽管 SOP 的质量门禁（P0-4）明确要求必须是真实签名链接。手工要求它补调时可以正常生成。
-
-**打通所需**：网关侧增加 `/download` 透传（改动不大），SOP 侧加强对 `publish_file` 的强制。在此之前，小程序端可先按"任务完成但产物暂不可下载"处理，只展示对话里的文字汇报。
+**典型量级**：一份简报约 7KB，可一次性读入内存渲染。
 
 ---
 
@@ -383,11 +411,9 @@ ClawOps 会把后端的失败包装成 HTTP 400 + 结构化错误：
 - 企业快评："查一下 XX 公司""XX 这家公司怎么样""帮我看看 XX""评估 XX"
 - 企业检索："搜索企业""帮我找""按行业筛选""有哪些…的公司"
 
-企业快评是**长任务**（通常数分钟），进度通过 §3.6 的事件流或 `/me/sop/tasks` 感知。
+企业快评是**长任务**（实测约 5 分钟、28 次工具调用），进度通过 §3.6 的事件流感知。
 
-**产物路径**（在该用户的独立工作区内）：
-- 简报：`briefs/<company_slug>/brief_<YYYY-MM-DD>.md`
-- 分享卡片：`briefs/cards/<company_slug>_<YYYY-MM-DD>.png`（750×1000 竖版）
+**产物**：一份 Markdown 简报，经 §3.7 的接口读取。对话里同时会有一段 ≤800 字的口头汇报（一句话画像 + 核心亮点 + 主要风险）。
 
 **模型**：DeepSeek `deepseek-v4-pro`（官方 API），推理模型。
 
