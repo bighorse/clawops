@@ -908,24 +908,48 @@ struct ArtifactResp {
     modified_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Locate a tenant's workspace directory from their openid.
-async fn workspace_dir_for(st: &AppState, openid: &str) -> Result<std::path::PathBuf> {
+/// The expected, un-dereferenced artifact root for a tenant.
+///
+/// Only `home_base` is canonicalized — it is root-owned and outside every
+/// tenant's reach. The per-tenant components are appended literally and are
+/// deliberately NOT resolved.
+///
+/// That distinction is the whole security property. `chown -R` hands the
+/// tenant their entire home, so `workspace/` and `briefs/` are theirs to
+/// unlink and recreate — including as symlinks pointing at another tenant's
+/// home, or at `/`. Canonicalizing the base would follow such a link and
+/// relocate the trust anchor itself, making the prefix check below vacuous.
+/// Keeping the base literal means a swapped-out directory resolves the
+/// *candidate* somewhere outside the expected prefix, and the check fires.
+async fn artifact_root_for(st: &AppState, openid: &str) -> Result<std::path::PathBuf> {
     let user = users::get_required(&st.pool, openid).await?;
-    let layout = crate::process::UserHomeLayout::new(
-        &st.cfg.zeroclaw.home_base,
-        &user.linux_uid,
-    );
-    Ok(layout.workspace_dir)
+    let home_base = st
+        .cfg
+        .zeroclaw
+        .home_base
+        .canonicalize()
+        .unwrap_or_else(|_| st.cfg.zeroclaw.home_base.clone());
+    Ok(home_base
+        .join(&user.linux_uid)
+        .join(".zeroclaw")
+        .join("workspace")
+        .join(ARTIFACT_SUBDIR))
 }
 
-/// Resolve a client-supplied relative path to an absolute one, refusing
-/// anything that escapes `<workspace>/briefs`.
+/// Resolve a client-supplied relative path, refusing anything that escapes
+/// the tenant's artifact root.
 ///
-/// Canonicalizing both sides is what makes this safe: `..` segments and
-/// symlinks are resolved *before* the prefix check, so a symlink pointing at
-/// /etc/passwd fails the check rather than being followed.
+/// Two distinct escapes are blocked here:
+///   * symlinks and `..` — `canonicalize` resolves them, then the prefix
+///     check against the literal root rejects whatever lands outside;
+///   * hard links — invisible to `canonicalize` (a hard link *is* the file,
+///     under a second name inside the root), so they are caught by the link
+///     count instead. SOP deliverables are always freshly written files with
+///     exactly one link; anything else is someone aliasing a file from
+///     outside, e.g. `ln ~/.zeroclaw/config.toml briefs/x.md` to read the
+///     tenant's own api_key back out through this endpoint.
 fn resolve_artifact_path(
-    workspace_dir: &std::path::Path,
+    root: &std::path::Path,
     rel: &str,
 ) -> Result<std::path::PathBuf> {
     // Reject absolute paths and Windows-style drive prefixes outright; the
@@ -937,32 +961,90 @@ fn resolve_artifact_path(
         return Err(Error::NotFound("artifact not found".into()));
     }
 
-    let base = workspace_dir.join(ARTIFACT_SUBDIR);
-    let base_real = base
+    // Strip a leading `briefs/` component so callers may pass either the path
+    // we handed them (`briefs/x/y.md`) or one relative to it (`x/y.md`).
+    // Component-wise, not `str::strip_prefix` — the latter would turn
+    // `briefs-evil/x.md` into `-evil/x.md` and silently read the wrong file.
+    let rel_path = std::path::Path::new(rel);
+    let inner = rel_path
+        .strip_prefix(ARTIFACT_SUBDIR)
+        .unwrap_or(rel_path);
+
+    let real = root
+        .join(inner)
         .canonicalize()
         .map_err(|_| Error::NotFound("artifact not found".into()))?;
 
-    // Strip a leading "briefs/" so callers may pass either the path we
-    // handed them (`briefs/x/y.md`) or one relative to briefs/ (`x/y.md`).
-    let inner = rel.strip_prefix(ARTIFACT_SUBDIR).unwrap_or(rel);
-    let inner = inner.trim_start_matches('/');
-
-    let candidate = base_real.join(inner);
-    let real = candidate
-        .canonicalize()
-        .map_err(|_| Error::NotFound(format!("artifact not found: {rel}")))?;
-
-    if !real.starts_with(&base_real) {
+    // `Path::starts_with` compares whole components, so `briefs-evil` can
+    // never pass as being under `briefs`.
+    if !real.starts_with(root) {
         return Err(Error::NotFound("artifact not found".into()));
     }
-    if !real.is_file() {
-        return Err(Error::NotFound(format!("artifact not found: {rel}")));
+
+    let meta = std::fs::symlink_metadata(&real)
+        .map_err(|_| Error::NotFound("artifact not found".into()))?;
+    if !meta.is_file() {
+        return Err(Error::NotFound("artifact not found".into()));
+    }
+    if std::os::unix::fs::MetadataExt::nlink(&meta) > 1 {
+        return Err(Error::NotFound("artifact not found".into()));
     }
     Ok(real)
 }
 
 fn mtime_of(meta: &std::fs::Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
     meta.modified().ok().map(chrono::DateTime::<chrono::Utc>::from)
+}
+
+/// A brief is ~7 KB. This bound exists so a tenant can't park a multi-GB
+/// `.md` in their workspace and OOM the gateway with one GET — we serve the
+/// whole body as a JSON string, so peak memory is roughly twice the file.
+const ARTIFACT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Directory recursion bound for listing. Deliverables live exactly two
+/// levels deep (`briefs/<slug>/brief_<date>.md`); the margin is for future
+/// layouts. Without a bound a tenant can `mkdir` a few hundred levels and
+/// blow the worker's 2 MB stack, which aborts the whole process — and since
+/// the directory survives, every subsequent request crashes it again.
+const ARTIFACT_MAX_DEPTH: usize = 8;
+
+/// Cap on entries returned, so a tenant can't make one listing walk forever.
+const ARTIFACT_MAX_ENTRIES: usize = 500;
+
+/// Open and read an artifact without ever re-resolving its path.
+///
+/// The naive form — validate the path, then `read_to_string(path)` — is a
+/// TOCTOU hole: the tenant owns `briefs/`, so between the check and the open
+/// they can swap the file for a symlink to anything on the host, and this
+/// process runs as root. Measured on the pre-fix code, a rename loop landed
+/// that race in roughly 2% of attempts.
+///
+/// So: open once with `O_NOFOLLOW` (the final component can no longer be a
+/// symlink, whatever it became after validation), then take metadata and the
+/// bytes from that same file descriptor. The path is never consulted again.
+fn read_artifact(path: &std::path::Path) -> Result<(String, std::fs::Metadata)> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| Error::NotFound("artifact not found".into()))?;
+
+    // fstat on the descriptor we already hold — describes the opened file,
+    // not whatever the path may point at by now.
+    let meta = file
+        .metadata()
+        .map_err(|_| Error::NotFound("artifact not found".into()))?;
+    if !meta.is_file() || meta.nlink() > 1 || meta.len() > ARTIFACT_MAX_BYTES {
+        return Err(Error::NotFound("artifact not found".into()));
+    }
+
+    let mut content = String::with_capacity(meta.len() as usize);
+    file.read_to_string(&mut content)
+        .map_err(|_| Error::NotFound("artifact not found".into()))?;
+    Ok((content, meta))
 }
 
 /// GET /me/artifacts — list this tenant's markdown deliverables, newest first.
@@ -973,11 +1055,17 @@ async fn list_my_artifacts(
     State(st): State<AppState>,
     AuthOpenid(openid): AuthOpenid,
 ) -> std::result::Result<Json<ArtifactsResp>, Error> {
-    let workspace = workspace_dir_for(&st, &openid).await?;
-    let base = workspace.join(ARTIFACT_SUBDIR);
-
+    let base = artifact_root_for(&st, &openid).await?;
+    // Reject a swapped-out root outright: if `briefs` (or any parent) is a
+    // symlink, listing it would enumerate someone else's directory.
+    if std::fs::symlink_metadata(&base)
+        .map(|m| !m.file_type().is_dir())
+        .unwrap_or(true)
+    {
+        return Ok(Json(ArtifactsResp { artifacts: Vec::new() }));
+    }
     let mut out: Vec<ArtifactEntry> = Vec::new();
-    collect_markdown(&base, &base, &mut out);
+    collect_markdown(&base, &base, 0, &mut out);
     out.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
     Ok(Json(ArtifactsResp { artifacts: out }))
 }
@@ -988,30 +1076,28 @@ async fn list_my_artifacts(
 fn collect_markdown(
     base: &std::path::Path,
     dir: &std::path::Path,
+    depth: usize,
     out: &mut Vec<ArtifactEntry>,
 ) {
+    if depth > ARTIFACT_MAX_DEPTH || out.len() >= ARTIFACT_MAX_ENTRIES {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // symlink_metadata, not metadata: the latter follows the link, which
-        // would let a tenant surface arbitrary host files (name and size) in
-        // their listing by symlinking to them. Reads are already blocked by
-        // resolve_artifact_path; this closes the matching disclosure in the
-        // listing. Symlinks are skipped outright — deliverables are always
-        // real files written by the SOP.
+        // DirEntry::metadata() is lstat semantics — it does NOT follow the
+        // link — so a symlink lands here as a regular entry whose name may
+        // well end in .md, and whose len() is the length of the target path
+        // string. Listing it would advertise a file outside the root, so skip
+        // symlinks outright: deliverables are always real files the SOP wrote.
         let Ok(meta) = entry.metadata() else { continue };
-        if entry
-            .path()
-            .symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(true)
-        {
+        if meta.file_type().is_symlink() {
             continue;
         }
         if meta.is_dir() {
-            collect_markdown(base, &path, out);
+            collect_markdown(base, &path, depth + 1, out);
             continue;
         }
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -1025,6 +1111,11 @@ fn collect_markdown(
             .unwrap_or_default()
             .to_string();
         if name.starts_with('_') {
+            continue;
+        }
+        // Same rationale as resolve_artifact_path: a hard link aliases a file
+        // from outside the root, so don't advertise it either.
+        if std::os::unix::fs::MetadataExt::nlink(&meta) > 1 {
             continue;
         }
         let rel = path
@@ -1046,10 +1137,9 @@ async fn get_my_artifact(
     AuthOpenid(openid): AuthOpenid,
     Path(rel): Path<String>,
 ) -> std::result::Result<Json<ArtifactResp>, Error> {
-    let workspace = workspace_dir_for(&st, &openid).await?;
-    let real = resolve_artifact_path(&workspace, &rel)?;
-    let content = std::fs::read_to_string(&real)?;
-    let meta = std::fs::metadata(&real)?;
+    let root = artifact_root_for(&st, &openid).await?;
+    let real = resolve_artifact_path(&root, &rel)?;
+    let (content, meta) = read_artifact(&real)?;
     let name = real
         .file_name()
         .and_then(|n| n.to_str())

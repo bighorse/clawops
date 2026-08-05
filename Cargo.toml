@@ -6,6 +6,7 @@ description = "Multi-tenant ops gateway for ZeroClaw agents"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+libc = "0.2"
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"

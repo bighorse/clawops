@@ -122,6 +122,35 @@ async fn main() -> anyhow::Result<()> {
                 limiters,
                 sop_event_tx,
             };
+            // An empty wx.backend_base_url puts WxClient in mock mode, where
+            // /auth/wx-login trusts a caller-supplied `mock_openid` verbatim —
+            // anyone can impersonate anyone. `#[serde(default)]` means simply
+            // omitting the line lands you there with no error, so make it a
+            // deliberate choice rather than an accident: on a real backend the
+            // operator must write `allow_mock_login = true` to proceed, and we
+            // shout about it on every boot.
+            if cfg.provisioner.backend != "mock" && cfg.wx.backend_base_url.trim().is_empty() {
+                if !cfg.wx.allow_mock_login {
+                    tracing::error!(
+                        "refusing to start: [wx].backend_base_url is empty while \
+                         provisioner.backend = \"{}\". That enables mock login, where \
+                         any caller can impersonate any user via the `mock_openid` \
+                         field. Set backend_base_url to the platform's code2session \
+                         endpoint — or, if this host is intentionally pre-launch, set \
+                         [wx].allow_mock_login = true and keep the port off the public \
+                         internet.",
+                        cfg.provisioner.backend
+                    );
+                    std::process::exit(1);
+                }
+                tracing::warn!(
+                    "MOCK LOGIN ENABLED — /auth/wx-login accepts any `mock_openid`, \
+                     so anyone who can reach this port can impersonate any user. \
+                     Acceptable only while the port is unreachable from the public \
+                     internet. Set [wx].backend_base_url to turn this off."
+                );
+            }
+
             let app = http::router(state);
             let addr: std::net::SocketAddr =
                 format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;

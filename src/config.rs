@@ -443,6 +443,13 @@ pub struct WxConfig {
     pub backend_base_url: String,
     #[serde(default = "default_wx_exchange_timeout_secs")]
     pub exchange_timeout_secs: u64,
+    /// Acknowledge that an empty `backend_base_url` means mock login, where
+    /// `/auth/wx-login` trusts any caller-supplied `mock_openid`. Without
+    /// this, `serve` refuses to start on a non-mock provisioner backend —
+    /// see the check in main.rs. Only set it while the port is unreachable
+    /// from the public internet.
+    #[serde(default)]
+    pub allow_mock_login: bool,
 }
 
 fn default_wx_exchange_timeout_secs() -> u64 {
@@ -454,6 +461,7 @@ impl Default for WxConfig {
         Self {
             backend_base_url: String::new(),
             exchange_timeout_secs: default_wx_exchange_timeout_secs(),
+            allow_mock_login: false,
         }
     }
 }
