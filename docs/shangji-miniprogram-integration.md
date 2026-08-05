@@ -185,7 +185,7 @@ data: {"type":"tool_call","tool":"shell","duration_ms":2,"success":true,"timesta
 
 **`arguments` 是一个 JSON 字符串**（不是对象），需二次 `JSON.parse` 才能取到如 `{"command":"date"}`。展示时建议截断，不要整段糊到屏幕上。
 
-**实测会出现的工具名**（用于做中文映射）：`web_search_tool`、`web_fetch`、`file_read`、`file_write`、`glob_search`、`shell`、`sop_execute`、`sop_advance`、`publish_file`。
+**实测会出现的工具名**（用于做中文映射）：`web_search_tool`、`web_fetch`、`file_read`、`file_write`、`glob_search`、`shell`、`sop_execute`、`sop_advance`。
 
 #### 3.6.2 小程序怎么连（与 Web 不同，关键差异）
 
@@ -404,7 +404,7 @@ ClawOps 会把后端的失败包装成 HTTP 400 + 结构化错误：
 
 | 类型 | 名称 | 说明 |
 |---|---|---|
-| SOP | `enterprise-quick-review` | **企业快评**：公司名消歧 → 缓存检查 → 五板块多源检索 → 简报 + 分享卡片 + ≤800 字汇报 |
+| SOP | `enterprise-quick-review` | **企业快评**：公司名消歧 → 缓存检查 → 五板块多源检索 → Markdown 简报 + ≤800 字口头汇报 |
 | Skill | `enterprise-search` | **企业检索**：按行业 / 地域 / 融资阶段等条件筛选企业 |
 
 **触发方式**：用户自然语言即可。
