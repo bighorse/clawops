@@ -55,6 +55,12 @@ pub enum Error {
     #[error("rate limit exceeded; retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
 
+    /// Caller-supplied input is malformed — 400, not 500. Without this,
+    /// validation failures fall through to the catch-all and look like
+    /// server faults to the client.
+    #[error("{0}")]
+    BadRequest(String),
+
     /// Requested resource isn't there — or the caller isn't allowed to know
     /// whether it is. Artifact lookups deliberately answer 404 for traversal
     /// attempts too, so probing can't distinguish "blocked" from "absent".
@@ -105,6 +111,7 @@ impl axum::response::IntoResponse for Error {
         let (status, msg) = match &self {
             Error::UserNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Error::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            Error::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             Error::UserAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
             Error::NoFreePort => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::DevFieldInProd(_) => (StatusCode::BAD_REQUEST, self.to_string()),

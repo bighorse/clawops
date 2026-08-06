@@ -76,6 +76,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/auth/wx-login", post(wx_login))
         .route("/auth/wecom-login", post(wecom_login))
+        .route("/auth/web-login", post(web_login))
         .route("/auth/logout", post(logout))
         .route("/auth/logout-all", post(logout_all))
         .route("/chat", post(chat))
@@ -379,6 +380,30 @@ struct WxLoginResp {
 /// memory, and chat history. We synthesise an openid of the form
 /// `uin:<uin>` to keep the existing users table primary key intact;
 /// nothing downstream needs to change.
+/// `POST /auth/web-login` — server-to-server login for the web SPA.
+///
+/// The SPA authenticates against the customer's own identity service (OAuth2
+/// client-credentials with an ak/sk pair held server-side, yielding a JWT
+/// carrying a user id). That JWT is theirs, not ours — rather than teaching
+/// this gateway to verify it, their backend exchanges the user id here for a
+/// session token, the same shape the mini-program gets.
+///
+/// The resulting openid is `web:<user_id>`. The prefix matters: `uin:` marks
+/// WeCom users, who get "we'll notify you when it's done" phrasing because
+/// they have no task list to look at. Web users do have one, so they must not
+/// share that prefix — see the branch at the SOP-started reply.
+#[derive(Deserialize)]
+struct WebLoginReq {
+    /// Stable per-user identifier from the caller's identity service —
+    /// typically the JWT `sub`. Must be stable across logins: it is the
+    /// primary key for this user's workspace, memory and reports.
+    user_id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct WecomLoginReq {
     /// Enterprise WeChat-assigned uin (≤128 chars; caller validates format).
@@ -389,6 +414,47 @@ struct WecomLoginReq {
     /// Optional avatar URL fetched from wecom contact profile.
     #[serde(default)]
     avatar_url: Option<String>,
+}
+
+async fn web_login(
+    _: AdminGuard,
+    State(st): State<AppState>,
+    Json(req): Json<WebLoginReq>,
+) -> std::result::Result<Json<WxLoginResp>, Error> {
+    if req.user_id.trim().is_empty() {
+        return Err(Error::BadRequest("user_id must not be empty".into()));
+    }
+    let openid = format!("web:{}", req.user_id.trim());
+    let mut is_new_user = false;
+    if users::get(&st.pool, &openid).await?.is_none() {
+        is_new_user = true;
+        let new = users::NewUser {
+            openid: openid.clone(),
+            phone: None,
+            display_name: req.display_name,
+            avatar_url: req.avatar_url,
+            enterprise_profile: None,
+        };
+        st.provisioner.provision(&new).await?;
+    } else if req.display_name.is_some() || req.avatar_url.is_some() {
+        let patch = users::ProfilePatch {
+            display_name: req.display_name,
+            phone: None,
+            avatar_url: req.avatar_url,
+            enterprise_profile: None,
+        };
+        users::update_profile(&st.pool, &openid, &patch).await?;
+    } else {
+        users::touch_active(&st.pool, &openid).await?;
+    }
+
+    let s = sessions::issue(&st.pool, &openid, Some("web")).await?;
+    Ok(Json(WxLoginResp {
+        token: s.token,
+        openid,
+        is_new_user,
+        expires_at: s.expires_at,
+    }))
 }
 
 async fn wecom_login(
