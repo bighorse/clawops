@@ -197,6 +197,18 @@ fn default_max_cost_per_day_cents() -> u64 {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Browser origins allowed to call the API cross-site, e.g.
+    /// `["https://ai.infocts.cn", "http://localhost:8080"]`.
+    ///
+    /// Empty (the default) disables CORS entirely — correct for mini-program
+    /// and server-to-server callers, which don't enforce the same-origin
+    /// policy. A browser SPA served from a different origin needs its origin
+    /// listed here, otherwise the preflight `OPTIONS` gets 405 and every
+    /// request fails before it reaches a handler.
+    ///
+    /// Origins are matched exactly; there is deliberately no wildcard.
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

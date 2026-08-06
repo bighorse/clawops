@@ -35,8 +35,44 @@ pub struct AppState {
     pub sop_event_tx: broadcast::Sender<JsonValue>,
 }
 
+/// Build the CORS layer from configured origins.
+///
+/// Returns None when no origins are configured, in which case the router
+/// carries no CORS layer at all — mini-program and server-to-server callers
+/// don't need one, and adding permissive headers by default would widen the
+/// attack surface for no benefit.
+///
+/// Note there is no wildcard support on purpose: `Authorization` is on the
+/// allowed-headers list, so a wildcard origin would let any site on the
+/// internet make authenticated calls with a token it phished from a user.
+fn cors_layer(cfg: &Config) -> Option<tower_http::cors::CorsLayer> {
+    use axum::http::{header, Method};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+
+    let origins: Vec<axum::http::HeaderValue> = cfg
+        .server
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    if origins.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+            // Browsers hide non-safelisted response headers from JS unless
+            // they're exposed; the SPA reads Retry-After to honour 429s.
+            .expose_headers([header::RETRY_AFTER])
+            .max_age(std::time::Duration::from_secs(3600)),
+    )
+}
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let cors = cors_layer(&state.cfg);
+    let r = Router::new()
         .route("/health", get(health))
         .route("/auth/wx-login", post(wx_login))
         .route("/auth/wecom-login", post(wecom_login))
@@ -60,7 +96,12 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/refresh-workspace/:openid", post(admin_refresh_workspace))
         .route("/admin/refresh-all-workspaces", post(admin_refresh_all_workspaces))
         .route("/internal/sop-event", post(internal_sop_event))
-        .with_state(state)
+        .with_state(state);
+
+    match cors {
+        Some(layer) => r.layer(layer),
+        None => r,
+    }
 }
 
 /// Bearer-token extractor — resolves the user's `openid` from the

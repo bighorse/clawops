@@ -1,8 +1,8 @@
-# 熵玑参谋 · 小程序对接文档
+# 熵玑参谋 · 前端对接文档（小程序 + Web）
 
 **版本**：2026-08-06
 
-本文档面向**小程序前端**与**小程序后端**。所有接口字段均经源码核对，字段名的大小写与下划线**必须逐字一致**，错一个字母登录链路就断。
+本文档面向**小程序前端**、**Web 前端（Vue 2）**与**小程序后端**。接口三端共用，Web 端的环境差异集中在 §3.8。所有接口字段均经源码核对，字段名的大小写与下划线**必须逐字一致**，错一个字母登录链路就断。
 
 ---
 
@@ -33,7 +33,7 @@ POST /chat ──► 熵玑参谋（企业快评 · 企业检索）
 **分工**：
 
 - **小程序后端**：只需实现 ③ 那个用 `code` 换 `openid` 的接口（详见 §4），此外无需开发。
-- **小程序前端**：登录流程、对话页、**执行过程的实时滚动显示（§3.6，工作量最大的一块）**、简报渲染页（§3.7）、任务列表、错误与超时处理，以及**增长埋点与分享归因（§7）**，都要做。
+- **前端（小程序 / Web 各一套）**：登录流程、对话页、**执行过程的实时滚动显示（§3.6，工作量最大的一块）**、简报渲染页（§3.7）、任务列表、错误与超时处理，以及**增长埋点与分享归因（§7）**，都要做。Web 端另见 §3.8（**跨域白名单需提前告知运维，否则一行都跑不通**）。
 - **另需提供**：企业详情页的小程序路径模板（§6.1）——企业检索的结果要跳到你们的页面。
 
 **关键概念**：**每个微信用户拥有一份完全独立的参谋实例**——独立的对话记忆、独立的简报产物，用户之间互不可见。首次登录时服务端要为该用户初始化专属实例，比较耗时（见 §3.3）。
@@ -62,7 +62,7 @@ POST /chat ──► 熵玑参谋（企业快评 · 企业检索）
 
 ---
 
-## 三、小程序前端对接
+## 三、前端对接（小程序与 Web 共用）
 
 ### 3.1 登录：`POST /auth/wx-login`
 
@@ -338,6 +338,139 @@ function handleEvent(e) {
 
 ---
 
+### 3.8 Web 端（Vue 2）对接差异
+
+**接口完全相同**——地址、字段、鉴权、错误码都不用改。以下只列 Web 与小程序的环境差异。
+
+#### 3.8.1 ⚠️ 先给运维你们的域名（否则一行都跑不通）
+
+浏览器有同源策略，跨站调用前会先发一个 `OPTIONS` 预检。服务端**按白名单**放行，**不在白名单里的来源会被浏览器直接拦截**，请求根本到不了业务代码。
+
+当前已放行：
+
+| 来源 | 用途 |
+|---|---|
+| `https://ai.infocts.cn` | 与接口同域部署时 |
+| `http://localhost:8080` | Vue CLI 默认 dev server |
+| `http://localhost:5173` | Vite 默认 dev server |
+
+**你们的生产域名和其它开发端口，需要提前告知运维加进白名单。** 端口不同也算不同来源（`localhost:8081` 与 `8080` 是两个来源）。
+
+也可以在开发期用 Vue CLI 的 devServer 代理绕开跨域：
+
+```js
+// vue.config.js
+module.exports = {
+  devServer: {
+    proxy: {
+      '/clawops': {
+        target: 'https://ai.infocts.cn',
+        changeOrigin: true,
+      },
+    },
+  },
+}
+```
+
+代理只解决开发期。**生产环境若与接口不同域，仍然需要白名单。**
+
+#### 3.8.2 SSE：不能用 EventSource
+
+浏览器原生 `EventSource` **无法自定义请求头**，而我们的鉴权是 `Authorization: Bearer`，所以只能用 `fetch` + `ReadableStream` 手动解析。这一点和小程序不同（小程序是没有流式 fetch，只能用 `enableChunked`）。
+
+```js
+// services/events.js
+const listeners = new Set()
+let controller = null
+
+export function onGatewayEvent(fn) {
+  listeners.add(fn)
+  ensureStream()
+  return () => listeners.delete(fn)
+}
+
+async function ensureStream() {
+  if (controller) return
+  while (listeners.size > 0) {
+    try {
+      controller = new AbortController()
+      const res = await fetch('https://ai.infocts.cn/clawops/events', {
+        headers: { Authorization: `Bearer ${getToken()}` },
+        signal: controller.signal,
+      })
+      if (!res.ok || !res.body) throw new Error(`SSE ${res.status}`)
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()   // 浏览器有，小程序没有
+      let buf = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        let idx
+        while ((idx = buf.indexOf('\n\n')) >= 0) {   // SSE 帧以空行分隔
+          const frame = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          for (const line of frame.split('\n')) {
+            if (!line.startsWith('data:')) continue
+            const payload = line.slice(5).trim()
+            if (!payload) continue
+            try {
+              const e = JSON.parse(payload)
+              listeners.forEach((fn) => fn(e))
+            } catch (_) { /* 非 JSON 帧忽略 */ }
+          }
+        }
+      }
+    } catch (_) {
+      // 断开或失败，退避后重连
+    }
+    controller = null
+    await new Promise((r) => setTimeout(r, 3000))
+  }
+}
+```
+
+`decoder.decode(value, { stream: true })` 的 `stream: true` **不能省**——它会把切在两个 chunk 之间的半个汉字留到下一块，否则中文会乱码。
+
+#### 3.8.3 滚动显示：Vue 2 的响应式坑
+
+事件处理逻辑与 §3.6.3 完全一致（`liveSteps` 数组、从后往前回填），但 Vue 2 有个必须注意的点：
+
+```js
+// ❌ Vue 2 检测不到按索引赋值
+this.liveSteps[i] = { ...this.liveSteps[i], running: false }
+
+// ✅ 用 $set 或整体替换
+this.$set(this.liveSteps, i, { ...this.liveSteps[i], running: false })
+// 或
+this.liveSteps = this.liveSteps.map((s, idx) => (idx === i ? {...s, running: false} : s))
+```
+
+Vue 2 的响应式基于 `Object.defineProperty`，**数组按下标赋值不会触发视图更新**。这个坑在滚动显示里必踩——工具执行完了但界面还停在"执行中"。
+
+#### 3.8.4 其它差异一览
+
+| 项 | 小程序 | Web（Vue 2） |
+|---|---|---|
+| token 存储 | `wx.setStorageSync` | `localStorage`（注意 XSS 风险，别渲染未转义的用户内容） |
+| 登录 | `wx.login()` 拿 code | **没有 code**，见下 |
+| 请求超时 | `wx.request` 的 `timeout` | `fetch` **默认不超时**，需 `AbortController` + `setTimeout` |
+| 长任务 | 同左 | 同左，`/chat` 建议至少给 300 秒 |
+| Markdown 渲染 | 小程序 Markdown 组件 | `marked` + `DOMPurify`（**必须消毒**，简报含外部来源内容） |
+| 分享 | `onShareAppMessage` | 复制链接 / 网页分享 API，埋点见 §7 |
+
+**登录方式**：`wx.login()` 是小程序专有的。Web 端没有 code，需要另一条登录路径（微信网页授权、扫码登录，或你们已有的账号体系）。**这条需要和运维单独确认**——当前服务端只实现了小程序 code 换 openid 与企微两条路径。
+
+#### 3.8.5 Web 端的埋点调整
+
+§7 的埋点清单在 Web 端同样适用，但两处要改：
+
+- `share_performed` — Web 没有 `onShareAppMessage`，改为在"复制链接"或"分享"按钮的点击回调里上报
+- 归因参数 `from` — 改为放在 URL query（`?from=xxx`），首屏从 `location.search` 读出后存进 `localStorage`，其余逻辑与 §7.2 一致
+
+---
+
 ## 四、小程序后端必须实现的接口
 
 这是 **唯一** 需要中伯伦后端开发的接口。服务端**不持有小程序的 appid/secret**，也不直接调用微信的 `jscode2session`，而是把 code 转发给你们的后端去换。
@@ -544,6 +677,8 @@ onLaunch(options) {
 | **你们的 code2session 接口** | ⬜ **待开发**（§4），唯一的阻塞项 |
 | 企业详情页路径模板 | ⬜ 待你们提供（§6.1），不阻塞联调 |
 | 增长埋点与分享归因 | ⬜ 待前端实现（§7），上线前需就绪 |
+| Web 端跨域白名单 | ✅ 已支持；生产域名待你们提供后加入（§3.8.1） |
+| Web 端登录方式 | ⬜ 待定：服务端目前只有小程序 code 与企微两条路径（§3.8.4） |
 | 公网开放 | ⬜ 待上一项就绪后由运维放开 |
 | 企微接入 | ⬜ 接口已就绪，待后续实现 |
 
