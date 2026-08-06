@@ -12,14 +12,19 @@ default_model = "{{llm.default_model}}"
 default_temperature = {{llm.default_temperature}}
 provider_timeout_secs = {{llm.provider_timeout_secs}}
 
+{{#if llm.api_url}}
+# 仅在显式配置了 api_url 时才覆盖 provider 定义。
+# ⚠️ 一旦覆盖，provider 名会变成 "custom:<url>"，成本账本的 key 也随之
+# 变成 "custom:<url>/<model>"，与 [cost.prices] 里按 "<provider>/<model>"
+# 写的条目对不上 —— 计费会静默归零、限额形同虚设。所以自带的 provider
+# （deepseek 等）不要配 api_url，直接用内置定义。
 # 强制 wire_api = "chat_completions" 跳过 Responses API 探测。
 [model_providers]
 [model_providers.{{llm.default_provider}}]
 name = "{{llm.default_provider}}"
-{{#if llm.api_url}}
 base_url = "{{llm.api_url}}"
-{{/if}}
 wire_api = "chat_completions"
+{{/if}}
 
 # ── Observability ──────────────────────────────────────────
 [observability]
@@ -45,6 +50,8 @@ forbidden_paths = [
     "~/.ssh", "~/.gnupg", "~/.aws", "~/.config"
 ]
 max_actions_per_hour = 120
+# 0 = 不限（实测确认：耗费远超 0 也不拦）。真正生效的是下方 [cost]
+# 的 daily_limit_usd；这里保持 0 以免两套限额各算各的、互相打架。
 max_cost_per_day_cents = {{llm.max_cost_per_day_cents}}
 require_approval_for_medium_risk = true
 block_high_risk_commands = true
@@ -200,25 +207,23 @@ max_response_size = 1048576
 timeout_secs = 30
 
 # ── Cost tracking ──────────────────────────────────────────
-# zeroclaw has its own per-daemon cost ledger (separate from
-# autonomy.max_cost_per_day_cents — both run, the lower wins).
-# Limits are PER USER (per zeroclaw daemon process). Currency is USD.
+# zeroclaw 自带按 daemon 的成本账本（与 autonomy.max_cost_per_day_cents
+# 并行，两者都跑、低的先拦）。限额是**每用户**的，币种 USD。
 #
-# IMPORTANT: prices below are estimates based on Aliyun DashScope
-# qwen-flash list price as of 2026-04. CONFIRM in the DashScope
-# console: 计费 → 模型定价 → 通义千问-Flash → OpenAI 兼容接口
-# before assuming these numbers.
+# ⚠️ 未列在 [cost.prices] 里的模型按 0 计费，限额会静默失效。换模型时
+# 必须同步这张表，否则「限额配了但不生效」不会有任何报错。
+#
+# 汇率按 7.1 折算，与官方人民币标价对应。
 [cost]
 enabled = true
-daily_limit_usd = 0.7         # ≈ ¥5/day/user — 同步 [autonomy].max_cost_per_day_cents=500
-monthly_limit_usd = 15.0      # ≈ ¥100/month/user
+# 实测：一次企业快评约耗 200 万输入 token + 1.7 万输出 ≈ ¥6。
+# agent loop 每轮都重发完整历史，成本几乎全在输入侧。
+# 下面按「每用户每天约 3 次企业快评」设定，按实际使用情况调整。
+daily_limit_usd = 2.8         # ≈ ¥20/天/用户
+monthly_limit_usd = 42.0      # ≈ ¥300/月/用户
 warn_at_percent = 80
 allow_override = false
 
-[cost.prices."qwen3.6-flash"]
-input = 0.169                 # USD per 1M tokens (= ¥1.2 official)
-output = 1.014                # USD per 1M tokens (= ¥7.2 official)
-
-[cost.prices."qwen3.6-plus"]
-input = 0.282                 # USD per 1M tokens (= ¥2.0 official)
-output = 1.690                # USD per 1M tokens (= ¥12.0 official)
+[cost.prices."deepseek/deepseek-v4-pro"]
+input = 0.423                 # USD per 1M tokens (= ¥3 官方标价)
+output = 0.845                # USD per 1M tokens (= ¥6 官方标价)

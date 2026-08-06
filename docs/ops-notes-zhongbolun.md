@@ -42,6 +42,10 @@ curl -X POST http://127.0.0.1:8088/admin/refresh-all-workspaces -H "X-Admin-Toke
 
 **⚠️ 密钥不可跨实例复制**：zeroclaw 的 `api_key` 若以 `enc2:` 开头即为密文，只能被生成它的那份 `.secret_key` 解开。配置里**必须填明文**，否则租户守护进程启动即失败，且报错会误导成 `zeroclaw not reachable ... after 20000ms`（真因在解密，不在网络）。
 
+**⚠️ 成本计费有两处会静默失效**：①`[cost.prices]` 的 key 必须是 **`<provider>/<model>`**（如 `deepseek/deepseek-v4-pro`），只写模型名匹配不上；②**不要给内置 provider 配 `api_url`**——一旦配了，provider 名会变成 `custom:<url>`，计费 key 随之变成 `custom:<url>/<model>`，同样对不上。两种情况都表现为**未知模型按 0 计费、限额形同虚设**，没有任何报错。判别：看 `workspace/state/costs.jsonl` 是否生成。
+
+**实测成本**（DeepSeek ¥3/¥6 每百万 token，汇率 7.1）：一次企业快评约 **200 万输入 token + 1.7 万输出 ≈ ¥6**。输入是输出的 120 倍——agent loop 每轮重发完整历史，成本几乎全在输入侧。当前限额 `daily_limit_usd = 2.8`（≈¥20）约合每人每天 3 次快评。
+
 **⚠️ 模型端点要和 key 配套**：这套用的是 DeepSeek **官方** key，`api_url` 必须指向 `https://api.deepseek.com`。指向阿里云百炼会得到 `401 invalid_api_key`——**换个基础模型仍然 401 只能说明 key 与端点不匹配，不代表 key 失效**，别据此断定 key 坏了。
 
 **⚠️ 环境变量不会自动传给脚本**：守护进程的环境变量要出现在 `shell_env_passthrough` 白名单里，shell 子进程才拿得到。`MYSQL_*` 漏掉时表现为**静默降级**——SOP 照跑不报错，只是内部数据那块是空的。验证时**不能只看 `/proc/<pid>/environ`**（那里是有的），必须验到脚本实际运行的子进程。
