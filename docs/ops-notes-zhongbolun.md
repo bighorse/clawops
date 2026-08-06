@@ -21,6 +21,14 @@
 | 共享环境变量 | `/etc/clawops/zeroclaw.env`（MySQL 凭据，经 systemd 注入所有租户） |
 | 模型 | DeepSeek 官方 `deepseek-v4-pro`，`api_url = https://api.deepseek.com` |
 
+**企业详情页模板（待小程序提供）**：拿到后写进 `/etc/clawops/zeroclaw.env`：
+```
+ENTERPRISE_DETAIL_URL_TEMPLATE=/pages/enterprise/detail?name={name}
+```
+然后 `systemctl restart clawops` + `refresh-all-workspaces`。已在 `shell_env_passthrough`
+白名单里，`search_enterprise.py` 会自己做 URL 编码。未配置时检索结果不带链接（不会输出坏链接）。
+企业表无主键，只能按名称跳转，故占位符只有 `{name}`。
+
 **改模板后下发到已有租户**：
 ```
 curl -X POST http://127.0.0.1:8088/admin/refresh-all-workspaces -H "X-Admin-Token: <token>"

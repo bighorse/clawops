@@ -7,6 +7,12 @@
 连接参数通过环境变量:
     MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE
 
+详情页链接模板（可选）:
+    ENTERPRISE_DETAIL_URL_TEMPLATE — 前端提供的小程序页面路径，用 {name} 占位
+    企业全称。例: /pages/enterprise/detail?name={name}
+    企业表没有主键，只能按名称跳转，故占位符只有 {name}。
+    未设置时 detail_url 为 null，技能会略去链接而不是输出坏链接。
+
 输出: JSON 数组，每个结果含:
     company, region, field, qualification, funding_status, intro, tech_keywords,
     match_score, match_fields, match_tokens, detail_url
@@ -16,6 +22,7 @@ import json
 import os
 import re
 import sys
+from urllib.parse import quote
 
 # 常见无意义连接词（会被过滤掉，不参与搜索）
 STOP_WORDS = {
@@ -211,6 +218,19 @@ def load_db_config() -> dict:
     return config
 
 
+def build_detail_url(company: str):
+    """按 ENTERPRISE_DETAIL_URL_TEMPLATE 拼小程序详情页链接。
+
+    企业名要 URL 编码后再填入——中文、括号、& 都可能出现在工商全称里，
+    不编码会把链接截断。未配置模板时返回 None，让技能层面略去链接，
+    好过输出一个点不开的占位串。
+    """
+    tpl = os.environ.get("ENTERPRISE_DETAIL_URL_TEMPLATE", "").strip()
+    if not tpl:
+        return None
+    return tpl.replace("{name}", quote(company, safe=""))
+
+
 def main():
     if len(sys.argv) < 2:
         print(json.dumps({"error": "请提供搜索查询，如：python3 search_enterprise.py '深圳的人工智能公司'"}, ensure_ascii=False))
@@ -251,8 +271,7 @@ def main():
             "tech_keywords": item["tech_keywords"],
             "match_score": item["match_score"],
             "reason": generate_reason(item, tokens),
-            # 占位链接：有了小程序详情页 URL 模板后替换
-            "detail_url": f"【小程序详情页·待配置】?company={item['company']}",
+            "detail_url": build_detail_url(item["company"]),
         })
 
     print(json.dumps({
