@@ -650,6 +650,25 @@ impl Provisioner {
             return Ok(user);
         }
 
+        // A stopped user has no port — the reaper released it back to the pool.
+        // Waking them up means allocating one again, and it will rarely be the
+        // one they had: `ports::allocate` hands out the lowest free port, so
+        // after a few tenants are reaped and woken in a different order, they
+        // trade ports with each other.
+        //
+        // The port also lives in the daemon's own config.toml, written at
+        // provision time. If we allocate a different one and don't rewrite that
+        // file, the daemon binds its *old* port while the DB records the new
+        // one — and every part of the system that trusts the DB is then wrong.
+        //
+        // Measured on the pre-fix build: stop two tenants, wake them in reverse
+        // order, and their DB ports come out exactly swapped. The health check
+        // still "passes" because the other tenant's daemon is listening there,
+        // so the user is marked running while every /api/chat gets 401 from a
+        // daemon that doesn't share their paired token. Only that token
+        // mismatch prevented one tenant's messages reaching another's daemon —
+        // an accident, not a safeguard.
+        let mut port_changed = false;
         let port = match user.port {
             Some(p) => p as u16,
             None => {
@@ -663,13 +682,28 @@ impl Provisioner {
                 )
                 .await?;
                 users::set_port(&self.pool, &user.openid, Some(p)).await?;
+                port_changed = true;
                 p
             }
         };
 
         if self.backend.launches_daemon() {
-            self.backend.start(&user.linux_uid).await?;
-            self.wait_health(port).await?;
+            if port_changed {
+                // Rewrite config.toml with the new port, then restart — both of
+                // which refresh_workspace already does, including the health
+                // check against the port now recorded in the DB.
+                //
+                // Deliberately propagating the error rather than falling back to
+                // a plain start: a daemon left on its stale port is worse than a
+                // failed wake. It would pass the health check by answering on
+                // another tenant's port, get marked running, and then reject
+                // every request — a failure that looks like success from the
+                // outside.
+                self.refresh_workspace(&user.openid).await?;
+            } else {
+                self.backend.start(&user.linux_uid).await?;
+                self.wait_health(port).await?;
+            }
         }
         users::set_status(&self.pool, &user.openid, "running").await?;
         users::get_required(&self.pool, openid).await

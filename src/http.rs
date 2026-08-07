@@ -623,10 +623,35 @@ async fn chat(
 
         let resp = builder.send().await?;
         if !resp.status().is_success() {
-            return Err(Error::Other(format!(
-                "zeroclaw /api/chat returned {}",
-                resp.status()
-            )));
+            // Carry the daemon's own explanation through instead of swallowing
+            // it. It knows exactly what went wrong — "cost budget exceeded",
+            // "provider credential failure" — while a bare "returned 500"
+            // leaves both the user and whoever is debugging with nothing.
+            let status = resp.status();
+            let detail = resp.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<JsonValue>(&detail)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .or_else(|| v.get("message"))
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or(detail);
+
+            // Budget exhaustion is a normal operating state, not a fault:
+            // surface it as something the user can act on rather than a 500
+            // that reads like the service broke.
+            if detail.contains("Cost budget exceeded") {
+                return Err(Error::BadRequest(
+                    "今日额度已用完，请稍后再试或联系管理员调整额度上限。".to_string(),
+                ));
+            }
+            return Err(Error::Other(if detail.trim().is_empty() {
+                format!("zeroclaw /api/chat returned {status}")
+            } else {
+                format!("zeroclaw /api/chat returned {status}: {}", detail.trim())
+            }));
         }
         let body: serde_json::Value = resp.json().await?;
         sop_started = body.get("sop_started").and_then(|v| v.as_bool()).unwrap_or(false);
