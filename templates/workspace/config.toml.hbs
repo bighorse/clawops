@@ -184,11 +184,17 @@ tavily_api_key = "{{llm.tavily_api_key}}"
 max_results = 10
 timeout_secs = 15
 {{else}}
+# 没有 tavily key 时**关掉**搜索，而不是回落到 duckduckgo。
+#
+# 原来的回落在这台服务器上是有害的：duckduckgo 的三个端点在国内均不可达，
+# 每次调用都跑满 15 秒超时才失败。实测一次企业快评有 6 次搜索、全部超时，
+# 白白吃掉 90 秒（占整个流程的 43%）。更糟的是模型以为自己有搜索能力，
+# 会反复重试同一个必然失败的动作，简报也因此缺少第三方信源。
+#
+# 关掉它，模型就知道自己只能靠已知 URL 与内部数据库，会如实说明信息来源
+# 受限，而不是把时间耗在注定失败的检索上。
 [web_search]
-enabled = true
-provider = "duckduckgo"
-max_results = 10
-timeout_secs = 15
+enabled = false
 {{/if}}
 
 [web_fetch]
@@ -219,8 +225,11 @@ enabled = true
 # 实测：一次企业快评约耗 200 万输入 token + 1.7 万输出 ≈ ¥6。
 # agent loop 每轮都重发完整历史，成本几乎全在输入侧。
 # 下面按「每用户每天约 3 次企业快评」设定，按实际使用情况调整。
-daily_limit_usd = 2.8         # ≈ ¥20/天/用户
-monthly_limit_usd = 42.0      # ≈ ¥300/月/用户
+# 联调期临时放宽到 ≈¥70/天（约 10 次企业快评）。正式运营前按真实使用
+# 情况回调 —— 一次快评约 ¥6，这个上限决定单用户一天最多能跑几次。
+# 注意：zeroclaw 按**业务时区**（北京时间）计算日周期，不是 UTC。
+daily_limit_usd = 10.0        # ≈ ¥71/天/用户
+monthly_limit_usd = 100.0     # ≈ ¥710/月/用户
 warn_at_percent = 80
 allow_override = false
 
