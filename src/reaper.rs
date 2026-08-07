@@ -30,11 +30,12 @@ impl Reaper {
         provisioner: Arc<Provisioner>,
         cfg: ReaperConfig,
     ) -> Self {
+        let tick_secs = cfg.tick_secs;
         Self {
             pool,
             provisioner,
             cfg,
-            tick_secs: 3600,
+            tick_secs,
         }
     }
 

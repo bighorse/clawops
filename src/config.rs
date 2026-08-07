@@ -502,11 +502,24 @@ impl Default for WxConfig {
 pub struct ReaperConfig {
     pub idle_stop_minutes: i64,
     pub idle_archive_minutes: i64,
+    /// How often to scan for idle tenants, in seconds.
+    ///
+    /// Exposed mainly so the reap path can actually be exercised: with the
+    /// production defaults (90-day idle threshold, hourly scan) it would take
+    /// three months to observe a single reap, which means it never gets
+    /// tested until it misbehaves in front of users.
+    #[serde(default = "default_reaper_tick_secs")]
+    pub tick_secs: u64,
+}
+
+fn default_reaper_tick_secs() -> u64 {
+    3600
 }
 
 impl Default for ReaperConfig {
     fn default() -> Self {
         Self {
+            tick_secs: default_reaper_tick_secs(),
             idle_stop_minutes: 90 * 24 * 60,
             idle_archive_minutes: 365 * 24 * 60,
         }
