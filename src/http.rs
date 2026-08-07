@@ -650,6 +650,13 @@ async fn chat(
     // (2) Translate the internal sop_name ("policy-match") to Chinese.
     if sop_started {
         if let Some(ref sop_name) = sop_name_from_zc {
+            // Does this SOP actually need a full legal name up front? Only the
+            // ones that hit an exact-match registry do. SOPs that disambiguate
+            // internally handle "查一下字节" fine, and gating them here would
+            // reject the very input they were designed for.
+            let sop_meta = st.cfg.sop_metadata.get(sop_name.as_str());
+            let needs_name = sop_meta.map(|m| m.requires_enterprise_name).unwrap_or(false);
+
             let db_user = users::get(&st.pool, &user.openid).await.ok().flatten();
 
             // Two sources only. Memory (brain.db) is intentionally excluded: it holds the
@@ -694,8 +701,12 @@ async fn chat(
 
             let enterprise_name = from_db.or(from_message).or(from_history);
 
-            if enterprise_name.is_none() {
-                let prompt = "请提供您企业的完整全称（营业执照上的名称，通常以「有限公司」结尾），我将为您发起政策匹配评测。".to_string();
+            if needs_name && enterprise_name.is_none() {
+                let prompt = sop_meta
+                    .map(|m| m.enterprise_name_prompt.clone())
+                    .unwrap_or_else(|| {
+                        "请提供企业的完整全称（营业执照上的名称，通常以「有限公司」结尾）。".to_string()
+                    });
                 tracing::debug!(openid = %user.openid, sop_name = %sop_name,
                     "SOP started but no verified enterprise_name — overriding response");
                 if let Err(e) = chat_history::record_turn(&st.pool, &user.openid, &req.content, &prompt).await {

@@ -99,6 +99,26 @@ pub struct SopMetadata {
     pub intent_description: String,
     #[serde(default = "default_sop_cache_ttl_days")]
     pub cache_ttl_days: u32,
+    /// Whether the gateway must hold a full legal company name before letting
+    /// this SOP proceed.
+    ///
+    /// Only true for SOPs that query an external registry by exact name — they
+    /// 404 on anything short of the registered name, so it is kinder to ask up
+    /// front than to fail three steps in. SOPs that disambiguate the name
+    /// themselves must leave this false, otherwise the gateway rejects the
+    /// abbreviations they were built to accept ("查一下字节") and answers with
+    /// a prompt written for a different SOP entirely.
+    #[serde(default)]
+    pub requires_enterprise_name: bool,
+    /// What to say when the name is missing and `requires_enterprise_name` is
+    /// set. Wording differs per SOP, so it lives beside the flag rather than
+    /// being hard-coded in the handler.
+    #[serde(default = "default_enterprise_name_prompt")]
+    pub enterprise_name_prompt: String,
+}
+
+fn default_enterprise_name_prompt() -> String {
+    "请提供企业的完整全称（营业执照上的名称，通常以「有限公司」结尾）。".into()
 }
 
 fn default_sop_cache_ttl_days() -> u32 {
