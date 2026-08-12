@@ -807,6 +807,7 @@ async fn chat(
     }
 
     let response_text = sanitize_assistant_response(&response_text, sop_started);
+    let response_text = ensure_non_empty_reply(&response_text);
 
     if let Err(e) =
         chat_history::record_turn(&st.pool, &user.openid, &req.content, &response_text).await
@@ -1966,6 +1967,22 @@ fn extract_company_name_from_text(text: &str) -> Option<String> {
 /// `sop_started` is the gateway's ground truth: when false, NO async job was
 /// created in this turn, so the model must not be allowed to promise it will
 /// "proactively send a report later".
+/// Never hand back an empty reply.
+///
+/// The model sometimes answers with nothing at all — observed when the same
+/// greeting is repeated a few times in a row, where it evidently judged there
+/// was nothing left to add. An empty string is a bad value for every consumer:
+/// a chat UI renders a blank bubble, and a caller waiting on the reply reads
+/// success while having received nothing. Better to say something usable and
+/// point at what this assistant is actually for.
+fn ensure_non_empty_reply(text: &str) -> String {
+    if text.trim().is_empty() {
+        return "我在。直接把公司全称发给我，就可以开始企业快评；也可以让我按行业、地区筛选企业。"
+            .to_string();
+    }
+    text.to_string()
+}
+
 fn sanitize_assistant_response(text: &str, sop_started: bool) -> String {
     // 1) Existing narrow rewrite: collapse leaked qualification-success
     //    internals into the canonical user-facing card.
@@ -2477,5 +2494,33 @@ mod artifact_marker_tests {
         // '/' inside each segment, so "../" can't appear.
         let evil = "<!-- artifact: briefs/../../etc/brief_x.md -->";
         assert_eq!(extract(evil), None);
+    }
+}
+
+#[cfg(test)]
+mod empty_reply_tests {
+    use super::ensure_non_empty_reply;
+
+    #[test]
+    fn substitutes_something_usable_for_nothing() {
+        for blank in ["", "   ", "\n", "\t \n "] {
+            let out = ensure_non_empty_reply(blank);
+            assert!(!out.trim().is_empty(), "still empty for {blank:?}");
+            assert!(out.contains("公司全称"), "substitute should say what to do next");
+        }
+    }
+
+    #[test]
+    fn leaves_real_answers_alone() {
+        let real = "寒武纪是国产 AI 芯片龙头。";
+        assert_eq!(ensure_non_empty_reply(real), real);
+    }
+
+    #[test]
+    fn keeps_answers_that_merely_start_with_whitespace() {
+        // Trimming is only for the emptiness test — the text itself must survive
+        // untouched, or leading blank lines in markdown would shift.
+        let padded = "\n\n# 标题\n正文";
+        assert_eq!(ensure_non_empty_reply(padded), padded);
     }
 }
