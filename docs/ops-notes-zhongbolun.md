@@ -8,7 +8,7 @@
 
 | 项 | 位置/值 |
 |---|---|
-| 服务器 | `root@47.94.58.57` |
+| 服务器 | `ssh -p 2222 root@47.94.58.57`（**22 端口对跨境 VPN 出口不可用**：TCP 能建连但 SSH 握手被中间链路切断，报 `kex_exchange_identification`。HTTPS 不受影响，故非封禁） |
 | 源码 | `/opt/clawops`，分支 **`tenant/zhongbolun`** |
 | 二进制 | `/usr/local/bin/clawops`（回滚：`clawops.old`） |
 | 配置 | `/etc/clawops/clawops.toml`（600） |

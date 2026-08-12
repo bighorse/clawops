@@ -151,7 +151,13 @@ POST /chat ──► 熵玑参谋（企业快评 · 企业检索）
 | `/auth/logout-all` | POST | Bearer | 注销该用户全部 token |
 | `/health` | GET | 无 | 健康检查 |
 
-**SOP 任务状态**：`pending` / `running` / `done` / `failed` 四值。任务对象字段：`task_id`、`sop_name`、`sop_name_cn`、`enterprise_name`、`status`、`deeplink`、`error`（**注意 JSON 字段名是 `error` 而非 `error_message`**）、`estimated_seconds`、`created_at`、`completed_at`。
+**SOP 任务状态**：`pending` / `running` / `done` / `failed` 四值。任务对象字段：`task_id`、`sop_name`、`sop_name_cn`、`enterprise_name`、`status`、`deeplink`、`error`（**注意 JSON 字段名是 `error` 而非 `error_message`**）、`estimated_seconds`、**`artifact_path`**、`created_at`、`completed_at`。
+
+**`artifact_path` 是任务与简报之间的唯一纽带**：完成后填上该任务产出的简报路径，可**原样**传给 `/me/artifacts/{path}` 取正文。运行中为 `null`。
+
+同时 `enterprise_name` 会在完成时回填为**完整工商全称**（如「深圳市汇川技术股份有限公司」），取自简报标题。任务列表因此能直接显示「哪家公司 + 对应哪份简报」，**用户同时跑多个快评也不会混**。
+
+**完成时对话里会自动出现一条通知**：`「<公司全称>」的企业快评已完成，简报可在「简报」页查看。` —— 前端无需为此轮询，走 §3.6 的事件流收到 `sop_task` 的 `done` 后刷新对话即可。
 
 **⚠️ `/events` 的鉴权失败返回 500 而不是 401**（已知问题）。服务端每 15 秒发一次心跳保活，断线仍需自行重连。
 
