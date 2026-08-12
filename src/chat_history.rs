@@ -65,6 +65,23 @@ pub async fn record_turn(
     Ok(())
 }
 
+/// Append a lone assistant message, with no user turn preceding it.
+///
+/// Needed because a long-running SOP's wrap-up arrives minutes after the
+/// message that started it — pairing it with a synthetic user turn would put
+/// words in the user's mouth.
+pub async fn record_assistant(pool: &SqlitePool, openid: &str, content: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO chat_messages (openid, role, content, created_at) VALUES (?, 'assistant', ?, ?)",
+    )
+    .bind(openid)
+    .bind(content)
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Page of messages, newest-first within a page.
 ///
 /// Cursor semantics:

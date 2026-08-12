@@ -1456,6 +1456,11 @@ struct SopTaskView {
     deeplink: Option<String>,
     error: Option<String>,
     estimated_seconds: i64,
+    /// The brief this run produced, ready to pass verbatim to
+    /// `GET /me/artifacts/{path}`. Null while running, or when the run
+    /// produced nothing. This is what ties a task to its output — before it
+    /// existed the two could only be matched by guessing at timestamps.
+    artifact_path: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -1501,6 +1506,7 @@ async fn list_my_sop_tasks(
                 deeplink: t.deeplink,
                 error: t.error_message,
                 estimated_seconds: t.estimated_seconds,
+            artifact_path: t.artifact_path.clone(),
                 created_at: t.created_at,
                 completed_at: t.completed_at,
             }
@@ -1530,6 +1536,101 @@ async fn list_my_sop_tasks(
 /// Fallback: when response_text doesn't contain a parseable deeplink, try to
 /// read `qualification_enterprise_id` from the workspace profile.json that the
 /// SOP wrote in step 1. Avoids depending on LLM to format the link correctly.
+/// Locate the brief a finished run produced, and read the company name out of
+/// it.
+///
+/// Two sources, in order of trust:
+///
+/// 1. The path mentioned in the run's own wrap-up. The SOP lists its outputs
+///    there, so when it does, we know exactly which file is meant.
+/// 2. Failing that, the most recently modified `brief_*.md` under `briefs/`,
+///    restricted to files touched after the task began. This is a fallback,
+///    not a guarantee: two runs finishing within moments of each other can be
+///    attributed to the wrong task. Source 1 is what makes it reliable, which
+///    is why the SOP is instructed to always name its output file.
+///
+/// The company name comes from the brief's H1 (`# <full name> — 企业快评`),
+/// which the SOP fixes in place — far steadier than parsing prose.
+async fn find_run_artifact(
+    cfg: &crate::config::Config,
+    linux_uid: &str,
+    response_text: &str,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Option<(String, Option<String>)> {
+    let ws = cfg
+        .zeroclaw
+        .home_base
+        .join(linux_uid)
+        .join(".zeroclaw")
+        .join("workspace");
+
+    // Source 1 — the marker the SOP puts on the last line of its wrap-up:
+    //   <!-- artifact: briefs/<slug>/brief_<date>.md -->
+    // An HTML comment, so it vanishes when the markdown is rendered — the user
+    // never sees a file path, which is what the SOP requires, while we still
+    // learn exactly which file this run wrote.
+    let re = Regex::new(r"<!--\s*artifact:\s*(briefs/[A-Za-z0-9._-]+/brief_[0-9A-Za-z._-]+\.md)\s*-->")
+        .ok()?;
+    let mut rel: Option<String> = re
+        .captures_iter(response_text)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .find(|p| ws.join(p).is_file());
+
+    // Source 2 — newest brief touched since the task began.
+    if rel.is_none() {
+        let briefs = ws.join("briefs");
+        let mut newest: Option<(std::time::SystemTime, String)> = None;
+        if let Ok(mut dirs) = tokio::fs::read_dir(&briefs).await {
+            while let Ok(Some(d)) = dirs.next_entry().await {
+                if !d.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let slug = d.file_name().to_string_lossy().to_string();
+                if let Ok(mut files) = tokio::fs::read_dir(d.path()).await {
+                    while let Ok(Some(f)) = files.next_entry().await {
+                        let name = f.file_name().to_string_lossy().to_string();
+                        if !(name.starts_with("brief_") && name.ends_with(".md")) {
+                            continue;
+                        }
+                        let Ok(md) = f.metadata().await else { continue };
+                        let Ok(mtime) = md.modified() else { continue };
+                        if chrono::DateTime::<chrono::Utc>::from(mtime) < since {
+                            continue;
+                        }
+                        if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                            newest = Some((mtime, format!("briefs/{slug}/{name}")));
+                        }
+                    }
+                }
+            }
+        }
+        rel = newest.map(|(_, p)| p);
+    }
+
+    let rel = rel?;
+    // H1 of the brief carries the full registered company name.
+    let name = tokio::fs::read_to_string(ws.join(&rel))
+        .await
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with("# "))
+                .map(|l| l.trim_start_matches("# ").trim().to_string())
+        })
+        .map(|h1| {
+            h1.split('—')
+                .next()
+                .unwrap_or(&h1)
+                .trim()
+                .trim_end_matches('-')
+                .trim()
+                .to_string()
+        })
+        .filter(|n| !n.is_empty());
+
+    Some((rel, name))
+}
+
 async fn try_deeplink_from_workspace(
     cfg: &crate::config::Config,
     linux_uid: &str,
@@ -1701,6 +1802,46 @@ async fn internal_sop_event(
                 response_text,
             )
             .await?;
+
+            // Attach the brief this run produced, and the company name read from
+            // it. Without this the task list shows a row of identical "企业快评 ·
+            // 已完成" entries with no way to tell which company each covered, and
+            // no way to reach the brief it produced.
+            if let Ok(Some(task)) = sop_tasks::get_by_id(&st.pool, &task_id).await {
+                if let Ok(Some(user)) = users::get(&st.pool, &openid).await {
+                    if let Some((path, name)) = find_run_artifact(
+                        &st.cfg,
+                        &user.linux_uid,
+                        response_text,
+                        task.created_at,
+                    )
+                    .await
+                    {
+                        if let Err(e) = sop_tasks::set_artifact(
+                            &st.pool,
+                            &task_id,
+                            &path,
+                            name.as_deref(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(task_id = %task_id, "failed to record artifact: {e}");
+                        }
+                    }
+                }
+            }
+
+            // Put the wrap-up into the conversation. It used to go nowhere: the
+            // chat showed only "已为您发起…", so the user had no sight of the
+            // result without going hunting in the brief list.
+            if !response_text.trim().is_empty() {
+                if let Err(e) =
+                    chat_history::record_assistant(&st.pool, &openid, response_text).await
+                {
+                    tracing::warn!(openid = %openid, "failed to persist sop wrap-up: {e}");
+                }
+            }
+
             emit_sop_event(&st, &task_id, &openid, "done");
             maybe_push_sop_failure(&st, &openid, deeplink.is_some(), response_text).await;
             Ok(Json(serde_json::json!({"ok": true, "task_id": task_id})))
@@ -2266,3 +2407,62 @@ pub fn spawn_sop_task_watchdog(pool: sqlx::SqlitePool, http: reqwest::Client, pu
     });
 }
 
+
+#[cfg(test)]
+mod artifact_marker_tests {
+    use regex::Regex;
+
+    fn marker_re() -> Regex {
+        Regex::new(
+            r"<!--\s*artifact:\s*(briefs/[A-Za-z0-9._-]+/brief_[0-9A-Za-z._-]+\.md)\s*-->",
+        )
+        .unwrap()
+    }
+
+    fn extract(text: &str) -> Option<String> {
+        marker_re()
+            .captures_iter(text)
+            .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .next()
+    }
+
+    #[test]
+    fn picks_path_out_of_a_normal_wrap_up() {
+        let wrap_up = "科大讯飞是国内语音赛道龙头……\n\n本简报基于公开信息，不构成投资建议。\n\n<!-- artifact: briefs/iflytek/brief_2026-08-12.md -->";
+        assert_eq!(
+            extract(wrap_up).as_deref(),
+            Some("briefs/iflytek/brief_2026-08-12.md")
+        );
+    }
+
+    #[test]
+    fn tolerates_spacing_the_model_may_vary() {
+        for t in [
+            "<!--artifact:briefs/sany/brief_2026-08-12.md-->",
+            "<!--   artifact:   briefs/sany/brief_2026-08-12.md   -->",
+        ] {
+            assert_eq!(
+                extract(t).as_deref(),
+                Some("briefs/sany/brief_2026-08-12.md"),
+                "failed on {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_a_path_merely_mentioned_in_prose() {
+        // The SOP forbids paths in the body; if one slips through anyway it must
+        // not be mistaken for the marker, or a stray mention would mis-attribute
+        // the task to some other run's brief.
+        let body = "简报已写入 briefs/other/brief_2020-01-01.md，请查看。";
+        assert_eq!(extract(body), None);
+    }
+
+    #[test]
+    fn refuses_paths_that_try_to_climb_out() {
+        // Path traversal must not survive the pattern — the char class excludes
+        // '/' inside each segment, so "../" can't appear.
+        let evil = "<!-- artifact: briefs/../../etc/brief_x.md -->";
+        assert_eq!(extract(evil), None);
+    }
+}

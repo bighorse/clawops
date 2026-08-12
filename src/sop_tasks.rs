@@ -17,6 +17,10 @@ pub struct SopTask {
     pub response_text: Option<String>,
     pub error_message: Option<String>,
     pub estimated_seconds: i64,
+    /// Workspace-relative path of the brief this run produced, e.g.
+    /// `briefs/cambricon/brief_2026-08-12.md`. Filled when the run finishes.
+    /// Without it there is no way to tell which brief came from which task.
+    pub artifact_path: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -37,6 +41,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for SopTask {
             response_text: row.try_get("response_text")?,
             error_message: row.try_get("error_message")?,
             estimated_seconds: row.try_get("estimated_seconds")?,
+            artifact_path: row.try_get("artifact_path")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             completed_at: row.try_get("completed_at")?,
@@ -379,20 +384,69 @@ pub async fn find_pending_by_sop(
 /// the result then gets orphaned into a fresh enterprise-less done row while the
 /// real task lingers until timeout_stale marks it failed. Matching running too
 /// lets the real task be marked done with its enterprise_name + deeplink intact.
+/// How recently a task must have been created to be adopted rather than
+/// duplicated.
+///
+/// The point of adoption is to collapse the two records that a *single*
+/// trigger can produce — the model calls sop_execute and the "starting"
+/// webhook lands before /chat returns, so both paths try to create a row.
+/// Those land milliseconds apart.
+///
+/// Matching on (user, sop_name) alone made this window infinite, which
+/// silently merged genuinely separate requests: ask about one company, then
+/// another while the first is still running, and the second got folded into
+/// the first — the user saw "已为您发起" both times but only one task existed,
+/// and its enterprise name was overwritten by the later company.
+const ADOPT_WINDOW_SECS: i64 = 15;
+
 pub async fn find_active_by_sop(
     pool: &SqlitePool,
     openid: &str,
     sop_name: &str,
 ) -> Result<Option<String>> {
+    let cutoff = Utc::now() - chrono::Duration::seconds(ADOPT_WINDOW_SECS);
     let task_id: Option<String> = sqlx::query_scalar(
         "SELECT task_id FROM sop_tasks WHERE openid = ? AND sop_name = ? \
-         AND status IN ('pending', 'running') ORDER BY created_at DESC LIMIT 1",
+         AND status IN ('pending', 'running') AND created_at >= ? \
+         ORDER BY created_at DESC LIMIT 1",
     )
     .bind(openid)
     .bind(sop_name)
+    .bind(cutoff)
     .fetch_optional(pool)
     .await?;
     Ok(task_id)
+}
+
+/// Record which brief a finished run produced, plus the company name read
+/// from that brief. Both are best-effort — a run that produced nothing simply
+/// leaves them null.
+pub async fn set_artifact(
+    pool: &SqlitePool,
+    task_id: &str,
+    artifact_path: &str,
+    enterprise_name: Option<&str>,
+) -> Result<()> {
+    if let Some(name) = enterprise_name {
+        sqlx::query(
+            "UPDATE sop_tasks SET artifact_path = ?, enterprise_name = COALESCE(enterprise_name, ?), \
+             updated_at = ? WHERE task_id = ?",
+        )
+        .bind(artifact_path)
+        .bind(name)
+        .bind(Utc::now())
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query("UPDATE sop_tasks SET artifact_path = ?, updated_at = ? WHERE task_id = ?")
+            .bind(artifact_path)
+            .bind(Utc::now())
+            .bind(task_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Fetch a single task row by task_id.

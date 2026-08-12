@@ -4,7 +4,10 @@ description = "企业快评：从公司名消歧、缓存检查、五板块多�
 version = "1.3.1"
 priority = "high"
 execution_mode = "auto"
-cooldown_secs = 60
+# 不设冷却：这个流程本身要跑 3–5 分钟，再加一道 60 秒冷却挡不住任何滥用，
+# 只会让用户连着查两家公司时第二次启动失败。而启动失败后模型往往不声张地
+# 改用别的方式凑合，产出质量差很多，用户还看不出来。
+cooldown_secs = 0
 max_concurrent = 3
 
 [[triggers]]
