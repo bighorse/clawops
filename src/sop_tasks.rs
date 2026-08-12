@@ -395,11 +395,21 @@ pub async fn find_pending_by_sop(
 /// Matching on (user, sop_name) alone made this window infinite, which
 /// silently merged genuinely separate requests: ask about one company, then
 /// another while the first is still running, and the second got folded into
-/// the first — the user saw "已为您发起" both times but only one task existed,
-/// and its enterprise name was overwritten by the later company.
-const ADOPT_WINDOW_SECS: i64 = 15;
+/// the first — the user saw "已为您发起" both times but only one task existed.
+///
+/// Two seconds, because the race this exists to fix resolves in milliseconds,
+/// while a person typing a second company name needs longer. It is still a
+/// heuristic: two requests fired programmatically within the window would
+/// collapse into one. A precise fix needs the daemon to say which run an
+/// event belongs to, which today's webhook payload doesn't carry.
+const ADOPT_WINDOW_SECS: i64 = 2;
 
-pub async fn find_active_by_sop(
+/// Find a just-created task to adopt instead of inserting a duplicate.
+///
+/// Deliberately time-boxed — see `ADOPT_WINDOW_SECS`. Do **not** use this to
+/// match a finishing run: by then the task is minutes old and would fall
+/// outside the window, leaving the completion to create an orphan row.
+pub async fn find_adoptable(
     pool: &SqlitePool,
     openid: &str,
     sop_name: &str,
@@ -413,6 +423,32 @@ pub async fn find_active_by_sop(
     .bind(openid)
     .bind(sop_name)
     .bind(cutoff)
+    .fetch_optional(pool)
+    .await?;
+    Ok(task_id)
+}
+
+/// Find the unfinished task a completion belongs to.
+///
+/// No time bound — a run takes minutes, so the row is long past any adoption
+/// window. Oldest-first: with several runs in flight the completions tend to
+/// arrive in the order they were started, so first-in-first-out is the best
+/// guess available. It is a guess — the webhook carries no run identifier, so
+/// two runs finishing out of order would be attributed to each other's task.
+/// The brief itself is matched separately and correctly, via the marker in the
+/// wrap-up, so a mix-up here swaps which task a brief hangs off, not which
+/// company a brief describes.
+pub async fn find_active_by_sop(
+    pool: &SqlitePool,
+    openid: &str,
+    sop_name: &str,
+) -> Result<Option<String>> {
+    let task_id: Option<String> = sqlx::query_scalar(
+        "SELECT task_id FROM sop_tasks WHERE openid = ? AND sop_name = ? \
+         AND status IN ('pending', 'running') ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(openid)
+    .bind(sop_name)
     .fetch_optional(pool)
     .await?;
     Ok(task_id)

@@ -753,7 +753,7 @@ async fn chat(
             // the name instead of creating a duplicate.
             let sop_meta = st.cfg.sop_metadata.get(sop_name.as_str());
             let estimated_seconds = sop_meta.map(|m| m.estimated_seconds).unwrap_or(540);
-            match sop_tasks::find_active_by_sop(&st.pool, &user.openid, sop_name).await {
+            match sop_tasks::find_adoptable(&st.pool, &user.openid, sop_name).await {
                 Ok(Some(existing)) => {
                     if let Some(name) = enterprise_name.as_deref() {
                         if let Err(e) =
@@ -1695,7 +1695,7 @@ async fn internal_sop_event(
                 emit_sop_event(&st, &task_id, &openid, "running");
                 tracing::debug!(openid = %openid, task_id = %task_id, "sop webhook: starting → running");
             } else if let Some(existing) =
-                sop_tasks::find_active_by_sop(&st.pool, &openid, &payload.sop_name).await?
+                sop_tasks::find_adoptable(&st.pool, &openid, &payload.sop_name).await?
             {
                 // An active (running) task already exists — a prior "starting"
                 // event created one (model called sop_execute again before the run
@@ -1831,14 +1831,27 @@ async fn internal_sop_event(
                 }
             }
 
-            // Put the wrap-up into the conversation. It used to go nowhere: the
-            // chat showed only "已为您发起…", so the user had no sight of the
-            // result without going hunting in the brief list.
-            if !response_text.trim().is_empty() {
-                if let Err(e) =
-                    chat_history::record_assistant(&st.pool, &openid, response_text).await
-                {
-                    tracing::warn!(openid = %openid, "failed to persist sop wrap-up: {e}");
+            // Tell the user in the chat that the run finished. Until now the
+            // conversation ended at "已为您发起…", so the result was invisible
+            // unless they went looking in the brief list.
+            //
+            // The notice is composed here rather than copied from the daemon's
+            // response_text. That text is the whole agent turn, reasoning and
+            // all — putting it in the chat verbatim showed the user things like
+            // "The user is asking me to look up 中微公司. According to the
+            // routing rules in IDENTITY.md…". The company name and brief path
+            // are already known and already clean, so state the outcome from
+            // those. response_text stays on the task row for diagnostics.
+            if let Ok(Some(task)) = sop_tasks::get_by_id(&st.pool, &task_id).await {
+                let notice = match (task.enterprise_name.as_deref(), task.artifact_path.as_deref()) {
+                    (Some(name), Some(_)) => {
+                        format!("「{name}」的企业快评已完成，简报可在「简报」页查看。")
+                    }
+                    (None, Some(_)) => "企业快评已完成，简报可在「简报」页查看。".to_string(),
+                    _ => "企业快评已结束，但这次没有生成简报，可以再试一次。".to_string(),
+                };
+                if let Err(e) = chat_history::record_assistant(&st.pool, &openid, &notice).await {
+                    tracing::warn!(openid = %openid, "failed to persist completion notice: {e}");
                 }
             }
 
