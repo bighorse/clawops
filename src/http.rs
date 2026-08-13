@@ -1766,6 +1766,19 @@ mod tests {
     }
 
     #[test]
+    fn keeps_policy_match_result_card_intact() {
+        // 这台网关上跑的是政策匹配，成功回复的形态与企业简报完全不同：
+        // 短段落 + 深链 + 逐条政策。新加的机械词过滤是全文匹配的，必须
+        // 证明它够不着这类正文——否则 40+ 租户的卡片会被吃掉。
+        let raw = "已为 **北京中孵高科技术发展有限公司** 匹配到 10 条适用政策：\n\n\
+            **1. 中关村高新技术企业认定奖励**\n资助额度：50 万元　申报截止：2026-09-30\n\n\
+            **2. 专精特新「小巨人」培育资金**\n资助额度：100 万元　申报截止：2026-10-15\n\n\
+            完整清单与申报材料要求：\n\n\
+            [查看政策匹配结果](/pages/policy/index?id=34)";
+        assert_eq!(sanitize_assistant_response(raw, true), raw);
+    }
+
+    #[test]
     fn keeps_legit_wait_message_when_sop_actually_started() {
         // Same proactive-notify wording is legitimate when a SOP really started;
         // that path passes sop_started = true and must be left untouched.
