@@ -1352,15 +1352,27 @@ fn extract_company_name_from_text(text: &str) -> Option<String> {
             // leading verb/prefix. Strip known leading words (longest-first) so the
             // recorded name is the clean company (keeps the workspace-deeplink
             // fallback path correct).
+            // Order-independent: always take the LONGEST matching prefix. The
+            // previous first-match-wins scan silently depended on the array being
+            // written longest-first, and "快评" — this product's own core verb —
+            // was simply missing, so "帮我快评一下 X 有限公司" was recorded as
+            // "快评一下 X 有限公司" and shown back to the user that way.
             const LEADING: &[&str] = &[
                 "做一下", "做个", "帮我给", "帮我", "帮忙", "帮", "给",
                 "为", "请", "查一下", "查查", "查", "看看", "看", "咨询",
+                // Verbs this product actually invites the user to type.
+                "快评一下", "快评", "评一下", "评估一下", "评估",
+                "分析一下", "分析", "调研一下", "调研", "研究一下",
+                "了解一下", "了解", "介绍一下", "介绍", "搜索一下", "搜索",
             ];
             loop {
-                match LEADING.iter().find_map(|p| name.strip_prefix(p)) {
-                    Some(rest) => name = rest.to_string(),
-                    None => break,
-                }
+                let longest = LEADING
+                    .iter()
+                    .copied()
+                    .filter(|p| name.starts_with(p))
+                    .max_by_key(|p| p.chars().count());
+                let Some(prefix) = longest else { break };
+                name = name[prefix.len()..].to_string();
             }
             if looks_like_full_company_name(&name) {
                 return Some(name);
@@ -1387,7 +1399,9 @@ fn sanitize_assistant_response(text: &str, sop_started: bool) -> String {
     // 2) Strip leaked zeroclaw "stuck self-reflection" blocks that weak models
     //    sometimes echo as if they were the answer.
     let text = strip_internal_reflection_block(&text);
-    // 3) When no SOP actually started, a "I'll proactively send you the report"
+    // 3) Strip the model's own play-by-play of how it routed the request.
+    let text = strip_internal_process_narration(&text);
+    // 4) When no SOP actually started, a "I'll proactively send you the report"
     //    promise is a lie (nothing is running). Replace it with an honest nudge.
     if sop_started {
         text
@@ -1434,6 +1448,78 @@ fn strip_internal_reflection_block(text: &str) -> String {
     let remainder = remainder.trim();
     if remainder.is_empty() {
         "抱歉，刚才没能顺利处理你的问题。可以再说一次你的需求吗？我来重新帮你。".to_string()
+    } else {
+        remainder.to_string()
+    }
+}
+
+/// Drop the model's narration of its own routing before the actual answer.
+///
+/// SOUL.md forbids this ("路由/切换类"、"后端术语原样照搬"), but the tenant model is
+/// weak and simply does not always comply — an enterprise search came back as:
+///
+/// ```text
+/// 我来帮你搜索上海的半导体设备企业。先确认一下这个需求走的是企业搜索技能。
+/// 找到了企业搜索技能。按规范需先读取 SKILL 文件获取完整操作指令。
+/// 按技能指令执行搜索。
+/// 搜索完成，共返回 50 家匹配企业。以下是匹配度最高的前 20 家：
+/// 找到 50 家匹配企业（结果较多，如需缩小范围可补充更多条件）：
+/// ```
+///
+/// Only the last line is for the customer. `strip_internal_reflection_block`
+/// could not catch this: it keys off one specific zeroclaw block format, while
+/// this is free-form prose.
+///
+/// Deliberately conservative, because a false positive deletes a real answer:
+///
+/// - **Leading paragraphs only.** Narration is always preamble; stopping at the
+///   first paragraph that does not match keeps the body untouched even if it
+///   happens to mention one of these words.
+/// - **Short paragraphs only.** Narration is one clause; real content is longer.
+/// - **Never returns empty.** If every paragraph matches, the classifier is
+///   more likely wrong than the model is, so the original text is returned
+///   unchanged rather than replaced with an apology.
+fn strip_internal_process_narration(text: &str) -> String {
+    // Backend vocabulary and self-narration that has no place in a customer
+    // reply. Matched anywhere inside a *short leading* paragraph.
+    const MARKERS: &[&str] = &[
+        // routing / capability plumbing
+        "技能", "SKILL", "skill", "SOP", "IDENTITY", "SOUL",
+        "操作指令", "按规范", "按指令", "走的是",
+        // tool call narration
+        "调取", "调用", "接口返回", "响应", "脚本", "字段", "run_id",
+        "读取", "执行搜索", "执行检索", "开始检索", "开始搜索",
+        "搜索完成", "检索完成", "查询完成", "执行完成",
+        // decision narration
+        "先确认", "我来尝试", "我判断", "让我", "我这边先",
+    ];
+    // A narration line is a single clause. 60 chars is comfortably above the
+    // observed leaks ("按技能指令执行搜索。" = 10) and well below a real answer
+    // paragraph, which carries data and sources.
+    const MAX_NARRATION_CHARS: usize = 60;
+
+    let is_narration = |para: &str| -> bool {
+        let t = para.trim();
+        !t.is_empty()
+            && t.chars().count() <= MAX_NARRATION_CHARS
+            && MARKERS.iter().any(|m| t.contains(m))
+    };
+
+    // Split on blank lines so a paragraph stays intact; `\n\n` is how the model
+    // separates these lines in practice.
+    let paras: Vec<&str> = text.split("\n\n").collect();
+    let keep_from = paras
+        .iter()
+        .position(|p| !p.trim().is_empty() && !is_narration(p))
+        .unwrap_or(paras.len());
+    if keep_from == 0 {
+        return text.to_string();
+    }
+    let remainder = paras[keep_from..].join("\n\n");
+    let remainder = remainder.trim();
+    if remainder.is_empty() {
+        // Everything looked like narration — distrust the classifier, not the model.
+        text.to_string()
     } else {
         remainder.to_string()
     }
@@ -1684,6 +1770,85 @@ mod tests {
                 .as_deref(),
             Some("百维互联科技发展(北京)有限公司")
         );
+    }
+
+    #[test]
+    fn strips_quick_review_verb_from_company_name() {
+        // 「快评」是本产品自己的核心动词，却是唯一漏掉的那个：实测记成了
+        // 「快评一下北方华创科技集团股份有限公司」，还原样回显给用户。
+        assert_eq!(
+            extract_company_name_from_text("帮我快评一下北方华创科技集团股份有限公司")
+                .as_deref(),
+            Some("北方华创科技集团股份有限公司")
+        );
+        for msg in [
+            "快评北方华创科技集团股份有限公司",
+            "帮我评估一下北方华创科技集团股份有限公司",
+            "分析一下北方华创科技集团股份有限公司",
+            "请调研北方华创科技集团股份有限公司",
+        ] {
+            assert_eq!(
+                extract_company_name_from_text(msg).as_deref(),
+                Some("北方华创科技集团股份有限公司"),
+                "未剥净动词前缀：{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_prefix_strip_is_longest_match_not_first_match() {
+        // 「快评」若排在「快评一下」之前被选中，会剩下「一下…」这种半截名字。
+        // 取最长匹配后，清单顺序不再影响结果。
+        assert_eq!(
+            extract_company_name_from_text("快评一下中拓产业云（北京）科技服务有限公司")
+                .as_deref(),
+            Some("中拓产业云（北京）科技服务有限公司")
+        );
+    }
+
+    #[test]
+    fn strips_skill_routing_narration() {
+        // 本次实测从「查企业」原样漏给用户的开头。
+        let raw = "我来帮你搜索上海的半导体设备企业。先确认一下这个需求走的是企业搜索技能。\n\n\
+            找到了企业搜索技能。按规范需先读取 SKILL 文件获取完整操作指令。\n\n\
+            按技能指令执行搜索。\n\n\
+            搜索完成，共返回 50 家匹配企业。以下是匹配度最高的前 20 家：\n\n\
+            找到 50 家匹配企业（结果较多，如需缩小范围可补充更多条件）：\n\n\
+            **1. 中微半导体设备（上海）股份有限公司**\n\
+            推荐理由：上海浦东，科创板上市（688012）";
+
+        let clean = sanitize_assistant_response(raw, false);
+
+        for leaked in ["技能", "SKILL", "操作指令", "先确认", "搜索完成"] {
+            assert!(!clean.contains(leaked), "内部术语仍然外泄：{leaked}");
+        }
+        // 真正给用户看的那句和正文都要留下。
+        assert!(clean.starts_with("找到 50 家匹配企业"));
+        assert!(clean.contains("中微半导体设备（上海）股份有限公司"));
+        assert!(clean.contains("688012"));
+    }
+
+    #[test]
+    fn keeps_marker_word_once_the_answer_has_started() {
+        // 只掐开头；正文里出现同样的词不能动，否则会切掉真答案。
+        let raw = "这家公司主营工业机器人。\n\n\
+            其核心技能储备集中在运动控制与视觉算法两块。";
+        assert_eq!(sanitize_assistant_response(raw, false), raw);
+    }
+
+    #[test]
+    fn keeps_long_paragraph_even_with_marker() {
+        // 长段落是内容不是旁白：命中关键词也不该整段丢掉。
+        let raw = "先确认一下，这家公司的主营业务横跨半导体设备与新材料两个板块，\
+            2025 年营收 393.53 亿元、同比增长 30.85%，毛利率由 42.93% 降至 40.10%。";
+        assert_eq!(sanitize_assistant_response(raw, false), raw);
+    }
+
+    #[test]
+    fn keeps_text_when_every_paragraph_looks_like_narration() {
+        // 全段命中时更可能是我的分类器错了，宁可放过也不要清空。
+        let raw = "先确认一下你要查的方向。\n\n按规范我需要更多信息。";
+        assert_eq!(sanitize_assistant_response(raw, false), raw);
     }
 
     #[test]
