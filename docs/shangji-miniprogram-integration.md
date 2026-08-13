@@ -402,6 +402,43 @@ function handleEvent(e) {
 
 **典型量级**：一份简报约 7 KB，可一次性读入内存渲染。
 
+#### 从「某个任务」跳到「它产出的那份简报」
+
+任务列表里点一条已完成的快评，要打开对应简报，走这三步：
+
+```js
+// 1) 拿任务列表，找到 status === 'done' 且 artifact_path 非空的那条
+const { tasks } = await GET('/me/sop/tasks?limit=50')      // 带 Bearer
+const t = tasks.find(x => x.status === 'done' && x.artifact_path)
+
+// 2) 用 artifact_path 原样取正文（注意：不要 encodeURIComponent，见下）
+const brief = await GET(`/me/artifacts/${t.artifact_path}`) // 带 Bearer
+
+// 3) 渲染 brief.content（原始 Markdown，需支持 GFM 表格）
+```
+
+不需要先调 `/me/artifacts` 列表——`artifact_path` 已经是完整路径，可直接取。列表接口是给「简报」独立入口用的。
+
+**三个必踩的坑：**
+
+**① 这个链接不能当 URL 用。** `/me/artifacts/{path}` 要 `Authorization: Bearer` 头，而浏览器地址栏跳转、`<a href>`、`wx.navigateTo`、`web-view` 的 src **都带不上自定义请求头**。所以：
+
+- ❌ 把 `https://ai.infocts.cn/clawops/me/artifacts/briefs/xxx/brief.md` 直接丢给 `<a>` 或 webview
+- ✅ 用你的请求库带头 GET 回来，把 `content` 渲染进自己的页面
+
+换句话说，**`artifact_path` 是一个数据标识，不是一个可直接打开的网址**。
+
+**② 路径不要 URL 编码。** 路由是通配匹配（`/me/artifacts/*path`），`artifact_path` 形如 `briefs/naura/brief_2026-08-13.md`，里面的 `/` 是路径分隔符。整串 `encodeURIComponent` 会把 `/` 变成 `%2F`，请求直接 404。**原样拼接即可**。
+
+**③ `artifact_path` 为 `null` 有两种情况，都要兼容：**
+
+| 情况 | 表现 | 前端处理 |
+|---|---|---|
+| 任务还在跑 | `status` 是 `pending`/`running` | 不显示入口，显示进度 |
+| 2026-08-12 之前的历史任务 | `status` 是 `done` 但 `artifact_path` 为 `null` | 显示「—」，不要报错。该字段是后加的，老数据补不回来 |
+
+所以判断条件必须是 `status === 'done' && artifact_path`，**只判断 `status === 'done'` 会拿到 null 去拼路径**。
+
 ---
 
 ### 3.8 Web 端（Vue 2）对接差异
