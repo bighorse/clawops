@@ -1508,21 +1508,62 @@ fn strip_internal_process_narration(text: &str) -> String {
     // Split on blank lines so a paragraph stays intact; `\n\n` is how the model
     // separates these lines in practice.
     let paras: Vec<&str> = text.split("\n\n").collect();
+
+    // Pass 1 — runtime machinery, stripped WHEREVER it appears.
+    //
+    // The leading-only rule above is not enough on the SOP path: an enterprise
+    // search came back with the quick-review SOP's own step log spliced into the
+    // middle of it, run id and all ("这个 SOP 运行（run-1786607353080-0002）…
+    // 目前停在 Step 4"、"Step 6 实际未完成落盘"). Unlike "技能" or "读取", none of
+    // these terms can plausibly occur in a real company brief, so matching them
+    // anywhere is safe where a broad marker would not be.
+    let paras: Vec<&str> = paras
+        .into_iter()
+        .filter(|p| !is_runtime_machinery(p))
+        .collect();
+    // Pass 2 — the model's own preamble, leading paragraphs only.
     let keep_from = paras
         .iter()
         .position(|p| !p.trim().is_empty() && !is_narration(p))
         .unwrap_or(paras.len());
-    if keep_from == 0 {
-        return text.to_string();
-    }
     let remainder = paras[keep_from..].join("\n\n");
     let remainder = remainder.trim();
     if remainder.is_empty() {
-        // Everything looked like narration — distrust the classifier, not the model.
+        // Everything looked like narration — distrust the classifier, not the
+        // model, and hand back what it actually said.
         text.to_string()
     } else {
         remainder.to_string()
     }
+}
+
+/// True when a paragraph is SOP/runtime bookkeeping rather than an answer.
+///
+/// Kept separate from the broad narration markers because these are matched
+/// anywhere in the reply, not just in the preamble: they are terms that cannot
+/// appear in a company brief, so a hit is never ambiguous. The length bound is
+/// looser for the same reason, but still present so a long content paragraph
+/// that happens to contain one of them survives.
+fn is_runtime_machinery(para: &str) -> bool {
+    const MACHINERY: &[&str] = &[
+        "SOP", "sop_execute", "sop_advance", "sop_status", "run_id", "run-",
+        "已被系统标记", "落盘", "中间产物", "检索日志", "结构化数据",
+        "requires_confirmation",
+    ];
+    const MAX_MACHINERY_CHARS: usize = 200;
+
+    let t = para.trim();
+    if t.is_empty() || t.chars().count() > MAX_MACHINERY_CHARS {
+        return false;
+    }
+    // "Step 4" / "Step 7 交付" — the step counter only exists inside the engine.
+    let step_counter = t.match_indices("Step ").any(|(i, _)| {
+        t[i + "Step ".len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+    });
+    step_counter || MACHINERY.iter().any(|m| t.contains(m))
 }
 
 /// When the gateway did NOT start a SOP this turn, any "I'll proactively notify
@@ -1826,6 +1867,40 @@ mod tests {
         assert!(clean.starts_with("找到 50 家匹配企业"));
         assert!(clean.contains("中微半导体设备（上海）股份有限公司"));
         assert!(clean.contains("688012"));
+    }
+
+    #[test]
+    fn strips_sop_step_log_spliced_into_an_unrelated_answer() {
+        // 实测：一次企业搜索的回复里，被塞进了另一个快评 SOP 的推进日志，
+        // 连 run id 都带出来了。这段在正文中段，只掐开头的规则够不着。
+        let raw = "找到 50 家匹配企业（结果较多，以下展示匹配度最高的 20 条）：\n\n\
+            **1. 北京通美晶体技术股份有限公司**\n推荐理由：北京通州，磷化铟衬底\n\n\
+            这个 SOP 运行（run-1786607353080-0002）是针对「中微半导体设备（上海）」的企业快评，目前停在 Step 4。\n\n\
+            我先检查这个快评任务已有的中间产物，确认当前状态。\n\n\
+            Step 5（一致性检查）和 Step 6（成稿）已被系统标记为完成，现在进入 Step 7 交付。\n\n\
+            简报文件尚未生成（Step 6 实际未完成落盘）。我需要先补写正式简报，再完成交付。\n\n\
+            **一句话画像**：国内刻蚀设备龙头，科创板上市（688012）";
+
+        let clean = sanitize_assistant_response(raw, true);
+
+        for leaked in ["SOP", "run-", "Step 4", "Step 7", "中间产物", "落盘", "已被系统标记"] {
+            assert!(!clean.contains(leaked), "流程机械仍然外泄：{leaked}");
+        }
+        // 两个真答案都必须留下。
+        assert!(clean.starts_with("找到 50 家匹配企业"));
+        assert!(clean.contains("北京通美晶体技术股份有限公司"));
+        assert!(clean.contains("国内刻蚀设备龙头"));
+    }
+
+    #[test]
+    fn keeps_long_content_paragraph_that_merely_mentions_machinery() {
+        // 超过长度上限的段落是内容，不是机械日志——命中也不动。
+        let long = format!(
+            "公司通过 SOP 标准作业程序管理产线良率，{}",
+            "该体系覆盖设备点检、工艺参数复核与异常追溯三个环节。".repeat(10)
+        );
+        assert!(long.chars().count() > 200);
+        assert_eq!(sanitize_assistant_response(&long, true), long);
     }
 
     #[test]
