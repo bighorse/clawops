@@ -56,6 +56,14 @@ curl -X POST http://127.0.0.1:8088/admin/refresh-all-workspaces -H "X-Admin-Toke
 
 **⚠️ 自测公网可达性不可靠**：在服务器上 curl 自己的公网域名，源 IP 会命中 `allow` 规则，测不出真实的外部访问情况。必须从外部测。
 
+**⚠️ 非交互 SSH 里 `cargo` 不在 PATH**：`ssh root@… 'cargo build'` 直接报 `command not found`（不加载 profile）。要写 `export PATH=/root/.cargo/bin:$PATH`。更坑的是：若命令写成 `cargo build 2>&1 | tail`，管道会把退出码吃掉，**外层看起来是成功的**。构建务必自己回显 `${PIPESTATUS[0]}` 并核对。
+
+**⚠️ 换二进制要原子替换**：正在运行的可执行文件不能直接 `cp` 覆盖（`Text file busy`）。用同目录 `cp` 到临时名再 `mv`（换 inode）。另：**长构建和"停服务/换文件"分两个 SSH 会话**——构建期间断连过一次。
+
+**⚠️ 重启会打断在途请求和 SSE**：`systemctl restart clawops` 会让浏览器端一连串 `ERR_CONNECTION_CLOSED`，此时正在发的 `/chat` 会静默失败（前端只是回到可输入状态，不报错）。重启后刷新页面再测，不要以为是功能坏了。
+
+**⚠️ 服务器 `/opt/clawops` 的工作区长期是脏的**：上一次改动是直接在服务器上编辑、没提交，本地也没有对应分支推到远端。改之前先 `sha256sum` 比对服务器文件与本地目标提交，确认基线一致再覆盖。本实例分支 `tenant/zhongbolun` **只在本地**，务必推到 origin 备份（但按上面的分支纪律，不要合进 main）。
+
 ---
 
 ## 开放公网前的检查清单（顺序不可颠倒）
