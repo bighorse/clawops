@@ -41,6 +41,12 @@ pub enum Error {
         waited_ms: u64,
     },
 
+    /// A daemon answered on the port, but not the tenant's own: its authenticated
+    /// probe was rejected. Almost always a port collision with a process ClawOps
+    /// does not manage.
+    #[error("port {port} is answering for a different daemon (probe returned {status})")]
+    ZeroclawIdentityMismatch { port: u16, status: u16 },
+
     /// Surfaces WeChat code2session errors verbatim to the client so the
     /// mini-program can react (re-call wx.login on 40029, retry on 45011, etc.)
     #[error("wechat code2session failed: errcode={errcode} errmsg={errmsg}")]
