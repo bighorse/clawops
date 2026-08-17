@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::process::{ProcessManager, UserHomeLayout};
 use crate::{ports, users, Error, Result};
 use handlebars::Handlebars;
+use reqwest::header;
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -159,7 +160,7 @@ impl Provisioner {
             self.backend.start(&user.linux_uid).await?;
             users::log_step(&self.pool, &user.openid, "systemd_start", true, None).await?;
 
-            self.wait_health(port).await?;
+            self.wait_ready(&user.openid, port).await?;
             users::log_step(&self.pool, &user.openid, "health_ok", true, None).await?;
 
             // Pairing: POST /pair with X-Pairing-Code. The pairing code is
@@ -343,6 +344,49 @@ impl Provisioner {
         }
 
         Ok(())
+    }
+
+    /// Liveness plus identity. `/health` only proves *a* daemon is up on that
+    /// port — a foreign one answers just as happily, which is how a port
+    /// collision once passed provisioning and surfaced hours later as a 401 on
+    /// the first chat. `/api/status` requires the tenant's own bearer token, so
+    /// it is the cheapest proof that the daemon on this port is really ours.
+    async fn wait_ready(&self, openid: &str, port: u16) -> Result<()> {
+        self.wait_health(port).await?;
+        let user = users::get_required(&self.pool, openid).await?;
+        match user.paired_token_enc {
+            Some(token) => self.verify_port_identity(port, &token).await,
+            // Nothing to prove identity with; liveness is all we have.
+            None => Ok(()),
+        }
+    }
+
+    /// Only 401/403 is treated as proof of a foreign daemon. Any other outcome
+    /// (an older runtime without the endpoint, a transient error) is
+    /// inconclusive and must not block provisioning — the check exists to catch
+    /// collisions, not to add a new way for onboarding to fail.
+    async fn verify_port_identity(&self, port: u16, paired_token: &str) -> Result<()> {
+        let url = format!("http://127.0.0.1:{port}/api/status");
+        let status = self
+            .http
+            .get(&url)
+            .header(header::AUTHORIZATION, format!("Bearer {paired_token}"))
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+            .unwrap_or(0);
+        match status {
+            200 => Ok(()),
+            401 | 403 => Err(Error::ZeroclawIdentityMismatch { port, status }),
+            other => {
+                tracing::warn!(
+                    port,
+                    status = other,
+                    "identity probe inconclusive; accepting liveness alone"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn wait_health(&self, port: u16) -> Result<()> {
@@ -582,7 +626,7 @@ impl Provisioner {
             if let Some(p) = user.port {
                 self.backend.stop(&user.linux_uid).await.ok();
                 self.backend.start(&user.linux_uid).await?;
-                self.wait_health(p as u16).await?;
+                self.wait_ready(&user.openid, p as u16).await?;
             }
         }
         Ok(())
@@ -663,7 +707,7 @@ impl Provisioner {
 
         if self.backend.launches_daemon() {
             self.backend.start(&user.linux_uid).await?;
-            self.wait_health(port).await?;
+            self.wait_ready(&user.openid, port).await?;
         }
         users::set_status(&self.pool, &user.openid, "running").await?;
         users::get_required(&self.pool, openid).await
