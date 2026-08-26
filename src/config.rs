@@ -215,7 +215,61 @@ pub struct ZeroclawConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProvisionerConfig {
     pub backend: String,
+    /// Templates for the `default_breed`. Kept as its own key (rather than
+    /// folding it under `breeds_dir`) so existing deployments render from
+    /// exactly the path they always did.
     pub template_dir: PathBuf,
+    /// Root holding one subdirectory per non-default breed:
+    /// `<breeds_dir>/<breed>/{IDENTITY.md.hbs, SOUL.md.hbs, USER.md.hbs,
+    /// config.toml.hbs, skills/, sops/, scripts/}`.
+    ///
+    /// Empty (the default) means single-breed mode: every tenant renders
+    /// from `template_dir` and the breed admin API refuses to write.
+    /// Point it somewhere writable to let ClawOps host several kinds of
+    /// lobster at once — the swarm then distinguishes them by
+    /// `users.breed` rather than by which git branch the box is on.
+    #[serde(default)]
+    pub breeds_dir: Option<PathBuf>,
+    /// Breed assigned to tenants that arrive without one (wx-login,
+    /// wecom-login, `provision` with no `--breed`). Must resolve, or
+    /// provisioning fails loudly rather than silently handing a new
+    /// tenant the wrong prompt set.
+    #[serde(default = "default_breed_name")]
+    pub default_breed: String,
+    /// Cap on an uploaded breed bundle, in bytes. The bundle is a
+    /// gzipped tar streamed into memory, so this is the ceiling on what
+    /// one admin request can allocate. 32 MiB fits a template tree with
+    /// fonts and helper scripts many times over.
+    #[serde(default = "default_max_bundle_bytes")]
+    pub max_bundle_bytes: usize,
+}
+
+/// The name reserved for `template_dir`. A breed literally called
+/// "default" never resolves under `breeds_dir` — that keeps the legacy
+/// path unshadowable by an uploaded bundle.
+pub const DEFAULT_BREED: &str = "default";
+
+fn default_breed_name() -> String {
+    DEFAULT_BREED.into()
+}
+
+fn default_max_bundle_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+impl ProvisionerConfig {
+    /// Where the given breed's templates live, or `None` when the breed
+    /// is unknown. `default` (and the empty string, which is what a row
+    /// written before migration 0010 effectively means) resolves to
+    /// `template_dir`; anything else must exist under `breeds_dir`.
+    pub fn breed_dir(&self, breed: &str) -> Option<PathBuf> {
+        if breed.is_empty() || breed == self.default_breed {
+            return Some(self.template_dir.clone());
+        }
+        let root = self.breeds_dir.as_ref()?;
+        let dir = root.join(breed);
+        dir.is_dir().then_some(dir)
+    }
 }
 
 /// Platform service-product (commodity) catalogue API. ClawOps doesn't

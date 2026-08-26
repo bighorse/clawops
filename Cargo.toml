@@ -29,6 +29,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 handlebars = "6"
 async-trait = "0.1"
+# Breed bundle transport: a gzipped tar streamed in over the admin API.
+# Entries are unpacked by hand rather than via `Archive::unpack` so path
+# traversal, links and decompressed size are all checked explicitly.
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
 governor = "0.7"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"

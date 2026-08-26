@@ -15,6 +15,24 @@ ZeroClaw 多租户运维网关。小程序端通过 ClawOps 统一入口鉴权�
 
 每用户对应一个 Linux uid、一个 zeroclaw daemon、一个 `/home/claw-NNN/.zeroclaw/` 目录。ClawOps 不进入 zeroclaw 进程内部,只做路由 + 生命周期管理。
 
+## 品种(breeds)
+
+一台 ClawOps 可以同时跑多种龙虾。每个品种是一棵独立的模板树,`users.breed`
+决定某个租户从哪一棵渲染——区分点在数据行上,不在 git 分支上。
+
+```bash
+# 开发端:一条命令推上去,只重启该品种的租户
+scripts/push-breed.sh --breed shangji --dir ./breed
+
+# 服务器上
+clawops breeds                                  # 品种 + digest + 租户数
+clawops set-breed --openid o_xxx --breed shangji
+```
+
+`provisioner.breeds_dir` 不填即单品种模式,行为与引入品种前完全一致。
+接口契约、开发端部署技能的改法、以及 `tenant/zhongbolun` 的迁移步骤见
+[`docs/breed-sync.md`](docs/breed-sync.md)。
+
 ## 开发环境(macOS / Linux 无 root)
 
 ```bash
@@ -56,6 +74,12 @@ mock backend 下 `/chat` 返回固定 echo,不会真的拉起 zeroclaw。
 | GET    | `/admin/users/:openid`    | 单用户详情 |
 | POST   | `/admin/provision`        | 手动新建(不走微信) |
 | POST   | `/admin/stop/:openid`     | 停止用户 zeroclaw,释放端口 |
+| GET    | `/admin/breeds`           | 列出品种 + 模板树 digest + 租户数 |
+| GET    | `/admin/breeds/:breed`    | 单品种详情 + `路径 -> sha256` 清单 |
+| PUT    | `/admin/breeds/:breed`    | 推送品种 bundle(tar/tar.gz),原子换入并下发 |
+| DELETE | `/admin/breeds/:breed`    | 删除品种(仍有租户则 409) |
+| POST   | `/admin/breeds/:breed/refresh` | 只重渲染该品种的租户 |
+| PUT    | `/admin/users/:openid/breed`   | 给租户换品种并立即重渲染 |
 
 ### wx-login 请求格式
 

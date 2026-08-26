@@ -20,8 +20,27 @@ port_range_end = 50000
 [provisioner]
 # "systemd" (Linux) or "mock" (dev / macOS). Mock writes provisioning steps to log only.
 backend = "mock"
-# Template directory bundled with the ClawOps install.
+# Templates for the "default" breed — the one bundled with the install.
 template_dir = "templates/workspace"
+
+# ── Breeds (品种) ───────────────────────────────────────────────────
+# One ClawOps can host several kinds of lobster side by side. Each breed
+# is its own template tree under breeds_dir; `users.breed` says which one
+# a tenant renders from. Push a breed with
+# `scripts/push-breed.sh --breed <name> --dir <tree>` — see
+# docs/breed-sync.md.
+#
+# Leave breeds_dir unset for single-breed mode: every tenant renders from
+# template_dir exactly as before, and the breed write API returns 503.
+# breeds_dir = "/etc/clawops/breeds"
+
+# Breed handed to tenants that arrive without one (wx-login, wecom-login,
+# `provision` with no --breed). "default" is template_dir above.
+# default_breed = "default"
+
+# Ceiling on one uploaded breed bundle, in bytes. It is decompressed in
+# memory, so this is the most a single admin request can allocate.
+# max_bundle_bytes = 33554432
 
 # ── LLM defaults injected into each rendered per-user config.toml ───
 # These centralise the model/provider so individual users don't repeat

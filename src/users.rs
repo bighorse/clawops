@@ -19,6 +19,10 @@ pub struct User {
     pub last_active_at: DateTime<Utc>,
     pub last_error: Option<String>,
     pub pending_sop_name: Option<String>,
+    /// Which breed's templates render this tenant's workspace. See
+    /// `ProvisionerConfig::breed_dir`. Rows predating migration 0010
+    /// read back as "default".
+    pub breed: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +32,11 @@ pub struct NewUser {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub enterprise_profile: Option<serde_json::Value>,
+    /// `None` means "whatever `provisioner.default_breed` says" — the
+    /// provisioner resolves it, so callers that don't care about breeds
+    /// (wx-login, wecom-login) don't have to name one.
+    #[serde(default)]
+    pub breed: Option<String>,
 }
 
 pub async fn get(pool: &SqlitePool, openid: &str) -> Result<Option<User>> {
@@ -49,6 +58,7 @@ pub async fn insert_provisioning(
     new: &NewUser,
     linux_uid: &str,
     workspace_path: &str,
+    breed: &str,
 ) -> Result<User> {
     let now = Utc::now();
     let profile_json = new
@@ -59,8 +69,8 @@ pub async fn insert_provisioning(
     sqlx::query(
         r#"INSERT INTO users
            (openid, phone, display_name, avatar_url, enterprise_profile, linux_uid, workspace_path,
-            port, paired_token_enc, status, created_at, last_active_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'provisioning', ?, ?)"#,
+            port, paired_token_enc, status, created_at, last_active_at, breed)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'provisioning', ?, ?, ?)"#,
     )
     .bind(&new.openid)
     .bind(&new.phone)
@@ -71,6 +81,7 @@ pub async fn insert_provisioning(
     .bind(workspace_path)
     .bind(now)
     .bind(now)
+    .bind(breed)
     .execute(pool)
     .await
     .map_err(|e| match e {
@@ -109,6 +120,45 @@ pub async fn set_paired_token(pool: &SqlitePool, openid: &str, token_enc: &str) 
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Move one tenant to a different breed. The caller is responsible for
+/// re-rendering the workspace afterwards — on its own this only changes
+/// which templates the *next* render reads, so a tenant left un-refreshed
+/// keeps running the old breed's prompts until something re-renders them.
+pub async fn set_breed(pool: &SqlitePool, openid: &str, breed: &str) -> Result<()> {
+    let res = sqlx::query("UPDATE users SET breed = ? WHERE openid = ?")
+        .bind(breed)
+        .bind(openid)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(Error::UserNotFound(openid.to_string()));
+    }
+    Ok(())
+}
+
+/// Openids of every tenant on `breed`, oldest first. Used to scope a
+/// template rollout to the breed that actually changed instead of
+/// restarting every daemon in the swarm.
+pub async fn openids_by_breed(pool: &SqlitePool, breed: &str) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT openid FROM users WHERE breed = ? ORDER BY created_at")
+            .bind(breed)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(o,)| o).collect())
+}
+
+/// `breed -> tenant count` across the whole swarm, including breeds whose
+/// template directory has since been deleted (that mismatch is exactly
+/// what an operator needs to see).
+pub async fn counts_by_breed(pool: &SqlitePool) -> Result<Vec<(String, i64)>> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT breed, COUNT(*) FROM users GROUP BY breed ORDER BY breed")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
 }
 
 pub async fn touch_active(pool: &SqlitePool, openid: &str) -> Result<()> {
@@ -241,6 +291,14 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for User {
             last_active_at: row.try_get("last_active_at")?,
             last_error: row.try_get("last_error")?,
             pending_sop_name: row.try_get("pending_sop_name")?,
+            // Tolerant on purpose: `SELECT *` runs against whatever the
+            // DB has, and a binary rolled back to before migration 0010
+            // must not start failing every user lookup.
+            breed: row
+                .try_get::<Option<String>, _>("breed")
+                .unwrap_or(None)
+                .filter(|b| !b.is_empty())
+                .unwrap_or_else(|| crate::config::DEFAULT_BREED.to_string()),
         })
     }
 }

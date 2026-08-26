@@ -61,6 +61,26 @@ pub enum Error {
     #[error("rate limit exceeded; retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
 
+    /// A tenant (or an admin request) named a breed with no template
+    /// directory behind it. Never rendered from a fallback: handing a
+    /// tenant the wrong breed's prompts is worse than refusing.
+    #[error("unknown breed '{0}': no template directory for it")]
+    UnknownBreed(String),
+
+    /// An uploaded breed bundle was rejected before anything was written.
+    #[error("invalid breed bundle: {0}")]
+    BadBundle(String),
+
+    /// Breed writes were attempted while `provisioner.breeds_dir` is unset.
+    #[error("breeds_dir is not configured; ClawOps is in single-breed mode")]
+    BreedsDisabled,
+
+    /// A breed still has tenants rendering from it. Deleting its
+    /// templates would freeze them on whatever is already in their
+    /// workspace and turn their next refresh into a 404.
+    #[error("breed '{breed}' still has {tenants} tenant(s); move them first via PUT /admin/users/<openid>/breed")]
+    BreedInUse { breed: String, tenants: i64 },
+
     #[error("{0}")]
     Other(String),
 }
@@ -107,6 +127,10 @@ impl axum::response::IntoResponse for Error {
             Error::UserAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
             Error::NoFreePort => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::DevFieldInProd(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            Error::UnknownBreed(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            Error::BadBundle(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            Error::BreedsDisabled => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            Error::BreedInUse { .. } => (StatusCode::CONFLICT, self.to_string()),
             _ => {
                 tracing::error!(error = %self, "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())

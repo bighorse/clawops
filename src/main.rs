@@ -38,6 +38,10 @@ enum Cmd {
         /// Path to a JSON file describing enterprise_profile.
         #[arg(long)]
         enterprise_profile: Option<PathBuf>,
+        /// Which breed's templates to render this tenant from.
+        /// Defaults to `provisioner.default_breed`.
+        #[arg(long)]
+        breed: Option<String>,
     },
 
     /// Stop a user's zeroclaw process and release its port.
@@ -66,6 +70,43 @@ enum Cmd {
     /// Run a single reaper pass against the configured DB and exit.
     /// Useful for ad-hoc cleanup or cron-driven invocations.
     Reap,
+
+    /// List the breeds this box can render, with the digest of each
+    /// template tree and the tenant count on it. The digest is what to
+    /// compare against a development machine to answer "is the swarm
+    /// actually running the lobster I pushed?".
+    Breeds,
+
+    /// Install a breed bundle from a local tar/tar.gz, then re-render
+    /// that breed's tenants. Same code path as `PUT /admin/breeds/:breed`
+    /// — for use on the box itself, where there is no admin token to hand.
+    InstallBreed {
+        /// Breed name, `[a-z0-9_-]+`.
+        #[arg(long)]
+        breed: String,
+        /// Path to the bundle (`.tar` or `.tar.gz`).
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Install only; leave existing tenants on the old templates.
+        #[arg(long)]
+        no_refresh: bool,
+    },
+
+    /// Re-render every tenant on one breed from the templates already on
+    /// disk. Unlike `refresh-workspace --all` this leaves other breeds'
+    /// daemons untouched.
+    RefreshBreed {
+        #[arg(long)]
+        breed: String,
+    },
+
+    /// Move one tenant to another breed and re-render them.
+    SetBreed {
+        #[arg(long)]
+        openid: String,
+        #[arg(long)]
+        breed: String,
+    },
 }
 
 #[tokio::main]
@@ -143,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
             phone,
             display_name,
             enterprise_profile,
+            breed,
         } => {
             let profile = match enterprise_profile {
                 Some(p) => Some(serde_json::from_str::<serde_json::Value>(
@@ -156,11 +198,12 @@ async fn main() -> anyhow::Result<()> {
                 display_name,
                 avatar_url: None,
                 enterprise_profile: profile,
+                breed,
             };
             let out = provisioner.provision(&new).await?;
             println!(
-                "provisioned: openid={} uid={} port={} workspace={} paired={}",
-                out.openid, out.linux_uid, out.port, out.workspace_path, out.paired
+                "provisioned: openid={} uid={} port={} breed={} workspace={} paired={}",
+                out.openid, out.linux_uid, out.port, out.breed, out.workspace_path, out.paired
             );
         }
         Cmd::Stop { openid } => {
@@ -198,10 +241,83 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             for u in rows {
                 println!(
-                    "{:<40} {:<10} status={:<14} port={:?} active={}",
-                    u.openid, u.linux_uid, u.status, u.port, u.last_active_at
+                    "{:<40} {:<10} breed={:<16} status={:<14} port={:?} active={}",
+                    u.openid, u.linux_uid, u.breed, u.status, u.port, u.last_active_at
                 );
             }
+        }
+        Cmd::Breeds => {
+            let counts: std::collections::BTreeMap<String, i64> =
+                users::counts_by_breed(&pool).await?.into_iter().collect();
+            let breeds = clawops::breeds::list(&cfg, &counts)?;
+            println!("{:<20} {:<8} {:<8} {:<66} PATH", "BREED", "TENANTS", "FILES", "DIGEST");
+            for b in breeds {
+                let name = if b.builtin {
+                    format!("{} (builtin)", b.name)
+                } else {
+                    b.name.clone()
+                };
+                println!(
+                    "{:<20} {:<8} {:<8} {:<66} {}",
+                    name, b.tenants, b.files, b.digest, b.path
+                );
+            }
+            // A breed with tenants but no template directory can only
+            // come from a directory deleted underneath a live swarm, and
+            // every one of those tenants will fail its next refresh.
+            let known: std::collections::BTreeSet<String> = clawops::breeds::list(&cfg, &counts)?
+                .into_iter()
+                .map(|b| b.name)
+                .collect();
+            for (breed, n) in &counts {
+                if !known.contains(breed) {
+                    eprintln!(
+                        "WARNING: {n} tenant(s) on breed '{breed}', which has no template directory"
+                    );
+                }
+            }
+        }
+        Cmd::InstallBreed {
+            breed,
+            bundle,
+            no_refresh,
+        } => {
+            let bytes = std::fs::read(&bundle)?;
+            let info = clawops::breeds::install(&cfg, &breed, &bytes)?;
+            println!(
+                "installed breed={} files={} digest={} path={}",
+                info.name, info.files, info.digest, info.path
+            );
+            if no_refresh {
+                println!("skipped rollout (--no-refresh)");
+            } else {
+                let (ok, failures) = provisioner.refresh_breed(&breed).await?;
+                println!("refreshed {ok} tenant(s)");
+                for (openid, err) in &failures {
+                    eprintln!("  FAILED: {openid} — {err}");
+                }
+                if !failures.is_empty() {
+                    anyhow::bail!("{} tenant(s) failed to refresh", failures.len());
+                }
+            }
+        }
+        Cmd::RefreshBreed { breed } => {
+            let (ok, failures) = provisioner.refresh_breed(&breed).await?;
+            println!("refreshed {ok} tenant(s) on breed '{breed}'");
+            for (openid, err) in &failures {
+                eprintln!("  FAILED: {openid} — {err}");
+            }
+            if !failures.is_empty() {
+                anyhow::bail!("{} tenant(s) failed to refresh", failures.len());
+            }
+        }
+        Cmd::SetBreed { openid, breed } => {
+            if cfg.provisioner.breed_dir(&breed).is_none() {
+                anyhow::bail!("unknown breed '{breed}' — run `clawops breeds` to see what exists");
+            }
+            users::set_breed(&pool, &openid, &breed).await?;
+            provisioner.refresh_workspace(&openid).await?;
+            println!("{openid} moved to breed '{breed}' and re-rendered");
         }
     }
 
