@@ -176,8 +176,11 @@ async fn main() -> anyhow::Result<()> {
             // production DB while clawops.service stays up — both share
             // the same SQLite file with WAL.
             let reaper = Reaper::new(pool.clone(), provisioner.clone(), cfg.reaper.clone());
-            let n = reaper.tick().await?;
-            println!("reaper one-shot stopped {n} idle user(s)");
+            let out = reaper.tick().await?;
+            println!(
+                "reaper one-shot: stopped {} idle user(s), purged {} expired session(s)",
+                out.stopped, out.sessions_purged
+            );
         }
         Cmd::Provision {
             openid,

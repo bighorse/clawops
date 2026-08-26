@@ -3,9 +3,13 @@
 **读者**：维护企微网关（调用 ClawOps `/auth/wecom-login` 的那个服务）的人，
 以及 ClawOps 自己的维护者——本文的改动**两边各占一半**。
 
-> **本文档是书面交付，不是已完成的改动。** 第 3 节的 `[[auth_clients]]` 机制
-> 在 ClawOps 侧**尚未实现**；第 4 节网关侧的事我也没有权限去做。两边都需要人
-> 工落地。第 2 节描述的是**当前代码的真实状态**（已逐行核对）。
+> **本文档大部分是书面交付，不是已完成的改动。** 第 3 节的
+> `[[auth_clients]]` 机制在 ClawOps 侧**尚未实现**；第 4 节网关侧的事我也没有
+> 权限去做。两边都需要人工落地。
+>
+> **例外：3.6（过期会话清理）已经实现并测试。**
+>
+> 第 2 节描述的是**当前代码的真实状态**（已逐行核对）。
 
 ---
 
@@ -114,15 +118,25 @@ rate_per_min = 600
 
 否则整件事白做。
 
-### 3.6 顺手修掉：过期会话从来没被清理过
+### 3.6 过期会话从来没被清理过 —— ✅ 已修
 
-`sessions::purge_expired()` 写了，但**全代码没有任何地方调用它**。
+`sessions::purge_expired()` 从一开始就写了，但**全代码没有任何地方调用它**。
 `migrations/0002_sessions.sql` 的注释写着「expired rows are pruned by Reaper
-later」，而 Reaper 只处理 `users` 表，不碰 `sessions`。
+later」，而 Reaper 只处理 `users` 表，不碰 `sessions`。后果是 `sessions` 表
+**只增不减**。
 
-后果：`sessions` 表**只增不减**。网关如果每条消息都调一次
-`/auth/wecom-login`（见 4.5），这张表会以消息量的速度膨胀。应当在 Reaper 每次
-tick 里调一次。
+**已经挂进 Reaper 的每次 tick**（默认每小时一次），`clawops reap` 也会顺带执
+行。停闲置守护进程与清理会话是同一 tick 里的两件独立事情：清理失败只 warn，不
+会把整个 tick 变成失败而掩盖掉前者已经成功。
+
+```
+$ clawops reap
+reaper one-shot: stopped 0 idle user(s), purged 137 expired session(s)
+```
+
+这条修掉了**存量堆积**，但 4.5 那条仍然要做：网关每条消息都换一次会话的话，
+新行的产生速度会远超每小时一次的清理，而且每一行在 30 天内都还是有效的、**清
+不掉**。
 
 ---
 
