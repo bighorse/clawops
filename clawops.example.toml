@@ -42,6 +42,24 @@ template_dir = "templates/workspace"
 # memory, so this is the most a single admin request can allocate.
 # max_bundle_bytes = 33554432
 
+# Route self-registering mini-program tenants to a breed by app_id.
+#
+# This is a routing table, NOT a whitelist: an app_id that isn't listed
+# still logs in, it just lands on default_breed. ClawOps keeps no list of
+# valid app_ids — the platform backend already 403s unconfigured ones.
+#
+# Only consulted when the exchange backend didn't already name a breed
+# (it may return `{"data": {"open_id": "...", "breed": "..."}}`), and only
+# for tenants that don't exist yet — a login never moves an existing
+# tenant between breeds. Use PUT /admin/users/:openid/breed for that.
+#
+# The breed named here must already exist, or new registrations on that
+# app_id fail. Push the breed first, then add the route.
+#
+# [provisioner.breed_routes]
+# "wxABC123..." = "shangji"
+# "wxDEF456..." = "yiliao"
+
 # ── LLM defaults injected into each rendered per-user config.toml ───
 # These centralise the model/provider so individual users don't repeat
 # secrets. Prefer leaving api_key empty here and exporting

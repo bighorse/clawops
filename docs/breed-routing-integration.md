@@ -4,9 +4,9 @@
 **目标**：让不同来源进来的用户，自动落到**不同品种的龙虾**上，而不是全部拿
 `default_breed`。
 
-> **状态说明**：ClawOps 的品种机制（`users.breed`、模板推送、按品种重渲染）
-> **已上线**；本文描述的**分流**部分**尚未实现**，是待开发的契约。哪边做什么、
-> 各自的工作量在第 2 节说清楚了。
+> **状态说明**：ClawOps 侧**已全部实现并测试通过**（第 5 节），契约是真的、
+> 可以照着开发。剩下要做的是你们两端：小程序端**零改动**（见第 3 节），企微端
+> **需要新增一个可选字段**（见第 4 节）。
 
 ---
 
@@ -153,16 +153,22 @@ ClawOps 再猜一次简单，也少维护一张表。
 
 ---
 
-## 5. ClawOps 侧要做的（我方）
+## 5. ClawOps 侧（**已实现**）
 
-供你们对照，不需要你们实现：
+供你们对照，不需要你们实现。以下都已上线：
 
-1. `WxLoginReq` 分流：读后端返回的 `data.breed` → 查 `breed_routes[app_id]` →
-   `default_breed`，把结果填进 `NewUser.breed`
-2. `WecomLoginReq` 新增可选 `breed` 字段，同样填进 `NewUser.breed`
-3. 新增 `[provisioner.breed_routes]` 配置
-4. 品种合法性校验**已经有了**：`Provisioner::provision` 在消耗 linux uid 和写
-   DB 行之前会先解析品种，未知品种直接失败（`src/provisioner.rs`）
+1. **小程序分流**：`ProvisionerConfig::route_breed` 按「后端返回的 `data.breed`
+   → `breed_routes[app_id]` → `default_breed`」的优先级解析，结果填进
+   `NewUser.breed`。**品种绝不从请求体读**
+2. **企微分流**：`WecomLoginReq` 新增可选 `breed` 字段
+3. **配置**：`[provisioner.breed_routes]`
+4. **品种合法性校验**：`Provisioner::provision` 在消耗 linux uid 和写 DB 行
+   **之前**先解析品种，未知品种直接失败
+5. **空值即无意见**：后端返回 `"breed": ""` 或空白，等同于没返回，不会把租户
+   推到一个名字为空的品种上
+
+方案 D（企微传 `corp_id`/`agent_id` 由 ClawOps 映射）**未实现**——按第 4 节的
+建议，选了更简单的方案 C。真需要 D 再加。
 
 ---
 

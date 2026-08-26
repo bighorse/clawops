@@ -242,6 +242,22 @@ pub struct ProvisionerConfig {
     /// fonts and helper scripts many times over.
     #[serde(default = "default_max_bundle_bytes")]
     pub max_bundle_bytes: usize,
+    /// Mini-program `app_id` → breed, for tenants that self-register
+    /// through `/auth/wx-login`.
+    ///
+    /// This is a routing table, **not a whitelist**: an `app_id` that
+    /// isn't listed still logs in, it just lands on `default_breed`.
+    /// ClawOps deliberately keeps no list of valid app_ids — the platform
+    /// backend already rejects unconfigured ones with a 403 — and adding
+    /// a route here must not quietly change that.
+    ///
+    /// Only consulted when the exchange backend didn't already name a
+    /// breed, and only for users who don't exist yet: a login never moves
+    /// an existing tenant between breeds, because that restarts their
+    /// daemon and drops the previous breed's skills. Use
+    /// `PUT /admin/users/:openid/breed` for that.
+    #[serde(default)]
+    pub breed_routes: std::collections::BTreeMap<String, String>,
 }
 
 /// The name reserved for `template_dir`. A breed literally called
@@ -269,6 +285,82 @@ impl ProvisionerConfig {
         let root = self.breeds_dir.as_ref()?;
         let dir = root.join(breed);
         dir.is_dir().then_some(dir)
+    }
+
+    /// Which breed a self-registering mini-program tenant should be created
+    /// on, or `None` to mean `default_breed`.
+    ///
+    /// Precedence, most specific first:
+    ///
+    /// 1. what the exchange backend returned — it owns the mapping between
+    ///    its own mini-programs and lines of business
+    /// 2. the `breed_routes` table here, keyed by `app_id`
+    /// 3. nothing, i.e. `default_breed`
+    ///
+    /// An unrouted `app_id` returns `None` rather than an error: this is a
+    /// routing table, not a whitelist, and an unlisted mini-program must
+    /// still be able to log in.
+    ///
+    /// Note that a breed named at either level still has to exist —
+    /// `Provisioner::provision` rejects an unknown one before spending a
+    /// linux uid. That is deliberate: a route pointing at a breed nobody
+    /// pushed yet should fail loudly, not silently hand the tenant the
+    /// wrong lobster.
+    pub fn route_breed(&self, backend_breed: Option<&str>, app_id: &str) -> Option<String> {
+        backend_breed
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| self.breed_routes.get(app_id).cloned())
+    }
+}
+
+#[cfg(test)]
+mod provisioner_config_tests {
+    use super::*;
+
+    fn cfg() -> ProvisionerConfig {
+        ProvisionerConfig {
+            backend: "systemd".into(),
+            template_dir: PathBuf::from("/etc/clawops/templates/workspace"),
+            breeds_dir: Some(PathBuf::from("/etc/clawops/breeds")),
+            default_breed: DEFAULT_BREED.into(),
+            max_bundle_bytes: 1024,
+            breed_routes: [("wxAAA".to_string(), "shangji".to_string())]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn routes_a_configured_app_id() {
+        assert_eq!(cfg().route_breed(None, "wxAAA").as_deref(), Some("shangji"));
+    }
+
+    /// An app_id nobody routed must still log in — on the default breed.
+    /// This is the case most likely to be broken by treating the table as
+    /// a whitelist, and it would lock out every existing mini-program.
+    #[test]
+    fn an_unrouted_app_id_falls_through_rather_than_failing() {
+        assert_eq!(cfg().route_breed(None, "wxZZZ"), None);
+    }
+
+    #[test]
+    fn the_backend_beats_the_local_table() {
+        assert_eq!(
+            cfg().route_breed(Some("yiliao"), "wxAAA").as_deref(),
+            Some("yiliao")
+        );
+    }
+
+    /// A backend that sends `"breed": ""` (or spaces) means "no opinion",
+    /// not "a breed whose name is the empty string" — which would resolve
+    /// to template_dir and quietly hand the tenant the default lobster
+    /// while looking like it had been routed.
+    #[test]
+    fn an_empty_backend_breed_is_the_same_as_absent() {
+        assert_eq!(cfg().route_breed(Some("   "), "wxAAA").as_deref(), Some("shangji"));
+        assert_eq!(cfg().route_breed(Some(""), "wxZZZ"), None);
     }
 }
 

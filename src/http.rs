@@ -363,6 +363,20 @@ struct WecomLoginReq {
     /// Optional avatar URL fetched from wecom contact profile.
     #[serde(default)]
     avatar_url: Option<String>,
+    /// Optional breed for a tenant being created by this call.
+    ///
+    /// Safe to take from the request here — unlike `/auth/wx-login`, this
+    /// endpoint is `AdminGuard`ed server-to-server, so the caller is the
+    /// wecom bot backend rather than an end-user device. That backend
+    /// already knows which line of business the conversation belongs to,
+    /// which beats making ClawOps infer it from a corp/agent id table.
+    ///
+    /// Omitted means `provisioner.default_breed`, so existing callers keep
+    /// working unchanged. Only applied when the tenant is created: a login
+    /// must not move an existing tenant, because that restarts their
+    /// daemon and strips the old breed's skills.
+    #[serde(default)]
+    breed: Option<String>,
 }
 
 async fn wecom_login(
@@ -380,9 +394,12 @@ async fn wecom_login(
             display_name: req.display_name,
             avatar_url: req.avatar_url,
             enterprise_profile: None,
-            // Self-service logins never name a breed; the provisioner
-            // falls back to `provisioner.default_breed`.
-            breed: None,
+            // `None` falls back to `provisioner.default_breed`. A breed
+            // that doesn't exist is rejected by `provision` before any
+            // linux uid or DB row is spent, so a typo here fails the call
+            // instead of stranding a tenant on templates that render
+            // nothing.
+            breed: req.breed,
         };
         st.provisioner.provision(&new).await?;
     } else if req.display_name.is_some() || req.avatar_url.is_some() {
@@ -425,13 +442,23 @@ async fn wx_login(
     let mut is_new_user = false;
     if users::get(&st.pool, &openid).await?.is_none() {
         is_new_user = true;
+        // Breed is decided here, server-side, and never read from the
+        // request body: this endpoint is called by the user's phone with
+        // no authentication beyond an IP rate limit, so a client-supplied
+        // breed would let anyone pick their own persona, skills and tool
+        // access. Precedence: what the exchange backend said, then the
+        // configured app_id route, then `default_breed`.
+        let breed = st
+            .cfg
+            .provisioner
+            .route_breed(session.breed.as_deref(), &req.app_id);
         let new = users::NewUser {
             openid: openid.clone(),
             phone: None,
             display_name: req.display_name,
             avatar_url: req.avatar_url,
             enterprise_profile: req.enterprise_profile,
-            breed: None,
+            breed,
         };
         st.provisioner.provision(&new).await?;
     } else {

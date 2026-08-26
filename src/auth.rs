@@ -27,6 +27,15 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct Code2SessionResp {
     pub openid: String,
+    /// Breed named by the exchange backend, when it names one.
+    ///
+    /// The backend already knows which mini-program the code came from,
+    /// so letting it answer "and this one is a `shangji` tenant" keeps
+    /// breed ownership in one system instead of two. Optional on the wire:
+    /// a backend that never sends it behaves exactly as before, and
+    /// ClawOps falls back to `provisioner.breed_routes` and then to
+    /// `default_breed`.
+    pub breed: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +50,9 @@ struct ExchangeResp {
 struct ExchangeData {
     #[serde(default)]
     open_id: String,
+    /// Optional. See `Code2SessionResp::breed`.
+    #[serde(default)]
+    breed: Option<String>,
 }
 
 pub struct WxClient {
@@ -80,7 +92,7 @@ impl WxClient {
                     )
                 })?
                 .to_string();
-            return Ok(Code2SessionResp { openid });
+            return Ok(Code2SessionResp { openid, breed: None });
         }
 
         if mock_supplied {
@@ -123,14 +135,18 @@ impl WxClient {
                 errmsg: body.message.unwrap_or_else(|| "backend error".into()),
             });
         }
-        let openid = body
-            .data
-            .map(|d| d.open_id)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::WxApiError {
+        let data = body.data.filter(|d| !d.open_id.is_empty()).ok_or_else(|| {
+            Error::WxApiError {
                 errcode: -10002,
                 errmsg: "backend returned empty open_id".into(),
-            })?;
-        Ok(Code2SessionResp { openid })
+            }
+        })?;
+        Ok(Code2SessionResp {
+            openid: data.open_id,
+            // An empty string is the same as absent — a backend that sends
+            // `"breed": ""` for "no opinion" must not push the tenant onto a
+            // breed literally named "".
+            breed: data.breed.map(|b| b.trim().to_string()).filter(|b| !b.is_empty()),
+        })
     }
 }
