@@ -43,11 +43,22 @@ scripts/push-breed.sh --breed shangji --dir ./breed
 ├── IDENTITY.md.hbs
 ├── SOUL.md.hbs
 ├── USER.md.hbs
+├── AGENTS.md.hbs          可选，但有就必须推——见下
+├── MEMORY.md.hbs          可选
+├── HEARTBEAT.md.hbs       可选
+├── TOOLS.md.hbs           可选
 ├── skills/<name>/SKILL.md.hbs
 ├── sops/<name>/SOP.toml.hbs
 ├── sops/<name>/SOP.md.hbs
 └── scripts/…              原样拷贝，**不做模板渲染**
 ```
+
+那四个「可选」不是可有可无：zeroclaw 把它们**全部**塞进系统提示词
+（`agent/prompt.rs`），而且 `AGENTS.md` 还驱动 `security/policy.rs`（安全
+策略）、`HEARTBEAT.md` 还驱动 `heartbeat/engine.rs`（定时任务）。在 OpenCode
+工作台里调好的龙虾如果用了它们而品种里没带，推到虾群后会**安静地变成另一
+只**——不报错，只是行为不同。反过来，租户换到不带这些文件的品种时，工作区里
+的旧文件会被**删掉**，不会留着继续生效。
 
 `scripts/` 不渲染是有意的：里面是 Python 源码和二进制资源，满是花括号，
 过一遍 handlebars 只会被改坏。脚本运行期需要的东西从环境变量拿

@@ -594,14 +594,37 @@ fn render_workspace(
     std::fs::create_dir_all(&layout.workspace_dir)?;
     std::fs::create_dir_all(&layout.config_dir)?;
 
-    for fname in &["USER.md", "IDENTITY.md", "SOUL.md"] {
-        render_one(
-            &hb,
-            tpl_dir,
-            &format!("{fname}.hbs"),
-            &layout.workspace_dir.join(fname),
-            ctx,
-        )?;
+    // AGENTS.md / MEMORY.md / HEARTBEAT.md / TOOLS.md are optional, but a
+    // breed that ships them must get them rendered: zeroclaw feeds all four
+    // into the system prompt (`agent/prompt.rs`), and beyond that AGENTS.md
+    // drives `security/policy.rs` while HEARTBEAT.md drives
+    // `heartbeat/engine.rs`. Dropping them turns a lobster that was tuned in
+    // the workbench into a quietly different one on the swarm — no error,
+    // just different behaviour, which is the worst failure mode for a
+    // "what I tested is what runs" pipeline. `render_one` skips templates
+    // that aren't there, so breeds that don't use them are unaffected.
+    for fname in &[
+        "USER.md",
+        "IDENTITY.md",
+        "SOUL.md",
+        "AGENTS.md",
+        "MEMORY.md",
+        "HEARTBEAT.md",
+        "TOOLS.md",
+    ] {
+        let out = layout.workspace_dir.join(fname);
+        let tpl = tpl_dir.join(format!("{fname}.hbs"));
+        if tpl.exists() {
+            render_one(&hb, tpl_dir, &format!("{fname}.hbs"), &out, ctx)?;
+        } else if out.exists() {
+            // The breed no longer defines this file, so it must not stay in
+            // the workspace. `render_one` alone only skips, which would let a
+            // tenant moved off a breed keep running the old breed's
+            // AGENTS.md security policy and HEARTBEAT.md schedule forever —
+            // the same "capability the operator believes they removed" trap
+            // that render_tree avoids by clearing skills/ and sops/ first.
+            std::fs::remove_file(&out)?;
+        }
     }
     render_one(
         &hb,
@@ -696,4 +719,85 @@ fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> Result<(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::UserHomeLayout;
+
+    fn write(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
+        std::fs::write(path, body).expect("write");
+    }
+
+    /// A breed carrying the four optional workspace files must get all of
+    /// them rendered. They are not decoration: zeroclaw puts all four in the
+    /// system prompt, and AGENTS.md additionally feeds `security/policy.rs`
+    /// while HEARTBEAT.md feeds `heartbeat/engine.rs`. Before breeds existed
+    /// only three .md files were ever written, so a lobster tuned in the
+    /// OpenCode workbench would arrive on the swarm quietly missing its
+    /// security policy and its schedule.
+    #[test]
+    fn renders_the_optional_workspace_files_a_breed_ships() {
+        let tmp = std::env::temp_dir().join(format!("clawops-breed-{}", uuid::Uuid::new_v4().simple()));
+        let tpl = tmp.join("tpl");
+        for f in [
+            "USER.md", "IDENTITY.md", "SOUL.md",
+            "AGENTS.md", "MEMORY.md", "HEARTBEAT.md", "TOOLS.md",
+        ] {
+            write(&tpl.join(format!("{f}.hbs")), &format!("# {f} for {{{{display_name}}}}\n"));
+        }
+        write(&tpl.join("config.toml.hbs"), "port = {{port}}\n");
+
+        let layout = UserHomeLayout::new(&tmp.join("home"), "claw-001");
+        let ctx = serde_json::json!({"display_name": "测试租户", "port": 42001});
+        render_workspace(&tpl, &layout, &ctx).expect("render");
+
+        for f in [
+            "USER.md", "IDENTITY.md", "SOUL.md",
+            "AGENTS.md", "MEMORY.md", "HEARTBEAT.md", "TOOLS.md",
+        ] {
+            let got = std::fs::read_to_string(layout.workspace_dir.join(f))
+                .unwrap_or_else(|e| panic!("{f} missing from workspace: {e}"));
+            assert!(got.contains("测试租户"), "{f} was not rendered: {got:?}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Moving a tenant to a breed that does not define one of these files
+    /// must remove it. Leaving it behind would keep the previous breed's
+    /// AGENTS.md policy and HEARTBEAT.md schedule live on a tenant the
+    /// operator believes they moved off it.
+    #[test]
+    fn drops_a_workspace_file_the_new_breed_no_longer_defines() {
+        let tmp = std::env::temp_dir().join(format!("clawops-breed-{}", uuid::Uuid::new_v4().simple()));
+        let rich = tmp.join("rich");
+        let plain = tmp.join("plain");
+        for d in [&rich, &plain] {
+            write(&d.join("SOUL.md.hbs"), "soul {{display_name}}\n");
+            write(&d.join("config.toml.hbs"), "port = {{port}}\n");
+        }
+        write(&rich.join("HEARTBEAT.md.hbs"), "every day {{display_name}}\n");
+        write(&rich.join("AGENTS.md.hbs"), "policy {{display_name}}\n");
+
+        let layout = UserHomeLayout::new(&tmp.join("home"), "claw-002");
+        let ctx = serde_json::json!({"display_name": "甲", "port": 42002});
+
+        render_workspace(&rich, &layout, &ctx).expect("render rich");
+        assert!(layout.workspace_dir.join("HEARTBEAT.md").exists());
+        assert!(layout.workspace_dir.join("AGENTS.md").exists());
+
+        render_workspace(&plain, &layout, &ctx).expect("render plain");
+        assert!(
+            !layout.workspace_dir.join("HEARTBEAT.md").exists(),
+            "stale HEARTBEAT.md survived the breed switch"
+        );
+        assert!(
+            !layout.workspace_dir.join("AGENTS.md").exists(),
+            "stale AGENTS.md survived the breed switch"
+        );
+        assert!(layout.workspace_dir.join("SOUL.md").exists(), "SOUL.md must stay");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
