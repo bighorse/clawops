@@ -94,11 +94,28 @@ mock backend 下 `/chat` 返回固定 echo,不会真的拉起 zeroclaw。
 
 ## 生产部署(Linux + systemd)
 
-1. 确认 OS 和 systemd 版本:`cat /etc/os-release && systemctl --version | head -1` —— 要求 Ubuntu 20.04+ 或 CentOS 8+ / Anolis OS(systemd ≥ 245)。CentOS 7 不支持。
-2. 安装 zeroclaw binary 到 `/usr/local/bin/zeroclaw`。
-3. 把 `systemd/zeroclaw@.service` 放到 `/etc/systemd/user/`。
-4. ClawOps 以 root 或具备 `useradd/loginctl/systemctl` NOPASSWD sudo 权限的用户运行。
-5. `clawops.toml` 中 `provisioner.backend = "systemd"`。
+```bash
+git clone https://github.com/bighorse/clawops.git /opt/clawops
+bash /opt/clawops/scripts/server-bootstrap.sh   # 系统包 + 目录 + systemd unit
+vi /etc/clawops/clawops.toml                    # 照 clawops.example.toml 改
+bash /opt/clawops/scripts/deploy.sh --ref main  # 构建、原子换二进制、重启、下发
+```
+
+`deploy.sh` 幂等,健康检查不过会**自动回滚到上一个二进制**。逐步骤说明、
+配置样例、以及一份「公网开放前的检查清单」见
+[`docs/deploy-baidu.md`](docs/deploy-baidu.md)。
+
+要求:Ubuntu 20.04+ 或 CentOS 8+ / Anolis OS(systemd ≥ 245),CentOS 7 不支持。
+ClawOps 以 root 运行(要 `useradd` / `loginctl` / `systemctl --user`)。
+
+## 对接文档
+
+| 文档 | 给谁看 |
+|---|---|
+| [`docs/breed-sync.md`](docs/breed-sync.md) | 品种机制的接口契约 |
+| [`docs/opencode-deploy-skill.md`](docs/opencode-deploy-skill.md) | OpenCode 端:部署技能怎么改 |
+| [`docs/wecom-gateway-auth.md`](docs/wecom-gateway-auth.md) | 企微网关端:认证怎么收敛 |
+| [`docs/deploy-baidu.md`](docs/deploy-baidu.md) | 运维:上新机器的完整手册 |
 
 ## 后续(未实施)
 

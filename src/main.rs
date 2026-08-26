@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
-#[command(name = "clawops", about = "ZeroClaw multi-tenant ops gateway")]
+#[command(name = "clawops", version, about = "ZeroClaw multi-tenant ops gateway")]
 struct Cli {
     /// Path to clawops.toml.
     #[arg(short, long, default_value = "clawops.toml", global = true)]
