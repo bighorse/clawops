@@ -202,6 +202,34 @@ impl Provisioner {
     /// Everything the handlebars templates can read. Built once and shared
     /// by provision and refresh — when the two drifted apart, a field added
     /// for provisioning silently rendered empty on every later refresh.
+    /// A context shaped exactly like a real tenant's, for rendering a breed
+    /// at install time so it can be inspected before anyone is put on it.
+    ///
+    /// Deliberately goes through `build_ctx` rather than hand-rolling a
+    /// lookalike: the point is to see what tenants will see, and a second
+    /// implementation would drift from the first exactly when it matters.
+    pub fn probe_ctx(&self, breed: &str) -> serde_json::Value {
+        let user = users::User {
+            openid: "probe:lint".into(),
+            phone: None,
+            display_name: Some("预检租户".into()),
+            avatar_url: None,
+            enterprise_profile: None,
+            linux_uid: "claw-probe".into(),
+            workspace_path: String::new(),
+            port: None,
+            paired_token_enc: None,
+            status: "probe".into(),
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            last_error: None,
+            pending_sop_name: None,
+            breed: breed.to_string(),
+        };
+        let layout = UserHomeLayout::new(&self.cfg.zeroclaw.home_base, &user.linux_uid);
+        self.build_ctx(&user, 40000, &layout, "probe-paired-token")
+    }
+
     fn build_ctx(
         &self,
         user: &users::User,

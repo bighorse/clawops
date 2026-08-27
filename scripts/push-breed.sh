@@ -133,11 +133,29 @@ DIGEST=$(local_digest)
 FILES=$(bundle_files | wc -l | tr -d ' ')
 echo "breed=$BREED files=$FILES digest=$DIGEST"
 
-if [[ $DRY_RUN -eq 1 ]]; then
-  echo "dry-run: nothing sent"
-  exit 0
-fi
 [[ -n "$TOKEN" ]] || die "no admin token (--token or \$CLAWOPS_ADMIN_TOKEN)"
+
+# A dry run asks the server, rather than answering locally. The checks that
+# matter — does the config render into valid TOML, does the price table match
+# the model that will actually run, can the model read its own skills — all
+# depend on the swarm's own settings, which only the swarm knows. Answering
+# here would mean guessing, and guessing right up until the day it matters.
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "dry-run: asking $URL to validate (nothing will be installed)"
+  OUT=$(tar -C "$DIR" $(bundle_files | sed 's/^/--include=/') -czf - . 2>/dev/null \
+        | curl -s -w '\n%{http_code}' -X PUT --data-binary @- \
+            -H "X-Admin-Token: $TOKEN" -H 'Content-Type: application/gzip' \
+            "$URL/admin/breeds/$BREED?dry_run=true")
+  CODE=$(printf '%s' "$OUT" | tail -1)
+  printf '%s' "$OUT" | sed '$d'
+  echo
+  if [[ "$CODE" == "200" ]]; then
+    echo "dry-run: accepted (warnings above, if any)"
+    exit 0
+  fi
+  echo "dry-run: REJECTED (HTTP $CODE) — fix the errors above before pushing" >&2
+  exit 2
+fi
 
 # ── 4. skip a no-op ─────────────────────────────────────────────────
 if [[ $FORCE -eq 0 ]]; then

@@ -286,11 +286,23 @@ async fn main() -> anyhow::Result<()> {
             no_refresh,
         } => {
             let bytes = std::fs::read(&bundle)?;
-            let info = clawops::breeds::install(&cfg, &breed, &bytes)?;
+            // Same gate as the HTTP path. Installing on the box is not a
+            // reason to skip the checks — the first breed that needed them
+            // was pushed by someone with a shell on the server.
+            let (info, warnings) = clawops::breeds::install_checked(
+                &cfg,
+                &breed,
+                &bytes,
+                false,
+                |b| provisioner.probe_ctx(b),
+            )?;
             println!(
                 "installed breed={} files={} digest={} path={}",
                 info.name, info.files, info.digest, info.path
             );
+            for w in &warnings {
+                eprintln!("  ⚠️  [{}] {}", w.rule, w.message);
+            }
             if no_refresh {
                 println!("skipped rollout (--no-refresh)");
             } else {

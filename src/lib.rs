@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod breed_lint;
 pub mod breeds;
 pub mod chat_history;
 pub mod config;

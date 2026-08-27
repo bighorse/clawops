@@ -199,6 +199,146 @@ pub fn list(cfg: &Config, tenant_counts: &BTreeMap<String, i64>) -> Result<Vec<B
 /// template that fails to compile is the single most common way a push
 /// breaks a swarm, and it costs nothing to catch here instead of at the
 /// next provision.
+
+/// Read every file of a staged tree as text, for the linter. Binary assets
+/// (fonts, images under `scripts/`) are skipped rather than failing: they
+/// are legitimate breed content and nothing in the lint rules reads them.
+pub fn read_sources(dir: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for rel in manifest(dir)?.keys() {
+        if let Ok(text) = std::fs::read_to_string(dir.join(rel)) {
+            out.insert(rel.clone(), text);
+        }
+    }
+    Ok(out)
+}
+
+/// Install a bundle, but only after checking that it renders into something
+/// a tenant can actually run.
+///
+/// `validate_tree` proves the templates parse. That is not the same as
+/// proving they *work*: the first hand-authored breed compiled cleanly and
+/// still shipped a model name pointed at the wrong endpoint, a skill whose
+/// instructions the model was forbidden to read, and a knowledge file that
+/// every render would delete. None of those are typos, so none of them were
+/// catchable before rendering — which is what this does, using the same
+/// context a real tenant gets.
+///
+/// Findings at `Error` level abort before anything is written. Warnings are
+/// returned for the caller to surface. With `dry_run` nothing is installed
+/// either way, so the development side can ask "would this be accepted?"
+/// without touching the swarm.
+pub fn install_checked(
+    cfg: &Config,
+    breed: &str,
+    bundle: &[u8],
+    dry_run: bool,
+    probe_ctx: impl FnOnce(&str) -> serde_json::Value,
+) -> Result<(BreedInfo, Vec<crate::breed_lint::Finding>)> {
+    validate_name(breed)?;
+    if breed == cfg.provisioner.default_breed || breed == DEFAULT_BREED {
+        return Err(Error::BadBundle(format!(
+            "'{breed}' is the built-in breed backed by provisioner.template_dir; \
+             push under a different name"
+        )));
+    }
+    let root = breeds_root(cfg)?;
+    std::fs::create_dir_all(root)?;
+
+    // Unpack somewhere disposable and inspect it there, so a rejected
+    // bundle never touches the directory tenants render from.
+    let staging = root.join(format!("{STAGING_PREFIX}{breed}-{}", uuid::Uuid::new_v4().simple()));
+    let checked = (|| -> Result<(Vec<crate::breed_lint::Finding>, BTreeMap<String, String>)> {
+        std::fs::create_dir_all(&staging)?;
+        unpack(bundle, &staging, cfg.provisioner.max_bundle_bytes)?;
+        validate_tree(&staging)?;
+
+        let sources = read_sources(&staging)?;
+        let ctx = probe_ctx(breed);
+        let tpl = sources.get("config.toml.hbs").cloned().unwrap_or_default();
+        let hb = handlebars::Handlebars::new();
+        let rendered = hb.render_template(&tpl, &ctx).map_err(|e| {
+            Error::BadBundle(format!("config.toml.hbs failed to render: {e}"))
+        })?;
+
+        let tpl_cfg = &cfg.zeroclaw_template;
+        let findings = crate::breed_lint::lint(&crate::breed_lint::Input {
+            sources: &sources,
+            rendered_config: &rendered,
+            swarm_provider: &tpl_cfg.default_provider,
+            swarm_api_url: tpl_cfg.api_url.as_deref().unwrap_or_default(),
+        });
+        Ok((findings, sources))
+    })();
+
+    let (findings, _sources) = match checked {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    let errors: Vec<&crate::breed_lint::Finding> = findings
+        .iter()
+        .filter(|f| f.level == crate::breed_lint::Level::Error)
+        .collect();
+    if !errors.is_empty() {
+        let detail = errors
+            .iter()
+            .map(|f| format!("[{}] {}", f.rule, f.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(Error::BadBundle(format!(
+            "品种校验未通过（{} 项）：\n{detail}",
+            errors.len()
+        )));
+    }
+
+    let warnings: Vec<crate::breed_lint::Finding> = findings
+        .into_iter()
+        .filter(|f| f.level == crate::breed_lint::Level::Warning)
+        .collect();
+
+    if dry_run {
+        let files = manifest(&staging)?.len();
+        let digest = digest_of(&manifest(&staging)?);
+        let _ = std::fs::remove_dir_all(&staging);
+        return Ok((
+            BreedInfo {
+                name: breed.to_string(),
+                path: root.join(breed).display().to_string(),
+                files,
+                digest,
+                builtin: false,
+                tenants: 0,
+            },
+            warnings,
+        ));
+    }
+
+    let live = root.join(breed);
+    let trash = root.join(format!("{TRASH_PREFIX}{breed}-{}", uuid::Uuid::new_v4().simple()));
+    let had_previous = live.exists();
+    if had_previous {
+        std::fs::rename(&live, &trash)?;
+    }
+    if let Err(e) = std::fs::rename(&staging, &live) {
+        if had_previous {
+            let _ = std::fs::rename(&trash, &live);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e.into());
+    }
+    let _ = std::fs::remove_dir_all(&trash);
+
+    let info = describe(cfg, breed, 0)?.ok_or_else(|| {
+        Error::Other(format!("breed '{breed}' unreadable immediately after install"))
+    })?;
+    Ok((info, warnings))
+}
+
 pub fn install(cfg: &Config, breed: &str, bundle: &[u8]) -> Result<BreedInfo> {
     validate_name(breed)?;
     if breed == cfg.provisioner.default_breed || breed == DEFAULT_BREED {

@@ -1106,6 +1106,11 @@ struct PutBreedQuery {
     /// a breed before anyone is on it.
     #[serde(default = "default_true")]
     refresh: bool,
+    /// Validate the bundle and report findings without installing anything.
+    /// Lets the development side get the authoritative verdict — the same
+    /// code that would reject the push — before touching the swarm.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 fn default_true() -> bool {
@@ -1126,13 +1131,32 @@ async fn admin_put_breed(
     Query(q): Query<PutBreedQuery>,
     body: axum::body::Bytes,
 ) -> std::result::Result<impl IntoResponse, Error> {
-    let info = crate::breeds::install(&st.cfg, &breed, &body)?;
+    let (info, findings) = crate::breeds::install_checked(
+        &st.cfg,
+        &breed,
+        &body,
+        q.dry_run,
+        |b| st.provisioner.probe_ctx(b),
+    )?;
+    if q.dry_run {
+        return Ok(Json(serde_json::json!({
+            "breed": breed,
+            "dry_run": true,
+            "digest": info.digest,
+            "files": info.files,
+            "findings": findings,
+        })));
+    }
     tracing::info!(
         breed = %breed,
         digest = %info.digest,
         files = info.files,
+        warnings = findings.len(),
         "breed bundle installed"
     );
+    for f in &findings {
+        tracing::warn!(breed = %breed, rule = f.rule, "{}", f.message);
+    }
 
     let (refreshed, failures) = if q.refresh {
         st.provisioner.refresh_breed(&breed).await?
@@ -1156,6 +1180,7 @@ async fn admin_put_breed(
         "tenants": counts.get(&breed).copied().unwrap_or(0),
         "refreshed": refreshed,
         "failures": failures,
+        "warnings": findings,
     })))
 }
 
