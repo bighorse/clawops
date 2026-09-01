@@ -419,6 +419,22 @@ struct WebLoginReq {
     display_name: Option<String>,
     #[serde(default)]
     avatar_url: Option<String>,
+    /// Which breed to render this tenant from, when the call creates them.
+    ///
+    /// Safe to accept here, unlike on `/auth/wx-login`: that route is public
+    /// and unauthenticated, so a client-supplied breed would let any user
+    /// pick their own persona, skills and tool permissions. This one sits
+    /// behind `AdminGuard` — the caller is the customer's own backend, which
+    /// already knows which line of business the user belongs to, and saying
+    /// so beats making ClawOps infer it.
+    ///
+    /// Omitted means `provisioner.default_breed`, so existing callers keep
+    /// working unchanged. Applied **only when the tenant is created**: a
+    /// login must never move an existing tenant, because that restarts their
+    /// daemon and strips the previous breed's skills out of their workspace.
+    /// Use `PUT /admin/users/<openid>/breed` for a deliberate move.
+    #[serde(default)]
+    breed: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -465,11 +481,10 @@ async fn web_login(
             display_name: req.display_name,
             avatar_url: req.avatar_url,
             enterprise_profile: None,
-            // This instance serves one breed, so the default is right. The
-            // route is admin-guarded like wecom-login, so adding an optional
-            // `breed` here later is safe — unlike wx-login, the caller is
-            // trusted. Left out until something actually needs it.
-            breed: None,
+            // An unknown breed is rejected by `provision` before a linux uid
+            // or DB row is spent, so a typo fails the call instead of
+            // stranding the tenant on templates that render nothing.
+            breed: req.breed,
         };
         st.provisioner.provision(&new).await?;
     } else if req.display_name.is_some() || req.avatar_url.is_some() {
@@ -2525,6 +2540,27 @@ fn extract_qualification_company(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The contract external callers depend on: `breed` is optional, so a
+    /// backend written before breeds existed keeps working untouched. Worth
+    /// pinning — the customer's WeCom and Web backends both call these, and
+    /// making the field required would break them silently at deploy time.
+    #[test]
+    fn login_breed_is_optional_and_parsed_when_present() {
+        let without: WebLoginReq =
+            serde_json::from_str(r#"{"user_id":"u-1"}"#).expect("pre-breed payload must still parse");
+        assert_eq!(without.breed, None, "omitted breed must fall back, not fail");
+
+        let with: WebLoginReq =
+            serde_json::from_str(r#"{"user_id":"u-1","breed":"ai-staff"}"#).expect("must parse");
+        assert_eq!(with.breed.as_deref(), Some("ai-staff"));
+
+        // Same guarantee on the WeCom path, which the bot backend calls.
+        let wecom: WecomLoginReq =
+            serde_json::from_str(r#"{"uin":"7881"}"#).expect("pre-breed payload must still parse");
+        assert_eq!(wecom.breed, None);
+    }
+
     use super::*;
 
     #[test]
