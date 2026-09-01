@@ -47,6 +47,19 @@ pub async fn get(pool: &SqlitePool, openid: &str) -> Result<Option<User>> {
     Ok(row)
 }
 
+/// Look a tenant up by the linux account that runs their daemon.
+///
+/// Used by the download proxy: a signed link produced inside a tenant's
+/// workspace carries `claw-0NN` rather than their openid, so a URL that
+/// gets forwarded or pasted somewhere does not also leak who they are.
+pub async fn get_by_linux_uid(pool: &SqlitePool, linux_uid: &str) -> Result<Option<User>> {
+    let u = sqlx::query_as::<_, User>("SELECT * FROM users WHERE linux_uid = ?")
+        .bind(linux_uid)
+        .fetch_optional(pool)
+        .await?;
+    Ok(u)
+}
+
 pub async fn get_required(pool: &SqlitePool, openid: &str) -> Result<User> {
     get(pool, openid)
         .await?

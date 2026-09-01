@@ -7,7 +7,7 @@ use crate::sop_tasks;
 use crate::{chat_history, sessions, users, Error, Result};
 use axum::body::Body;
 use axum::extract::FromRequestParts;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -82,6 +82,10 @@ pub fn router(state: AppState) -> Router {
     let bundle_limit = axum::extract::DefaultBodyLimit::max(state.cfg.provisioner.max_bundle_bytes);
     let r = Router::new()
         .route("/health", get(health))
+        // Public on purpose: the signed link a tenant hands its user has to
+        // work from a chat bubble, with no session. Access is gated by the
+        // HMAC the daemon itself verifies, not by this route.
+        .route("/dl/:linux_uid/download/*path", get(download_proxy))
         .route("/auth/wx-login", post(wx_login))
         .route("/auth/wecom-login", post(wecom_login))
         .route("/auth/web-login", post(web_login))
@@ -1091,8 +1095,24 @@ async fn update_my_profile(
 // Every path is confined to `<workspace>/briefs/` and must resolve (after
 // symlink resolution) back inside it — see `resolve_artifact_path`.
 
-/// Deliverables live here, relative to the workspace root.
-const ARTIFACT_SUBDIR: &str = "briefs";
+/// Workspace subdirectories holding deliverables, from config.
+///
+/// Was a single `briefs` constant. That held while every breed delivered
+/// through the quick-review SOP, and broke silently the day one wrote its
+/// reports to `analyses/`: the files were there, `/me/artifacts` could not
+/// see them, and the daemon fell back to advertising its own loopback link.
+///
+/// Each entry must be a plain directory name — a component with a slash or
+/// a `..` would escape the workspace, so those are dropped rather than
+/// trusted.
+fn artifact_dirs(cfg: &Config) -> Vec<&str> {
+    cfg.server
+        .artifact_dirs
+        .iter()
+        .map(String::as_str)
+        .filter(|d| !d.is_empty() && !d.contains('/') && !d.contains('\\') && *d != ".." && *d != ".")
+        .collect()
+}
 
 #[derive(Serialize)]
 struct ArtifactEntry {
@@ -1133,7 +1153,10 @@ struct ArtifactResp {
 /// relocate the trust anchor itself, making the prefix check below vacuous.
 /// Keeping the base literal means a swapped-out directory resolves the
 /// *candidate* somewhere outside the expected prefix, and the check fires.
-async fn artifact_root_for(st: &AppState, openid: &str) -> Result<std::path::PathBuf> {
+async fn artifact_roots_for(
+    st: &AppState,
+    openid: &str,
+) -> Result<Vec<(String, std::path::PathBuf)>> {
     let user = users::get_required(&st.pool, openid).await?;
     let home_base = st
         .cfg
@@ -1141,11 +1164,14 @@ async fn artifact_root_for(st: &AppState, openid: &str) -> Result<std::path::Pat
         .home_base
         .canonicalize()
         .unwrap_or_else(|_| st.cfg.zeroclaw.home_base.clone());
-    Ok(home_base
+    let ws = home_base
         .join(&user.linux_uid)
         .join(".zeroclaw")
-        .join("workspace")
-        .join(ARTIFACT_SUBDIR))
+        .join("workspace");
+    Ok(artifact_dirs(&st.cfg)
+        .into_iter()
+        .map(|d| (d.to_string(), ws.join(d)))
+        .collect())
 }
 
 /// Resolve a client-supplied relative path, refusing anything that escapes
@@ -1177,9 +1203,14 @@ fn resolve_artifact_path(
     // we handed them (`briefs/x/y.md`) or one relative to it (`x/y.md`).
     // Component-wise, not `str::strip_prefix` — the latter would turn
     // `briefs-evil/x.md` into `-evil/x.md` and silently read the wrong file.
+    // Strip the root's own name when the caller included it, component-wise
+    // rather than by string prefix — `str::strip_prefix` would turn
+    // `briefs-evil/x.md` into `-evil/x.md` and read the wrong file.
     let rel_path = std::path::Path::new(rel);
-    let inner = rel_path
-        .strip_prefix(ARTIFACT_SUBDIR)
+    let inner = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| rel_path.strip_prefix(n).ok())
         .unwrap_or(rel_path);
 
     let real = root
@@ -1259,6 +1290,97 @@ fn read_artifact(path: &std::path::Path) -> Result<(String, std::fs::Metadata)> 
     Ok((content, meta))
 }
 
+/// GET /dl/:linux_uid/download/*path — hand a tenant's signed download link
+/// back to the outside world.
+///
+/// A daemon that produces a file mints an HMAC-signed URL for it, so the user
+/// can click through from chat without a session. But a daemon only knows its
+/// own loopback address, so unaided it advertises `http://127.0.0.1:<port>/…`
+/// — right on the box, useless in a browser. This route is the public end of
+/// that link: it resolves the tenant, forwards the request to their daemon,
+/// and streams the file back.
+///
+/// It deliberately does **not** check the signature. The daemon holds the
+/// secret and verifies it on arrival; duplicating that here would mean
+/// duplicating the secret, and a second copy is a second thing to get wrong.
+///
+/// Security boundary, all four parts load-bearing:
+///
+/// 1. **Only `/download/`.** The path is rebuilt from the captured suffix, so
+///    no request can be steered at `/chat`, `/pair` or anything else the
+///    daemon exposes. Without this the route is an open proxy into every
+///    tenant's gateway.
+/// 2. **Port comes from the database**, never from the URL — so this cannot
+///    be pointed at an arbitrary host or port.
+/// 3. **`linux_uid` must match a real tenant**, and its shape is checked
+///    first so a crafted value can't reach the query as something exotic.
+/// 4. **The signature still gates access.** Knowing a `claw-0NN` is not
+///    enough; the daemon rejects anything unsigned or expired.
+///
+/// The link carries `claw-0NN` rather than an openid on purpose: these URLs
+/// get forwarded and pasted around, and the linux account says nothing about
+/// who the tenant is.
+async fn download_proxy(
+    State(st): State<AppState>,
+    Path((linux_uid, path)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> std::result::Result<axum::response::Response, Error> {
+    // Shape check before the lookup: `claw-` plus digits is the whole
+    // vocabulary the provisioner creates.
+    let shaped = linux_uid.len() <= 32
+        && linux_uid.starts_with("claw-")
+        && linux_uid[5..].chars().all(|c| c.is_ascii_digit())
+        && linux_uid.len() > 5;
+    if !shaped {
+        return Err(Error::NotFound("not found".into()));
+    }
+
+    let user = users::get_by_linux_uid(&st.pool, &linux_uid)
+        .await?
+        .ok_or_else(|| Error::NotFound("not found".into()))?;
+    let port = user
+        .port
+        .and_then(|p| u16::try_from(p).ok())
+        .ok_or_else(|| Error::NotFound("not found".into()))?;
+
+    // Re-encode as one segment, the same shape the daemon signed and the
+    // same shape it produced — axum handed us the decoded form.
+    let upstream = format!(
+        "http://127.0.0.1:{port}/download/{}{}",
+        urlencoding::encode(&path),
+        match query.as_deref() {
+            Some(q) if !q.is_empty() => format!("?{q}"),
+            _ => String::new(),
+        }
+    );
+
+    let resp = st
+        .http
+        .get(&upstream)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("download upstream unreachable: {e}")))?;
+
+    let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let mut builder = axum::response::Response::builder().status(status);
+    // Carry over only what a download needs. Copying every header would drag
+    // the daemon's own CORS and cookie decisions into a different origin.
+    for h in ["content-type", "content-length", "content-disposition"] {
+        if let Some(v) = resp.headers().get(h) {
+            builder = builder.header(h, v);
+        }
+    }
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| Error::Other(format!("download upstream failed: {e}")))?;
+    builder
+        .body(axum::body::Body::from(body))
+        .map_err(|e| Error::Other(format!("download response build failed: {e}")))
+}
+
 /// GET /me/artifacts — list this tenant's markdown deliverables, newest first.
 ///
 /// Returns an empty list (not an error) when the tenant has produced nothing
@@ -1267,17 +1389,20 @@ async fn list_my_artifacts(
     State(st): State<AppState>,
     AuthOpenid(openid): AuthOpenid,
 ) -> std::result::Result<Json<ArtifactsResp>, Error> {
-    let base = artifact_root_for(&st, &openid).await?;
-    // Reject a swapped-out root outright: if `briefs` (or any parent) is a
-    // symlink, listing it would enumerate someone else's directory.
-    if std::fs::symlink_metadata(&base)
-        .map(|m| !m.file_type().is_dir())
-        .unwrap_or(true)
-    {
-        return Ok(Json(ArtifactsResp { artifacts: Vec::new() }));
-    }
     let mut out: Vec<ArtifactEntry> = Vec::new();
-    collect_markdown(&base, &base, 0, &mut out);
+    for (dir, base) in artifact_roots_for(&st, &openid).await? {
+        // Reject a swapped-out root outright: if the directory (or any
+        // parent) is a symlink, listing it would enumerate someone else's
+        // files. A breed that never writes there simply has no directory,
+        // which is not an error — skip it.
+        if std::fs::symlink_metadata(&base)
+            .map(|m| !m.file_type().is_dir())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        collect_markdown(&dir, &base, &base, 0, &mut out);
+    }
     out.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
     Ok(Json(ArtifactsResp { artifacts: out }))
 }
@@ -1286,6 +1411,7 @@ async fn list_my_artifacts(
 /// listing that skips an unreadable subdirectory beats failing the whole
 /// request.
 fn collect_markdown(
+    dir_name: &str,
     base: &std::path::Path,
     dir: &std::path::Path,
     depth: usize,
@@ -1309,7 +1435,7 @@ fn collect_markdown(
             continue;
         }
         if meta.is_dir() {
-            collect_markdown(base, &path, depth + 1, out);
+            collect_markdown(dir_name, base, &path, depth + 1, out);
             continue;
         }
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -1332,7 +1458,7 @@ fn collect_markdown(
         }
         let rel = path
             .strip_prefix(base)
-            .map(|p| format!("{ARTIFACT_SUBDIR}/{}", p.display()))
+            .map(|p| format!("{dir_name}/{}", p.display()))
             .unwrap_or_else(|_| name.clone());
         out.push(ArtifactEntry {
             path: rel,
@@ -1349,7 +1475,17 @@ async fn get_my_artifact(
     AuthOpenid(openid): AuthOpenid,
     Path(rel): Path<String>,
 ) -> std::result::Result<Json<ArtifactResp>, Error> {
-    let root = artifact_root_for(&st, &openid).await?;
+    // The first component picks the root. Anything else keeps the old
+    // behaviour of being read relative to the first configured directory,
+    // so links handed out before this became a list still resolve.
+    let roots = artifact_roots_for(&st, &openid).await?;
+    let head = rel.split('/').next().unwrap_or_default();
+    let root = roots
+        .iter()
+        .find(|(d, _)| d == head)
+        .or_else(|| roots.first())
+        .map(|(_, p)| p.clone())
+        .ok_or_else(|| Error::NotFound("artifact not found".into()))?;
     let real = resolve_artifact_path(&root, &rel)?;
     let (content, meta) = read_artifact(&real)?;
     let name = real
@@ -2540,6 +2676,57 @@ fn extract_qualification_company(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The listing gained a second root the day a breed wrote its reports
+    /// somewhere other than `briefs/`. Widening a path-confined endpoint is
+    /// exactly where confinement gets lost, so pin both halves: the new
+    /// directory is reachable, and nothing outside either root is.
+    #[test]
+    fn artifact_paths_stay_inside_their_root() {
+        // Canonicalise the base first: on macOS `/tmp` is a symlink to
+        // `/private/tmp`, and the containment check compares the resolved
+        // path against the literal root. Production canonicalises
+        // `home_base` for the same reason.
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp dir")
+            .join(format!("clawops-art-{}", std::process::id()));
+        let briefs = tmp.join("briefs");
+        let analyses = tmp.join("analyses");
+        std::fs::create_dir_all(analyses.join("acme")).expect("mkdir");
+        std::fs::create_dir_all(&briefs).expect("mkdir");
+        std::fs::write(briefs.join("b.md"), "b").expect("write");
+        std::fs::write(analyses.join("acme").join("report.md"), "r").expect("write");
+        // A file the endpoint must never reach, one level above both roots.
+        std::fs::write(tmp.join("secret.md"), "s").expect("write");
+
+        // Reachable: with the root's own name, and without it.
+        assert!(resolve_artifact_path(&analyses, "analyses/acme/report.md").is_ok());
+        assert!(resolve_artifact_path(&analyses, "acme/report.md").is_ok());
+        assert!(resolve_artifact_path(&briefs, "briefs/b.md").is_ok());
+
+        // Not reachable: traversal out of the root, the sibling root's file
+        // through the wrong root, absolute paths, non-markdown.
+        for bad in [
+            "../secret.md",
+            "analyses/../../secret.md",
+            "../briefs/b.md",
+            "/etc/passwd",
+            "acme/report.txt",
+        ] {
+            assert!(
+                resolve_artifact_path(&analyses, bad).is_err(),
+                "must not resolve: {bad}"
+            );
+        }
+
+        // A directory named like the root but longer must not be treated as
+        // the root — the component-wise strip is what prevents that.
+        assert!(resolve_artifact_path(&analyses, "analyses-evil/x.md").is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
 
     /// The contract external callers depend on: `breed` is optional, so a
     /// backend written before breeds existed keeps working untouched. Worth

@@ -252,6 +252,20 @@ impl Provisioner {
             "avatar_url": user.avatar_url,
             "linux_uid": user.linux_uid,
             "port": port,
+            // Base URL a tenant advertises for the files it produces. The
+            // daemon signs download links against whatever this is; the HMAC
+            // covers only path+expiry, so pointing it at the gateway is safe.
+            // Falls back to loopback when no public base is configured, which
+            // is exactly the previous behaviour.
+            "download_base_url": if self.cfg.server.public_base_url.is_empty() {
+                format!("http://127.0.0.1:{port}")
+            } else {
+                format!(
+                    "{}/dl/{}",
+                    self.cfg.server.public_base_url.trim_end_matches('/'),
+                    user.linux_uid
+                )
+            },
             "breed": user.breed,
             "workspace_path": layout.workspace_dir,
             "config_dir": layout.config_dir,

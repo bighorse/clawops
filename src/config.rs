@@ -213,10 +213,38 @@ fn default_max_cost_per_day_cents() -> u64 {
     500
 }
 
+fn default_artifact_dirs() -> Vec<String> {
+    vec!["briefs".to_string(), "analyses".to_string()]
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Where this ClawOps is reachable from the outside, including any path
+    /// prefix nginx strips — e.g. `https://ai.infocts.cn/clawops`.
+    ///
+    /// Tenant daemons mint signed download links for the files they produce.
+    /// Left unset, a daemon has nothing to advertise but its own loopback
+    /// address, so the link it hands the user is `http://127.0.0.1:<port>/…`
+    /// — correct on the box, useless in a browser. Setting this lets the
+    /// provisioner give each tenant a base URL that resolves from outside
+    /// and routes back to that tenant through `/dl/<linux_uid>/…`.
+    ///
+    /// Empty keeps the previous loopback behaviour, so existing deployments
+    /// are unchanged until they opt in.
+    #[serde(default)]
+    pub public_base_url: String,
+    /// Workspace subdirectories whose `.md` files `/me/artifacts` lists.
+    ///
+    /// Was hard-coded to `briefs` — correct while every breed produced its
+    /// deliverables through the quick-review SOP, and quietly wrong the
+    /// moment one wrote reports to `analyses/` instead: the files existed,
+    /// the client could not see them, and the daemon fell back to handing
+    /// out its own loopback links. Breeds choose their own output directory,
+    /// so this has to be a list rather than a constant.
+    #[serde(default = "default_artifact_dirs")]
+    pub artifact_dirs: Vec<String>,
     /// Browser origins allowed to call the API cross-site, e.g.
     /// `["https://ai.infocts.cn", "http://localhost:8080"]`.
     ///
