@@ -72,6 +72,14 @@ fn cors_layer(cfg: &Config) -> Option<tower_http::cors::CorsLayer> {
 
 pub fn router(state: AppState) -> Router {
     let cors = cors_layer(&state.cfg);
+    // Breed bundles are the only route that accepts a large body. Axum's
+    // default cap is 2 MiB, which a template tree carrying fonts or
+    // helper scripts clears easily — and a 413 with no body reads as
+    // "the server is broken", not "your bundle is too big". Raise it to
+    // the configured ceiling; `breeds::install` still enforces the same
+    // number against the *decompressed* size, which is the one that
+    // matters.
+    let bundle_limit = axum::extract::DefaultBodyLimit::max(state.cfg.provisioner.max_bundle_bytes);
     let r = Router::new()
         .route("/health", get(health))
         .route("/auth/wx-login", post(wx_login))
@@ -96,6 +104,15 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/issue-token", post(admin_issue_token))
         .route("/admin/refresh-workspace/:openid", post(admin_refresh_workspace))
         .route("/admin/refresh-all-workspaces", post(admin_refresh_all_workspaces))
+        .route("/admin/breeds", get(admin_list_breeds))
+        .route("/admin/breeds/:breed", get(admin_get_breed))
+        .route(
+            "/admin/breeds/:breed",
+            axum::routing::put(admin_put_breed).layer(bundle_limit),
+        )
+        .route("/admin/breeds/:breed", axum::routing::delete(admin_delete_breed))
+        .route("/admin/breeds/:breed/refresh", post(admin_refresh_breed))
+        .route("/admin/users/:openid/breed", axum::routing::put(admin_set_user_breed))
         .route("/internal/sop-event", post(internal_sop_event))
         .with_state(state);
 
@@ -414,6 +431,20 @@ struct WecomLoginReq {
     /// Optional avatar URL fetched from wecom contact profile.
     #[serde(default)]
     avatar_url: Option<String>,
+    /// Optional breed for a tenant being created by this call.
+    ///
+    /// Safe to take from the request here — unlike `/auth/wx-login`, this
+    /// endpoint is `AdminGuard`ed server-to-server, so the caller is the
+    /// wecom bot backend rather than an end-user device. That backend
+    /// already knows which line of business the conversation belongs to,
+    /// which beats making ClawOps infer it from a corp/agent id table.
+    ///
+    /// Omitted means `provisioner.default_breed`, so existing callers keep
+    /// working unchanged. Only applied when the tenant is created: a login
+    /// must not move an existing tenant, because that restarts their
+    /// daemon and strips the old breed's skills.
+    #[serde(default)]
+    breed: Option<String>,
 }
 
 async fn web_login(
@@ -434,6 +465,11 @@ async fn web_login(
             display_name: req.display_name,
             avatar_url: req.avatar_url,
             enterprise_profile: None,
+            // This instance serves one breed, so the default is right. The
+            // route is admin-guarded like wecom-login, so adding an optional
+            // `breed` here later is safe — unlike wx-login, the caller is
+            // trusted. Left out until something actually needs it.
+            breed: None,
         };
         st.provisioner.provision(&new).await?;
     } else if req.display_name.is_some() || req.avatar_url.is_some() {
@@ -472,6 +508,12 @@ async fn wecom_login(
             display_name: req.display_name,
             avatar_url: req.avatar_url,
             enterprise_profile: None,
+            // `None` falls back to `provisioner.default_breed`. A breed
+            // that doesn't exist is rejected by `provision` before any
+            // linux uid or DB row is spent, so a typo here fails the call
+            // instead of stranding a tenant on templates that render
+            // nothing.
+            breed: req.breed,
         };
         st.provisioner.provision(&new).await?;
     } else if req.display_name.is_some() || req.avatar_url.is_some() {
@@ -514,12 +556,23 @@ async fn wx_login(
     let mut is_new_user = false;
     if users::get(&st.pool, &openid).await?.is_none() {
         is_new_user = true;
+        // Breed is decided here, server-side, and never read from the
+        // request body: this endpoint is called by the user's phone with
+        // no authentication beyond an IP rate limit, so a client-supplied
+        // breed would let anyone pick their own persona, skills and tool
+        // access. Precedence: what the exchange backend said, then the
+        // configured app_id route, then `default_breed`.
+        let breed = st
+            .cfg
+            .provisioner
+            .route_breed(session.breed.as_deref(), &req.app_id);
         let new = users::NewUser {
             openid: openid.clone(),
             phone: None,
             display_name: req.display_name,
             avatar_url: req.avatar_url,
             enterprise_profile: req.enterprise_profile,
+            breed,
         };
         st.provisioner.provision(&new).await?;
     } else {
@@ -1330,6 +1383,9 @@ struct ProvisionReq {
     avatar_url: Option<String>,
     #[serde(default)]
     enterprise_profile: Option<serde_json::Value>,
+    /// Omit to get `provisioner.default_breed`.
+    #[serde(default)]
+    breed: Option<String>,
 }
 
 async fn admin_provision(
@@ -1343,6 +1399,7 @@ async fn admin_provision(
         display_name: req.display_name,
         avatar_url: req.avatar_url,
         enterprise_profile: req.enterprise_profile,
+        breed: req.breed,
     };
     let out = st.provisioner.provision(&new).await?;
     Ok(Json(serde_json::json!({
@@ -1351,6 +1408,7 @@ async fn admin_provision(
         "port": out.port,
         "workspace": out.workspace_path,
         "paired": out.paired,
+        "breed": out.breed,
     })))
 }
 
@@ -1427,6 +1485,210 @@ async fn admin_stop(
 ) -> std::result::Result<impl IntoResponse, Error> {
     st.provisioner.stop(&openid).await?;
     Ok(Json(serde_json::json!({"stopped": true, "openid": openid})))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// /admin/breeds/* — push and inspect lobster breeds
+//
+// This is the endpoint a development-side "deploy" command targets: PUT
+// a tarball of a template tree, get back the digest, and the swarm's
+// tenants on that breed are re-rendered. See docs/breed-sync.md.
+// ────────────────────────────────────────────────────────────────────
+
+async fn tenant_counts(pool: &SqlitePool) -> Result<std::collections::BTreeMap<String, i64>> {
+    Ok(users::counts_by_breed(pool).await?.into_iter().collect())
+}
+
+/// GET /admin/breeds — every breed this box can render, with the digest
+/// of its template tree and how many tenants are on it.
+async fn admin_list_breeds(
+    _: AdminGuard,
+    State(st): State<AppState>,
+) -> std::result::Result<impl IntoResponse, Error> {
+    let counts = tenant_counts(&st.pool).await?;
+    let breeds = crate::breeds::list(&st.cfg, &counts)?;
+    Ok(Json(serde_json::json!({
+        "default_breed": st.cfg.provisioner.default_breed,
+        "breeds_dir": st.cfg.provisioner.breeds_dir,
+        "breeds": breeds,
+    })))
+}
+
+/// GET /admin/breeds/:breed — the full `path -> sha256` manifest.
+///
+/// Exists so a push can be a no-op when nothing changed: the caller
+/// compares digests and skips the upload (and the daemon restarts it
+/// would cause) if they already match.
+async fn admin_get_breed(
+    _: AdminGuard,
+    State(st): State<AppState>,
+    Path(breed): Path<String>,
+) -> std::result::Result<impl IntoResponse, Error> {
+    let counts = tenant_counts(&st.pool).await?;
+    let tenants = counts.get(&breed).copied().unwrap_or(0);
+    let info = crate::breeds::describe(&st.cfg, &breed, tenants)?
+        .ok_or_else(|| Error::UnknownBreed(breed.clone()))?;
+    let dir = std::path::PathBuf::from(&info.path);
+    let manifest = crate::breeds::manifest(&dir)?;
+    Ok(Json(serde_json::json!({
+        "breed": info,
+        "manifest": manifest,
+    })))
+}
+
+#[derive(Deserialize)]
+struct PutBreedQuery {
+    /// Re-render every tenant on this breed after installing. Defaults
+    /// to true — a push that leaves live tenants on the old templates is
+    /// almost never what the pusher meant. Set `refresh=false` to stage
+    /// a breed before anyone is on it.
+    #[serde(default = "default_true")]
+    refresh: bool,
+    /// Validate the bundle and report findings without installing anything.
+    /// Lets the development side get the authoritative verdict — the same
+    /// code that would reject the push — before touching the swarm.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// PUT /admin/breeds/:breed — install a bundle (a tar, gzipped or not,
+/// of the template tree) and roll it out to that breed's tenants.
+///
+/// Returns 200 with the new digest and the per-tenant rollout result.
+/// Rollout failures are reported, not raised: the templates are already
+/// live at that point, so a tenant whose daemon refused to restart is a
+/// thing to go fix, not a reason to claim the push failed.
+async fn admin_put_breed(
+    _: AdminGuard,
+    State(st): State<AppState>,
+    Path(breed): Path<String>,
+    Query(q): Query<PutBreedQuery>,
+    body: axum::body::Bytes,
+) -> std::result::Result<impl IntoResponse, Error> {
+    let (info, findings) = crate::breeds::install_checked(
+        &st.cfg,
+        &breed,
+        &body,
+        q.dry_run,
+        |b| st.provisioner.probe_ctx(b),
+    )?;
+    if q.dry_run {
+        return Ok(Json(serde_json::json!({
+            "breed": breed,
+            "dry_run": true,
+            "digest": info.digest,
+            "files": info.files,
+            "findings": findings,
+        })));
+    }
+    tracing::info!(
+        breed = %breed,
+        digest = %info.digest,
+        files = info.files,
+        warnings = findings.len(),
+        "breed bundle installed"
+    );
+    for f in &findings {
+        tracing::warn!(breed = %breed, rule = f.rule, "{}", f.message);
+    }
+
+    let (refreshed, failures) = if q.refresh {
+        st.provisioner.refresh_breed(&breed).await?
+    } else {
+        (0, Vec::new())
+    };
+    let failures: Vec<serde_json::Value> = failures
+        .into_iter()
+        .map(|(openid, error)| serde_json::json!({"openid": openid, "error": error}))
+        .collect();
+    if !failures.is_empty() {
+        tracing::warn!(breed = %breed, failed = failures.len(), "breed rollout had failures");
+    }
+
+    let counts = tenant_counts(&st.pool).await?;
+    Ok(Json(serde_json::json!({
+        "breed": breed,
+        "digest": info.digest,
+        "files": info.files,
+        "path": info.path,
+        "tenants": counts.get(&breed).copied().unwrap_or(0),
+        "refreshed": refreshed,
+        "failures": failures,
+        "warnings": findings,
+    })))
+}
+
+/// DELETE /admin/breeds/:breed — drop a breed's templates.
+///
+/// Refuses while any tenant is still bound to it: deleting the templates
+/// out from under a live tenant turns their next refresh into a 404 and
+/// leaves them frozen on whatever is on disk in their workspace.
+async fn admin_delete_breed(
+    _: AdminGuard,
+    State(st): State<AppState>,
+    Path(breed): Path<String>,
+) -> std::result::Result<impl IntoResponse, Error> {
+    let counts = tenant_counts(&st.pool).await?;
+    let tenants = counts.get(&breed).copied().unwrap_or(0);
+    if tenants > 0 {
+        return Err(Error::BreedInUse { breed, tenants });
+    }
+    crate::breeds::remove(&st.cfg, &breed)?;
+    Ok(Json(serde_json::json!({"deleted": breed})))
+}
+
+/// POST /admin/breeds/:breed/refresh — re-render that breed's tenants
+/// without uploading anything. For when the templates were changed on
+/// disk directly, or a previous rollout left failures to retry.
+async fn admin_refresh_breed(
+    _: AdminGuard,
+    State(st): State<AppState>,
+    Path(breed): Path<String>,
+) -> std::result::Result<impl IntoResponse, Error> {
+    let (refreshed, failures) = st.provisioner.refresh_breed(&breed).await?;
+    let failures: Vec<serde_json::Value> = failures
+        .into_iter()
+        .map(|(openid, error)| serde_json::json!({"openid": openid, "error": error}))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "breed": breed,
+        "refreshed": refreshed,
+        "failures": failures,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SetBreedReq {
+    breed: String,
+}
+
+/// PUT /admin/users/:openid/breed — move one tenant to another breed and
+/// re-render them immediately. Without the re-render the tenant would
+/// keep answering as the old lobster until something else refreshed
+/// them, which reads as the move having silently failed.
+async fn admin_set_user_breed(
+    _: AdminGuard,
+    State(st): State<AppState>,
+    Path(openid): Path<String>,
+    Json(req): Json<SetBreedReq>,
+) -> std::result::Result<impl IntoResponse, Error> {
+    // Reject an unknown breed before writing it to the row, so a typo
+    // can't strand a tenant on a breed that renders from nothing.
+    if st.cfg.provisioner.breed_dir(&req.breed).is_none() {
+        return Err(Error::UnknownBreed(req.breed));
+    }
+    let previous = users::get_required(&st.pool, &openid).await?.breed;
+    users::set_breed(&st.pool, &openid, &req.breed).await?;
+    st.provisioner.refresh_workspace(&openid).await?;
+    Ok(Json(serde_json::json!({
+        "openid": openid,
+        "breed": req.breed,
+        "previous_breed": previous,
+    })))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2366,6 +2628,19 @@ mod tests {
         let raw = "已为 **X公司** 触发资质数据处理，点击查看详情：\n\n\
             [查看企业资质详情](/pages/qualification/index?id=5)";
         assert_eq!(sanitize_assistant_response(raw, false), raw);
+    }
+
+    #[test]
+    fn keeps_policy_match_result_card_intact() {
+        // 这台网关上跑的是政策匹配，成功回复的形态与企业简报完全不同：
+        // 短段落 + 深链 + 逐条政策。新加的机械词过滤是全文匹配的，必须
+        // 证明它够不着这类正文——否则 40+ 租户的卡片会被吃掉。
+        let raw = "已为 **北京中孵高科技术发展有限公司** 匹配到 10 条适用政策：\n\n\
+            **1. 中关村高新技术企业认定奖励**\n资助额度：50 万元　申报截止：2026-09-30\n\n\
+            **2. 专精特新「小巨人」培育资金**\n资助额度：100 万元　申报截止：2026-10-15\n\n\
+            完整清单与申报材料要求：\n\n\
+            [查看政策匹配结果](/pages/policy/index?id=34)";
+        assert_eq!(sanitize_assistant_response(raw, true), raw);
     }
 
     #[test]

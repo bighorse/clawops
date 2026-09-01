@@ -27,7 +27,7 @@ apt-get upgrade -y -q
 echo "==> base packages"
 apt-get install -y -q \
     build-essential pkg-config libssl-dev cmake git curl jq sqlite3 \
-    fail2ban ufw acl \
+    fail2ban ufw acl rsync \
     ca-certificates
 
 echo "==> rustup (system-wide for the build user)"
@@ -75,11 +75,18 @@ echo
 echo "==> clawops directories"
 mkdir -p /etc/clawops /var/lib/clawops /var/log/clawops
 mkdir -p /var/lib/clawops/data
+# Breed template trees pushed from the development side land here. Created
+# up front so the first push doesn't fail on a missing parent.
+mkdir -p /etc/clawops/breeds
+mkdir -p /var/backups/clawops
 
-echo "==> systemd user-template unit"
+echo "==> systemd units"
 install -m 0644 \
     "$(dirname "$0")/../systemd/zeroclaw@.service" \
     /etc/systemd/user/zeroclaw@.service
+install -m 0644 \
+    "$(dirname "$0")/../systemd/clawops.service" \
+    /etc/systemd/system/clawops.service
 systemctl daemon-reload
 
 echo
@@ -93,5 +100,5 @@ echo "  3. Copy clawops.toml to /etc/clawops/clawops.toml (use clawops.example.t
 echo "  4. Put shared LLM env in /etc/clawops/zeroclaw.env, e.g.:"
 echo "       echo 'ZEROCLAW_API_KEY=sk-xxx' > /etc/clawops/zeroclaw.env"
 echo "       chmod 600 /etc/clawops/zeroclaw.env"
-echo "  5. Start clawops as root for now:"
-echo "       /usr/local/bin/clawops --config /etc/clawops/clawops.toml serve"
+echo "  5. Deploy and start:"
+echo "       bash /opt/clawops/scripts/deploy.sh --ref main"

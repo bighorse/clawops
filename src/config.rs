@@ -247,7 +247,153 @@ pub struct ZeroclawConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProvisionerConfig {
     pub backend: String,
+    /// Templates for the `default_breed`. Kept as its own key (rather than
+    /// folding it under `breeds_dir`) so existing deployments render from
+    /// exactly the path they always did.
     pub template_dir: PathBuf,
+    /// Root holding one subdirectory per non-default breed:
+    /// `<breeds_dir>/<breed>/{IDENTITY.md.hbs, SOUL.md.hbs, USER.md.hbs,
+    /// config.toml.hbs, skills/, sops/, scripts/}`.
+    ///
+    /// Empty (the default) means single-breed mode: every tenant renders
+    /// from `template_dir` and the breed admin API refuses to write.
+    /// Point it somewhere writable to let ClawOps host several kinds of
+    /// lobster at once — the swarm then distinguishes them by
+    /// `users.breed` rather than by which git branch the box is on.
+    #[serde(default)]
+    pub breeds_dir: Option<PathBuf>,
+    /// Breed assigned to tenants that arrive without one (wx-login,
+    /// wecom-login, `provision` with no `--breed`). Must resolve, or
+    /// provisioning fails loudly rather than silently handing a new
+    /// tenant the wrong prompt set.
+    #[serde(default = "default_breed_name")]
+    pub default_breed: String,
+    /// Cap on an uploaded breed bundle, in bytes. The bundle is a
+    /// gzipped tar streamed into memory, so this is the ceiling on what
+    /// one admin request can allocate. 32 MiB fits a template tree with
+    /// fonts and helper scripts many times over.
+    #[serde(default = "default_max_bundle_bytes")]
+    pub max_bundle_bytes: usize,
+    /// Mini-program `app_id` → breed, for tenants that self-register
+    /// through `/auth/wx-login`.
+    ///
+    /// This is a routing table, **not a whitelist**: an `app_id` that
+    /// isn't listed still logs in, it just lands on `default_breed`.
+    /// ClawOps deliberately keeps no list of valid app_ids — the platform
+    /// backend already rejects unconfigured ones with a 403 — and adding
+    /// a route here must not quietly change that.
+    ///
+    /// Only consulted when the exchange backend didn't already name a
+    /// breed, and only for users who don't exist yet: a login never moves
+    /// an existing tenant between breeds, because that restarts their
+    /// daemon and drops the previous breed's skills. Use
+    /// `PUT /admin/users/:openid/breed` for that.
+    #[serde(default)]
+    pub breed_routes: std::collections::BTreeMap<String, String>,
+}
+
+/// The name reserved for `template_dir`. A breed literally called
+/// "default" never resolves under `breeds_dir` — that keeps the legacy
+/// path unshadowable by an uploaded bundle.
+pub const DEFAULT_BREED: &str = "default";
+
+fn default_breed_name() -> String {
+    DEFAULT_BREED.into()
+}
+
+fn default_max_bundle_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+impl ProvisionerConfig {
+    /// Where the given breed's templates live, or `None` when the breed
+    /// is unknown. `default` (and the empty string, which is what a row
+    /// written before migration 0010 effectively means) resolves to
+    /// `template_dir`; anything else must exist under `breeds_dir`.
+    pub fn breed_dir(&self, breed: &str) -> Option<PathBuf> {
+        if breed.is_empty() || breed == self.default_breed {
+            return Some(self.template_dir.clone());
+        }
+        let root = self.breeds_dir.as_ref()?;
+        let dir = root.join(breed);
+        dir.is_dir().then_some(dir)
+    }
+
+    /// Which breed a self-registering mini-program tenant should be created
+    /// on, or `None` to mean `default_breed`.
+    ///
+    /// Precedence, most specific first:
+    ///
+    /// 1. what the exchange backend returned — it owns the mapping between
+    ///    its own mini-programs and lines of business
+    /// 2. the `breed_routes` table here, keyed by `app_id`
+    /// 3. nothing, i.e. `default_breed`
+    ///
+    /// An unrouted `app_id` returns `None` rather than an error: this is a
+    /// routing table, not a whitelist, and an unlisted mini-program must
+    /// still be able to log in.
+    ///
+    /// Note that a breed named at either level still has to exist —
+    /// `Provisioner::provision` rejects an unknown one before spending a
+    /// linux uid. That is deliberate: a route pointing at a breed nobody
+    /// pushed yet should fail loudly, not silently hand the tenant the
+    /// wrong lobster.
+    pub fn route_breed(&self, backend_breed: Option<&str>, app_id: &str) -> Option<String> {
+        backend_breed
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| self.breed_routes.get(app_id).cloned())
+    }
+}
+
+#[cfg(test)]
+mod provisioner_config_tests {
+    use super::*;
+
+    fn cfg() -> ProvisionerConfig {
+        ProvisionerConfig {
+            backend: "systemd".into(),
+            template_dir: PathBuf::from("/etc/clawops/templates/workspace"),
+            breeds_dir: Some(PathBuf::from("/etc/clawops/breeds")),
+            default_breed: DEFAULT_BREED.into(),
+            max_bundle_bytes: 1024,
+            breed_routes: [("wxAAA".to_string(), "shangji".to_string())]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn routes_a_configured_app_id() {
+        assert_eq!(cfg().route_breed(None, "wxAAA").as_deref(), Some("shangji"));
+    }
+
+    /// An app_id nobody routed must still log in — on the default breed.
+    /// This is the case most likely to be broken by treating the table as
+    /// a whitelist, and it would lock out every existing mini-program.
+    #[test]
+    fn an_unrouted_app_id_falls_through_rather_than_failing() {
+        assert_eq!(cfg().route_breed(None, "wxZZZ"), None);
+    }
+
+    #[test]
+    fn the_backend_beats_the_local_table() {
+        assert_eq!(
+            cfg().route_breed(Some("yiliao"), "wxAAA").as_deref(),
+            Some("yiliao")
+        );
+    }
+
+    /// A backend that sends `"breed": ""` (or spaces) means "no opinion",
+    /// not "a breed whose name is the empty string" — which would resolve
+    /// to template_dir and quietly hand the tenant the default lobster
+    /// while looking like it had been routed.
+    #[test]
+    fn an_empty_backend_breed_is_the_same_as_absent() {
+        assert_eq!(cfg().route_breed(Some("   "), "wxAAA").as_deref(), Some("shangji"));
+        assert_eq!(cfg().route_breed(Some(""), "wxZZZ"), None);
+    }
 }
 
 /// Platform service-product (commodity) catalogue API. ClawOps doesn't

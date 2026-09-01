@@ -1,0 +1,55 @@
+[Unit]
+Description=ClawOps — ZeroClaw multi-tenant ops gateway
+Documentation=https://github.com/bighorse/clawops
+After=network-online.target
+Wants=network-online.target
+
+# A crash loop from a bad config should surface as a failed unit, not as
+# an endless restart that looks like the service is "sort of running".
+# These are [Unit] keys — systemd ignores them under [Service] and only
+# says so at `systemd-analyze verify` time.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/clawops --config /etc/clawops/clawops.toml serve
+
+# Absolute paths everywhere in clawops.toml, please. This is only a
+# fallback for anything that slipped through as relative.
+WorkingDirectory=/var/lib/clawops
+
+Restart=on-failure
+RestartSec=5
+
+Environment=RUST_LOG=info,clawops=info
+
+# ── Why this runs as root, and why the usual hardening is off ────────
+# ClawOps provisions one Linux account per tenant. It calls useradd,
+# loginctl enable-linger, chown, setfacl, and `sudo -u claw-NNN systemctl
+# --user`. Each of the following would break one of those:
+#
+#   NoNewPrivileges=true   → blocks `sudo -u claw-NNN`
+#   ProtectHome=yes|read-only → it owns /home/claw-NNN
+#   PrivateUsers=yes       → useradd would write into a throwaway namespace
+#   ProtectSystem=strict   → needs /etc/passwd, /etc/clawops, /var/lib
+#
+# So the isolation that matters is elsewhere: each tenant gets its own
+# uid and a 0700 home, the daemons run under `systemd --user` as that
+# uid, and the listener binds 127.0.0.1 behind a reverse proxy.
+User=root
+
+# These do hold without breaking provisioning.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+
+# The DB, per-tenant homes and templates. Nothing else needs writing.
+ReadWritePaths=/var/lib/clawops /etc/clawops /home /var/log/clawops
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

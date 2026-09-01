@@ -41,6 +41,12 @@ pub enum Error {
         waited_ms: u64,
     },
 
+    /// A daemon answered on the port, but not the tenant's own: its authenticated
+    /// probe was rejected. Almost always a port collision with a process ClawOps
+    /// does not manage.
+    #[error("port {port} is answering for a different daemon (probe returned {status})")]
+    ZeroclawIdentityMismatch { port: u16, status: u16 },
+
     /// Surfaces WeChat code2session errors verbatim to the client so the
     /// mini-program can react (re-call wx.login on 40029, retry on 45011, etc.)
     #[error("wechat code2session failed: errcode={errcode} errmsg={errmsg}")]
@@ -66,6 +72,25 @@ pub enum Error {
     /// attempts too, so probing can't distinguish "blocked" from "absent".
     #[error("{0}")]
     NotFound(String),
+    /// A tenant (or an admin request) named a breed with no template
+    /// directory behind it. Never rendered from a fallback: handing a
+    /// tenant the wrong breed's prompts is worse than refusing.
+    #[error("unknown breed '{0}': no template directory for it")]
+    UnknownBreed(String),
+
+    /// An uploaded breed bundle was rejected before anything was written.
+    #[error("invalid breed bundle: {0}")]
+    BadBundle(String),
+
+    /// Breed writes were attempted while `provisioner.breeds_dir` is unset.
+    #[error("breeds_dir is not configured; ClawOps is in single-breed mode")]
+    BreedsDisabled,
+
+    /// A breed still has tenants rendering from it. Deleting its
+    /// templates would freeze them on whatever is already in their
+    /// workspace and turn their next refresh into a 404.
+    #[error("breed '{breed}' still has {tenants} tenant(s); move them first via PUT /admin/users/<openid>/breed")]
+    BreedInUse { breed: String, tenants: i64 },
 
     #[error("{0}")]
     Other(String),
@@ -115,6 +140,10 @@ impl axum::response::IntoResponse for Error {
             Error::UserAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
             Error::NoFreePort => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::DevFieldInProd(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            Error::UnknownBreed(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            Error::BadBundle(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            Error::BreedsDisabled => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            Error::BreedInUse { .. } => (StatusCode::CONFLICT, self.to_string()),
             _ => {
                 tracing::error!(error = %self, "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
